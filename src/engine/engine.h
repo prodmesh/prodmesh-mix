@@ -102,6 +102,17 @@ public:
     // plugin latency along the slowest path, with compensation applied.
     int latencyOf(NodeId id) const;
 
+    // Pro Tools-style delay view for one node, in samples:
+    //   chain        latency its own inserts add ("dly")
+    //   compensation how much its output is delayed so it lines up with
+    //                other inputs at each destination ("cmp"), by node
+    struct DelayInfo {
+        int chain = 0;
+        int arrival = 0;
+        std::vector<std::pair<NodeId, int>> compensation;
+    };
+    DelayInfo delayInfo(NodeId id) const;
+
     struct PluginRtIssue {
         NodeId node;
         std::string plugin;
@@ -137,6 +148,9 @@ private:
         std::unordered_map<NodeId, std::shared_ptr<LevelState>> levels;
         std::unordered_map<NodeId, std::shared_ptr<MeterState>> meters;
         std::unordered_map<NodeId, int> latency;  // output arrival, samples
+        std::unordered_map<NodeId, int> chain;    // own inserts' latency
+        // source -> (destination, compensating delay) for live edges
+        std::unordered_map<NodeId, std::vector<std::pair<NodeId, int>>> comp;
     };
 
     enum class Fail { None, Invalid, FadingCycle };

@@ -408,10 +408,17 @@ private:
 
     QJsonObject snapshot() const {
         const auto& dc = driver_->config();
-        QJsonObject latency;
-        for (const auto& n : engine_->graph().nodes)
+        QJsonObject latency, delay;
+        for (const auto& n : engine_->graph().nodes) {
             if (const int l = engine_->latencyOf(n.id))
                 latency[QString::number(n.id)] = l;
+            const auto d = engine_->delayInfo(n.id);
+            QJsonArray comp;
+            for (const auto& [to, samples] : d.compensation)
+                comp.append(QJsonArray{double(to), samples});
+            delay[QString::number(n.id)] = QJsonObject{
+                {"chain", d.chain}, {"arrival", d.arrival}, {"comp", comp}};
+        }
         QJsonArray warnings;
         for (const auto& w : engine_->warnings())
             warnings.append(QString::fromStdString(w));
@@ -419,6 +426,7 @@ private:
                 {"proto", proto::kVersion},
                 {"graph", proto::graphToJson(engine_->graph())},
                 {"latency", latency},
+                {"delay", delay},
                 {"warnings", warnings},
                 {"engine", QJsonObject{{"sampleRate", dc.sampleRate},
                                        {"block", dc.blockSize},

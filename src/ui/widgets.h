@@ -394,6 +394,51 @@ private:
     int hover_ = -1;
 };
 
+// "DLY 3115" / "CMP 64": a quiet label and a value that only takes colour
+// when it is non-zero.
+class DelayCell : public QWidget {
+public:
+    explicit DelayCell(const QString& label) : label_(label) {
+        setFixedHeight(16);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    }
+    void setValue(int samples, const QColor& active, const QString& tip) {
+        if (samples == value_ && tip == toolTip()) return;
+        value_ = samples;
+        active_ = active;
+        setToolTip(tip);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor("#191c23"));
+        p.drawRoundedRect(rect(), 3, 3);
+        QFont f = font();
+        f.setPixelSize(9);
+        f.setWeight(QFont::DemiBold);
+        f.setLetterSpacing(QFont::AbsoluteSpacing, 0.6);
+        p.setFont(f);
+        p.setPen(theme::text);
+        p.drawText(rect().adjusted(6, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                   label_);
+        QFont v = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        v.setPixelSize(11);
+        p.setFont(v);
+        p.setPen(value_ ? active_ : QColor("#5a6172"));
+        p.drawText(rect().adjusted(0, 0, -6, 0), Qt::AlignVCenter | Qt::AlignRight,
+                   QString::number(value_));
+    }
+
+private:
+    QString label_;
+    int value_ = 0;
+    QColor active_;
+};
+
 class StripWidget : public QWidget {
 public:
     std::function<void(float faderDb, bool mute)> onChange;
@@ -425,13 +470,6 @@ public:
 
         inserts_ = new InsertList;
         v->addWidget(inserts_);
-        latency_ = new QLabel(this);
-        latency_->setAlignment(Qt::AlignCenter);
-        latency_->setStyleSheet("color: #e0c05c; font-size: 10px;");
-        latency_->setFixedHeight(12);
-        latency_->setToolTip("Latency this path adds (plugin look-ahead), "
-                             "compensated on every path that meets it");
-        v->addWidget(latency_);
 
         fader_ = new FaderMeter(channels, this);
         v->addWidget(fader_, 1, Qt::AlignHCenter);
@@ -456,6 +494,16 @@ public:
             "QPushButton:checked { background: #c2393e; border-color: #e5484d;"
             " color: #ffffff; }");
         v->addWidget(mute_);
+
+        // Pro Tools-style delay view: what this chain adds, and how far this
+        // channel is held back to stay in phase with others.
+        auto* delays = new QVBoxLayout;
+        delays->setSpacing(3);
+        dly_ = new DelayCell("DLY");
+        cmp_ = new DelayCell("CMP");
+        delays->addWidget(dly_);
+        delays->addWidget(cmp_);
+        v->addLayout(delays);
 
         fader_->onLevel = [this](float d) {
             showDb(d);
@@ -487,10 +535,29 @@ public:
         fader_->setMeter(peak, rms);
     }
     InsertList* inserts() { return inserts_; }
-    void setLatency(int samples, double rate) {
-        latency_->setText(samples > 0 && rate > 0
-                              ? QString("+%1 ms").arg(1000.0 * samples / rate, 0, 'f', 1)
-                              : QString());
+    // chain: this node's own insert latency. comp: (destination name,
+    // samples) of the delay applied on each of its outputs. arrival: total
+    // latency at this node's output.
+    void setDelay(int chain, int arrival,
+                  const QList<QPair<QString, int>>& comp, double rate) {
+        auto ms = [rate](int n) {
+            return rate > 0 ? QString::number(1000.0 * n / rate, 'f', 2) + " ms"
+                            : QString();
+        };
+        dly_->setValue(chain, theme::warn,
+                       QString("Plugin delay: this chain adds %1 samples (%2)."
+                               "\nTotal latency at this point: %3 samples (%4).")
+                           .arg(chain).arg(ms(chain)).arg(arrival).arg(ms(arrival)));
+        int most = 0;
+        QStringList lines;
+        for (const auto& [to, n] : comp) {
+            most = std::max(most, n);
+            lines << QString("%1: %2 samples (%3)").arg(to).arg(n).arg(ms(n));
+        }
+        cmp_->setValue(most, theme::accent,
+                       most ? "Delay compensation: held back to stay in phase "
+                              "with other channels' plugins.\n" + lines.join("\n")
+                            : "No delay compensation needed.");
     }
     void clearMeter() { fader_->clearMeter(); }
 
@@ -501,7 +568,8 @@ private:
     bool syncing_ = false;
     QLabel* name_;
     QLabel* readout_;
-    QLabel* latency_;
+    DelayCell* dly_;
+    DelayCell* cmp_;
     InsertList* inserts_;
     FaderMeter* fader_;
     QPushButton* mute_;

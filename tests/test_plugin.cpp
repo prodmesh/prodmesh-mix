@@ -199,6 +199,12 @@ TEST(pdc_aligns_parallel_paths_exactly) {
     const auto x = run(ref, 40), y = run(pdc, 40);
     CHECK(pdc.latencyOf(2) == 64 && pdc.latencyOf(3) == 0);
     CHECK(pdc.latencyOf(4) == 64 && pdc.latencyOf(5) == 64);
+    // The delay view: A's chain adds 64 ("dly"); B is held back 64 to meet
+    // it at the bus ("cmp"); A itself needs no compensation.
+    const auto a = pdc.delayInfo(2), b = pdc.delayInfo(3);
+    CHECK(a.chain == 64 && b.chain == 0);
+    CHECK(b.compensation.size() == 1 && b.compensation[0] == std::make_pair(NodeId(4), 64));
+    CHECK(a.compensation.size() == 1 && a.compensation[0].second == 0);
     // Both paths arrive together: the bus is the reference, 64 samples late.
     for (std::size_t n = 64; n < x.size(); ++n)
         if (y[n] != x[n - 64]) {

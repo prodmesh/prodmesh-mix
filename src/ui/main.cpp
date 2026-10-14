@@ -374,12 +374,22 @@ private:
             if (proto::graphFromJson(m["graph"].toObject(), g, nullptr)) {
                 if (!sameLayout(g, graph_) || strips_.isEmpty()) build(g);
                 graph_ = g;
-                const auto lat = m["latency"].toObject();
+                const auto delay = m["delay"].toObject();
                 for (const auto& n : graph_.nodes)
                     if (auto* st = strips_.value(n.id)) {
                         st->setLevel(n.faderDb, n.mute);
                         st->inserts()->setInserts(insertNames(n));
-                        st->setLatency(lat[QString::number(n.id)].toInt(), rate_);
+                        const auto d = delay[QString::number(n.id)].toObject();
+                        QList<QPair<QString, int>> comp;
+                        for (const auto& c : d["comp"].toArray()) {
+                            const auto pair = c.toArray();
+                            const auto* to = graph_.find(NodeId(pair[0].toDouble()));
+                            if (to && to->kind != NodeKind::Output)
+                                comp.append({QString::fromStdString(to->name),
+                                             pair[1].toInt()});
+                        }
+                        st->setDelay(d["chain"].toInt(), d["arrival"].toInt(), comp,
+                                     rate_);
                     }
             }
             QStringList w;

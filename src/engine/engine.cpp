@@ -163,6 +163,16 @@ std::vector<Engine::PluginRtIssue> Engine::pluginRtIssues() const {
     return out;
 }
 
+Engine::DelayInfo Engine::delayInfo(NodeId id) const {
+    DelayInfo d;
+    if (auto it = live_.chain.find(id); it != live_.chain.end()) d.chain = it->second;
+    if (auto it = live_.latency.find(id); it != live_.latency.end())
+        d.arrival = it->second;
+    if (auto it = live_.comp.find(id); it != live_.comp.end())
+        d.compensation = it->second;
+    return d;
+}
+
 int Engine::latencyOf(NodeId id) const {
     auto it = live_.latency.find(id);
     return it == live_.latency.end() ? 0 : it->second;
@@ -411,7 +421,10 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
             if (e.to == me && (e.desc || !anyLive))
                 inArrival = std::max(inArrival, arrival[stepOf[e.from]]);
         arrival[si] = inArrival + (s.node ? s.node->latencySamples() : 0);
-        if (!s.dying) live->latency[s.id] = arrival[si];
+        if (!s.dying) {
+            live->latency[s.id] = arrival[si];
+            live->chain[s.id] = s.node ? s.node->latencySamples() : 0;
+        }
 
         for (const auto& e : edges) {
             if (e.to != me) continue;
@@ -450,7 +463,10 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
             EdgeInstance::targetsFor(e.desc, src.nch, s.nch, t.m);
             plan->edgeTargets.push_back(t);
             plan->contribs.push_back({inst.get(), srcStep});
-            if (e.desc) live->edges[{e.fromId, e.toId}] = inst;
+            if (e.desc) {
+                live->edges[{e.fromId, e.toId}] = inst;
+                live->comp[e.fromId].push_back({e.toId, inst->delay()});
+            }
             plan->edges.push_back(std::move(inst));
         }
         s.numContrib = int(plan->contribs.size()) - s.firstContrib;

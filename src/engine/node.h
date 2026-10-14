@@ -29,6 +29,14 @@ public:
     // Audio thread, once, before the instance leaves the graph (CLAP's
     // stop_processing). Processing starts lazily on the first process().
     virtual void stopProcessing() {}
+
+    // Third-party plugins: display name, and how often the plugin's own
+    // code allocated on the audio thread (it is not real-time safe).
+    virtual std::string name() const { return {}; }
+    std::uint64_t rtAllocations() const { return rtAllocs_.load(); }
+
+protected:
+    std::atomic<std::uint64_t> rtAllocs_{0};
 };
 
 class NodeInstance {
@@ -46,6 +54,13 @@ public:
 
     // Audio thread: the instance is about to leave the graph.
     void stopProcessing();
+
+    struct PluginRt {
+        std::string plugin;
+        std::uint64_t allocations = 0;
+    };
+    // Plugins in this chain that allocated on the audio thread.
+    std::vector<PluginRt> pluginRtReport() const;
 
     // Inserts that failed to load and are passed through, as messages.
     const std::vector<std::string>& warnings() const { return warnings_; }

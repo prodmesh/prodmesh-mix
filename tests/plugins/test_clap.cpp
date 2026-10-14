@@ -1,6 +1,8 @@
 // pm-test.clap: plugins the host tests drive.
 //   com.prodmesh.test.gain     x0.5, stereo
 //   com.prodmesh.test.delay    64-sample delay, reports 64 samples latency
+//   com.prodmesh.test.alloc    unity, but allocates in process() (a plugin
+//                              that is not real-time safe)
 // Every instance also checks the host against CLAP's lifecycle rules and
 // counts violations; tests read them through pm_test_counters(). Like many
 // commercial plugins, they declare a mono sidechain input and expect the
@@ -18,7 +20,7 @@ std::atomic<int> gStarts{0}, gStops{0}, gViolations{0}, gLive{0};
 struct Plugin {
     clap_plugin_t clap{};
     const clap_host_t* host = nullptr;
-    bool delay = false;
+    bool delay = false, alloc = false;
     bool active = false, processing = false;
     std::vector<float> line[2];
     std::size_t pos = 0;
@@ -68,6 +70,10 @@ clap_process_status process(const clap_plugin_t* p, const clap_process_t* pr) {
     if (pr->audio_inputs_count < 2 || !pr->audio_inputs[1].data32 ||
         pr->audio_inputs[1].data32[0][0] != 0.0f)
         ++gViolations;  // sidechain missing (or not silent)
+    if (s->alloc) {
+        int* volatile leak = new int(1);  // what a careless plugin does
+        delete leak;
+    }
     const auto n = pr->frames_count;
     for (uint32_t c = 0; c < 2; ++c) {
         const float* in = pr->audio_inputs[0].data32[c];
@@ -78,7 +84,7 @@ clap_process_status process(const clap_plugin_t* p, const clap_process_t* pr) {
                 out[i] = s->line[c][(s->pos + i) % kDelay];
                 s->line[c][(s->pos + i) % kDelay] = x;
             } else {
-                out[i] = in[i] * 0.5f;
+                out[i] = s->alloc ? in[i] : in[i] * 0.5f;
             }
         }
     }
@@ -117,21 +123,25 @@ const clap_plugin_descriptor_t kDescs[] = {
      "", "1.0", "", kFeatures},
     {CLAP_VERSION, "com.prodmesh.test.delay", "PM Test Delay", "ProdMesh", "",
      "", "", "1.0", "", kFeatures},
+    {CLAP_VERSION, "com.prodmesh.test.alloc", "PM Test Alloc", "ProdMesh", "",
+     "", "", "1.0", "", kFeatures},
 };
+constexpr uint32_t kCount = 3;
 
-uint32_t count(const clap_plugin_factory_t*) { return 2; }
+uint32_t count(const clap_plugin_factory_t*) { return kCount; }
 const clap_plugin_descriptor_t* desc(const clap_plugin_factory_t*, uint32_t i) {
-    return i < 2 ? &kDescs[i] : nullptr;
+    return i < kCount ? &kDescs[i] : nullptr;
 }
 const clap_plugin_t* create(const clap_plugin_factory_t*, const clap_host_t* host,
                             const char* id) {
     int which = -1;
-    for (int i = 0; i < 2; ++i)
-        if (!std::strcmp(id, kDescs[i].id)) which = i;
+    for (uint32_t i = 0; i < kCount; ++i)
+        if (!std::strcmp(id, kDescs[i].id)) which = int(i);
     if (which < 0) return nullptr;
     auto* s = new Plugin;
     s->host = host;
     s->delay = which == 1;
+    s->alloc = which == 2;
     s->clap = {&kDescs[which], s,       init,           destroy,
                activate,       deactivate, startProcessing, stopProcessing,
                reset,          process, getExtension,  onMainThread};

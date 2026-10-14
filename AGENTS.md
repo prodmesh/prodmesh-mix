@@ -138,7 +138,16 @@ with segfaults in real commercial plugins — keep them:
   context, never null; plugins write meters to output parameter changes
   without checking for a null queue (FabFilter Pro-C 2 / Pro-L 2).
 Never load a plugin to *scan* it in the engine: `mix-plugin scan` does it
-in child processes with a timeout. `PM_PLUGIN_TRACE=1` logs host->plugin
+in child processes with a timeout, and with `--cache` (as mixd runs it)
+only bundles that are new or changed get loaded — loading plugins can pop
+up licence dialogs (iLok) on the user's screen, so each version is loaded
+at most once and quarantine is remembered. The catalog is machine-wide:
+`~/Library/Application Support/ProdMesh/Mix/plugins.jsonl`.
+**On the dev machine, test only with FabFilter (licensed) and MiniMeters
+(free)** — the smoke test's default set.
+Third-party code that allocates on the audio thread is attributed to the
+plugin (`rt::ScopedThirdParty`, `Engine::pluginRtIssues()`), not counted as
+an engine violation; FabFilter Pro-L 2 does it in its first blocks. `PM_PLUGIN_TRACE=1` logs host->plugin
 calls; `tools/plugin_smoke.py` runs installed real plugins as inserts
 (19/19 on the dev machine) — run it after touching an adapter.
 Not done yet: VST3 edit controller (parameters, state), plugin UIs,

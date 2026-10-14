@@ -9,6 +9,7 @@
 // malloc or locks.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 // Marks a function whose whole dynamic extent must be real-time safe.
@@ -42,6 +43,20 @@ public:
 
 private:
     bool previous_;
+};
+
+// Marks a call into third-party code (a plugin's process) on a real-time
+// thread: allocations inside are added to `counter` — attributed to that
+// plugin — instead of the engine's own violation count, and never abort.
+class ScopedThirdParty {
+public:
+    explicit ScopedThirdParty(std::atomic<std::uint64_t>* counter);
+    ~ScopedThirdParty();
+    ScopedThirdParty(const ScopedThirdParty&) = delete;
+    ScopedThirdParty& operator=(const ScopedThirdParty&) = delete;
+
+private:
+    std::atomic<std::uint64_t>* previous_;
 };
 
 // Temporarily lifts the guard, e.g. around a deliberately non-RT call in a

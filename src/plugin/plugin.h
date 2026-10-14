@@ -21,6 +21,7 @@ struct PluginInfo {
     std::string path;    // bundle path
     std::string id;      // plugin id within the bundle
     std::string name, vendor, version;
+    bool instrument = false;  // generates audio; not offered as an insert
 };
 
 // Lists the plugins a bundle contains. Loads code: run it in the scanner

@@ -39,6 +39,8 @@
 #include "record/recorder.h"
 #include "record/wav_writer.h"
 #include <QDateTime>
+#include <QProcess>
+#include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QDirIterator>
 #include <QStorageInfo>
@@ -109,6 +111,7 @@ public:
             *error = QString::fromStdString(err);
             return false;
         }
+        startCatalog();
         if (!recordDir_.isEmpty() && !startTake(error)) return false;
         if (!driver_->start(&render, &ctx_, &err)) {
             *error = QString::fromStdString(err);
@@ -169,6 +172,7 @@ private:
         const auto op = m["op"].toString();
         if (op == "hello") {
             send(s, snapshot());
+            send(s, catalogMessage());
         } else if (op == "ping") {
             send(s, {{"type", "pong"}, {"t", m["t"]}});
         } else if (op == "setLevel") {
@@ -193,7 +197,9 @@ private:
                          {"op", op},
                          {"message", QString::fromStdString(engineErr)}});
             } else {
-                broadcast(snapshot(), nullptr);
+                // Latency and plugin warnings are known once the edit has
+                // been compiled; pump() sends the snapshot then.
+                snapshotPending_ = true;
                 saveTimer_.start();
             }
         } else {
@@ -272,6 +278,17 @@ private:
         return true;
     }
 
+    // Plugins that allocate on the audio thread: a dropout risk the
+    // operator should know about (and the vendor should fix).
+    QJsonArray pluginRt() const {
+        QJsonArray out;
+        for (const auto& i : engine_->pluginRtIssues())
+            out.append(QJsonObject{{"node", double(i.node)},
+                                   {"plugin", QString::fromStdString(i.plugin)},
+                                   {"allocations", double(i.allocations)}});
+        return out;
+    }
+
     QJsonObject recordingHealth() const {
         if (!recorder_) return {{"on", false}};
         std::uint64_t dropped = 0;
@@ -335,11 +352,74 @@ private:
             qWarning("mixd: could not save session %s", qPrintable(sessionPath_));
     }
 
+    // --- plugin catalog: cached, rescanned out of process ----------------
+    // Machine-wide, not per show: every session shares one catalog, so a
+    // new session never triggers a rescan (plugins can pop up licence
+    // dialogs when loaded).
+    QString catalogPath() const {
+        const auto dir =
+            QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+        QDir().mkpath(dir);
+        return dir + "/plugins.jsonl";
+    }
+
+    void loadCatalog(const QByteArray& lines) {
+        QJsonArray list;
+        for (const auto& l : lines.split('\n')) {
+            const auto o = QJsonDocument::fromJson(l).object();
+            if (o.isEmpty() || o.contains("quarantined") || o["empty"].toBool() ||
+                o["instrument"].toBool())
+                continue;
+            list.append(o);
+        }
+        catalog_ = list;
+    }
+
+    void startCatalog() {
+        QFile cache(catalogPath());
+        if (cache.open(QIODevice::ReadOnly)) loadCatalog(cache.readAll());
+        const QString tool =
+            QCoreApplication::applicationDirPath() + "/mix-plugin";
+        if (!QFileInfo::exists(tool)) return;
+        scanner_ = new QProcess(this);
+        connect(scanner_, &QProcess::finished, this, [this](int code) {
+            const auto out = scanner_->readAllStandardOutput();
+            scanner_->deleteLater();
+            scanner_ = nullptr;
+            if (code == 0) {
+                QSaveFile f(catalogPath());
+                if (f.open(QIODevice::WriteOnly)) {
+                    f.write(out);
+                    f.commit();
+                }
+                loadCatalog(out);
+            }
+            broadcast(catalogMessage(), nullptr);
+        });
+        // Incremental: only new or updated bundles get loaded.
+        scanner_->start(tool, {"scan", "--cache", catalogPath()});
+    }
+
+    QJsonObject catalogMessage() const {
+        return {{"type", "catalog"},
+                {"plugins", catalog_},
+                {"scanning", scanner_ != nullptr}};
+    }
+
     QJsonObject snapshot() const {
         const auto& dc = driver_->config();
+        QJsonObject latency;
+        for (const auto& n : engine_->graph().nodes)
+            if (const int l = engine_->latencyOf(n.id))
+                latency[QString::number(n.id)] = l;
+        QJsonArray warnings;
+        for (const auto& w : engine_->warnings())
+            warnings.append(QString::fromStdString(w));
         return {{"type", "snapshot"},
                 {"proto", proto::kVersion},
                 {"graph", proto::graphToJson(engine_->graph())},
+                {"latency", latency},
+                {"warnings", warnings},
                 {"engine", QJsonObject{{"sampleRate", dc.sampleRate},
                                        {"block", dc.blockSize},
                                        {"outputs", dc.numOutputs},
@@ -348,6 +428,10 @@ private:
 
     void pump() {
         engine_->pump();
+        if (snapshotPending_ && engine_->settled()) {
+            snapshotPending_ = false;
+            broadcast(snapshot(), nullptr);
+        }
         while (auto smp = driver_->stats().samples.pop()) {
             const double us = smp->durationNs / 1e3;
             windowMax_ = std::max(windowMax_, us);
@@ -382,7 +466,8 @@ private:
                    {"rtViolations", double(rt::violations())},
                    {"settled", engine_->settled()},
                    {"lastError", QString::fromStdString(engine_->lastError())},
-                   {"recording", recordingHealth()}},
+                   {"recording", recordingHealth()},
+                   {"pluginRt", pluginRt()}},
                   nullptr);
         windowSum_ = windowMax_ = 0;
         windowCount_ = 0;
@@ -417,6 +502,9 @@ private:
     double ringSeconds_ = 30;
     QElapsedTimer takeClock_;
     std::unique_ptr<rec::Recorder> recorder_;
+    QJsonArray catalog_;
+    bool snapshotPending_ = false;
+    QProcess* scanner_ = nullptr;
     double periodUs_ = 0;
     double windowSum_ = 0, windowMax_ = 0;
     std::uint64_t windowCount_ = 0;

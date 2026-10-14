@@ -102,6 +102,14 @@ public:
     // plugin latency along the slowest path, with compensation applied.
     int latencyOf(NodeId id) const;
 
+    struct PluginRtIssue {
+        NodeId node;
+        std::string plugin;
+        std::uint64_t allocations;
+    };
+    // Live plugins whose own code has allocated on the audio thread.
+    std::vector<PluginRtIssue> pluginRtIssues() const;
+
     // Plugins that failed to load (passed through), oldest first.
     const std::vector<std::string>& warnings() const { return warnings_; }
 

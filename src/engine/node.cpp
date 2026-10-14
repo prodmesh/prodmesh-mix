@@ -118,6 +118,13 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
     }
 }
 
+std::vector<NodeInstance::PluginRt> NodeInstance::pluginRtReport() const {
+    std::vector<PluginRt> out;
+    for (const auto& ins : inserts_)
+        if (const auto n = ins->rtAllocations()) out.push_back({ins->name(), n});
+    return out;
+}
+
 void NodeInstance::stopProcessing() {
     for (auto& ins : inserts_) ins->stopProcessing();
 }

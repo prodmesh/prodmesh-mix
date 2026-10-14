@@ -101,7 +101,7 @@ TEST(clap_bundle_describes_its_plugins) {
     std::vector<plugin::PluginInfo> list;
     std::string err;
     CHECK_MSG(plugin::describeBundle(PM_TEST_CLAP, list, &err), err);
-    CHECK(list.size() == 2);
+    CHECK(list.size() == 3);
     CHECK(list[0].id == "com.prodmesh.test.gain" && list[0].format == "clap");
 }
 
@@ -222,4 +222,15 @@ TEST(pdc_change_is_continuous) {
     CHECK_MSG(worst <= steady * 1.05f, "step when compensation changed: " +
                                            std::to_string(worst / steady));
     CHECK(e.settled());
+}
+
+TEST(plugin_allocations_are_attributed_not_counted_as_engine_bugs) {
+    Engine e(cfg());
+    CHECK(e.setGraph(withPlugin(sine(), "com.prodmesh.test.alloc")));
+    run(e, 20);
+    CHECK_MSG(rt::violations() == 0, "a plugin's allocation was blamed on the engine");
+    const auto issues = e.pluginRtIssues();
+    CHECK(issues.size() == 1);
+    CHECK(issues[0].node == 2 && issues[0].plugin == "PM Test Alloc");
+    CHECK(issues[0].allocations >= 20);
 }

@@ -15,7 +15,11 @@
 
 #include "proto/protocol.h"
 #include "ui/theme.h"
+#include "ui/plugin_browser.h"
 #include "ui/widgets.h"
+#include <QFileInfo>
+#include <QMenu>
+#include <QPointer>
 
 namespace pm::ui {
 
@@ -54,6 +58,10 @@ public:
 
     void setLevel(quint32 id, float db, bool mute) {
         pending_[id] = {db, mute};
+    }
+    void setGraph(const GraphDesc& g) {
+        flushLevels();  // keep fader moves ordered before the edit
+        send({{"op", "setGraph"}, {"graph", proto::graphToJson(g)}});
     }
 
 private:
@@ -279,6 +287,13 @@ public:
             " border-bottom: 1px solid #e5484d;");
         banner_->hide();
         outer->addWidget(banner_);
+        warnings_ = new QLabel;
+        warnings_->setWordWrap(true);
+        warnings_->setStyleSheet(
+            "background: #362f1a; color: #f3e3b0; font-size: 12px;"
+            " padding: 7px 16px; border-bottom: 1px solid #e0c05c;");
+        warnings_->hide();
+        outer->addWidget(warnings_);
 
         auto* body = new QWidget;
         body->setObjectName("root");
@@ -353,12 +368,37 @@ private:
                 loggedSnapshot_ = true;
             }
             const auto eng = m["engine"].toObject();
-            health_->setFormat(eng["sampleRate"].toDouble(),
-                               eng["block"].toInt());
+            rate_ = eng["sampleRate"].toDouble();
+            health_->setFormat(rate_, eng["block"].toInt());
             GraphDesc g;
-            if (proto::graphFromJson(m["graph"].toObject(), g, nullptr))
-                build(g);
+            if (proto::graphFromJson(m["graph"].toObject(), g, nullptr)) {
+                if (!sameLayout(g, graph_) || strips_.isEmpty()) build(g);
+                graph_ = g;
+                const auto lat = m["latency"].toObject();
+                for (const auto& n : graph_.nodes)
+                    if (auto* st = strips_.value(n.id)) {
+                        st->setLevel(n.faderDb, n.mute);
+                        st->inserts()->setInserts(insertNames(n));
+                        st->setLatency(lat[QString::number(n.id)].toInt(), rate_);
+                    }
+            }
+            QStringList w;
+            for (const auto& v : m["warnings"].toArray()) w << v.toString();
+            warnings_->setText(
+                w.isEmpty() ? QString()
+                            : QString("%1 couldn't load and %2 bypassed: %3")
+                                  .arg(w.size() == 1 ? "A plugin" : QString("%1 plugins").arg(w.size()),
+                                       w.size() == 1 ? "is" : "are", w.join(" · ")));
+            warnings_->setVisible(!w.isEmpty());
+            loadFailures_ = w;
+            refreshNotes();
             setOffline(false);
+        } else if (type == "catalog") {
+            catalog_ = m["plugins"].toArray();
+            scanning_ = m["scanning"].toBool();
+            for (const auto& n : graph_.nodes)  // names may resolve now
+                if (auto* st = strips_.value(n.id))
+                    st->inserts()->setInserts(insertNames(n));
         } else if (type == "meters") {
             for (const auto& v : m["m"].toArray()) {
                 const auto r = v.toArray();
@@ -373,6 +413,108 @@ private:
                 s->setLevel(float(m["faderDb"].toDouble()), m["mute"].toBool());
         } else if (type == "health") {
             health_->setHealth(m);
+            rtIssues_.clear();
+            for (const auto& v : m["pluginRt"].toArray()) {
+                const auto o = v.toObject();
+                rtIssues_[quint32(o["node"].toDouble())][o["plugin"].toString()] =
+                    qint64(o["allocations"].toDouble());
+            }
+            refreshNotes();
+        }
+    }
+
+    // Same nodes in the same order: update strips in place, no rebuild.
+    static bool sameLayout(const GraphDesc& a, const GraphDesc& b) {
+        if (a.nodes.size() != b.nodes.size()) return false;
+        for (std::size_t i = 0; i < a.nodes.size(); ++i)
+            if (a.nodes[i].id != b.nodes[i].id ||
+                a.nodes[i].kind != b.nodes[i].kind ||
+                a.nodes[i].name != b.nodes[i].name)
+                return false;
+        return true;
+    }
+
+    QString pluginName(const InsertDesc& ins) const {
+        for (const auto& v : catalog_) {
+            const auto o = v.toObject();
+            if (o["id"].toString().toStdString() == ins.pluginId &&
+                o["path"].toString().toStdString() == ins.path)
+                return o["name"].toString();
+        }
+        return QFileInfo(QString::fromStdString(ins.path)).completeBaseName();
+    }
+
+    QStringList insertNames(const NodeDesc& n) const {
+        QStringList out;
+        for (const auto& ins : n.processing.inserts) {
+            switch (ins.type) {
+            case InsertDesc::Type::Plugin: out << pluginName(ins); break;
+            case InsertDesc::Type::Gain:
+                out << QString("Gain %1 dB").arg(double(ins.value));
+                break;
+            case InsertDesc::Type::CpuLoad: out << "CPU load"; break;
+            }
+        }
+        return out;
+    }
+
+public:
+    void openBrowser(quint32 id, const QString& search, QPoint at = {}) {
+        auto* b = new PluginBrowser(catalog_, scanning_, this);
+        b->onPick = [this, id](const QJsonObject& e) { addInsert(id, e); };
+        if (at.isNull())
+            if (auto* st = strips_.value(id))
+                at = st->inserts()->mapToGlobal(QPoint(0, 0));
+        b->move(at - QPoint(20, 20));
+        b->setSearch(search);
+        b->show();
+        browser_ = b;
+    }
+    QWidget* browser() const { return browser_; }
+
+private:
+    void refreshNotes() {
+        for (const auto& n : graph_.nodes) {
+            auto* st = strips_.value(n.id);
+            if (!st) continue;
+            const auto names = insertNames(n);
+            QMap<int, QString> notes;
+            const auto issues = rtIssues_.value(n.id);
+            for (int i = 0; i < names.size(); ++i) {
+                const auto& ins = n.processing.inserts[std::size_t(i)];
+                const auto path = QString::fromStdString(ins.path);
+                for (const auto& f : loadFailures_)
+                    if (!path.isEmpty() && f.contains(path))
+                        notes[i] = names[i] + " — couldn't load; audio passes "
+                                              "straight through";
+                for (auto it = issues.cbegin(); it != issues.cend(); ++it)
+                    if (names[i] == it.key() || names[i].startsWith(it.key()))
+                        notes[i] = QString("%1 — allocated memory on the audio "
+                                           "thread %2× (not real-time safe; "
+                                           "a dropout risk under load)")
+                                       .arg(names[i])
+                                       .arg(it.value());
+            }
+            st->inserts()->setNotes(notes);
+        }
+    }
+
+    void addInsert(NodeId id, const QJsonObject& entry) {
+        GraphDesc g = graph_;
+        if (auto* n = g.find(id)) {
+            n->processing.inserts.push_back(InsertDesc::plugin(
+                entry["format"].toString().toStdString(),
+                entry["path"].toString().toStdString(),
+                entry["id"].toString().toStdString()));
+            client_.setGraph(g);
+        }
+    }
+
+    void removeInsert(NodeId id, int index) {
+        GraphDesc g = graph_;
+        if (auto* n = g.find(id); n && index < int(n->processing.inserts.size())) {
+            n->processing.inserts.erase(n->processing.inserts.begin() + index);
+            client_.setGraph(g);
         }
     }
 
@@ -434,6 +576,24 @@ private:
         const auto id = n.id;
         s->onChange = [this, id](float db, bool mute) {
             client_.setLevel(id, db, mute);
+            if (auto* n = graph_.find(id)) {  // so the next edit keeps it
+                n->faderDb = db;
+                n->mute = mute;
+            }
+        };
+        s->inserts()->onAdd = [this, id](QPoint at) { openBrowser(id, {}, at); };
+        s->inserts()->onSlot = [this, id](int index, QPoint at) {
+            const auto* n = graph_.find(id);
+            if (!n) return;
+            QMenu menu(this);
+            menu.setStyleSheet(
+                "QMenu { background: #232733; border: 1px solid #46506a;"
+                " color: #e8ecf4; padding: 4px; }"
+                "QMenu::item { padding: 5px 18px; border-radius: 4px; }"
+                "QMenu::item:selected { background: #2a3a37; }");
+            const auto names = insertNames(*n);
+            auto* remove = menu.addAction("Remove " + names.value(index));
+            if (menu.exec(at) == remove) removeInsert(id, index);
         };
         strips_[id] = s;
         return s;
@@ -452,7 +612,15 @@ private:
     QWidget* masterHost_;
     QLabel* offline_;
     QLabel* banner_;
+    QLabel* warnings_;
     QMap<quint32, StripWidget*> strips_;
+    GraphDesc graph_;
+    QJsonArray catalog_;
+    bool scanning_ = false;
+    QMap<quint32, QMap<QString, qint64>> rtIssues_;
+    QStringList loadFailures_;
+    QPointer<QWidget> browser_;
+    double rate_ = 48000;
 };
 
 }  // namespace pm::ui
@@ -471,16 +639,31 @@ int main(int argc, char** argv) {
         {"screenshot", "Save a PNG of the window after --after ms, then quit",
          "path"},
         {"after", "Delay before --screenshot", "ms", "1500"},
+        {"open-browser", "Dev aid: open the plugin browser on this strip "
+                         "after connecting, filtered by --browser-search",
+         "node"},
+        {"browser-search", "Dev aid: text for --open-browser", "text"},
     });
     p.process(app);
 
     pm::ui::MainWindow win(p.value("socket"));
     win.resize(1240, 640);
     win.show();
+    if (p.isSet("open-browser"))
+        QTimer::singleShot(1200, &win, [&] {
+            win.openBrowser(p.value("open-browser").toUInt(),
+                            p.value("browser-search"));
+        });
 
     if (p.isSet("screenshot")) {
         QTimer::singleShot(p.value("after").toInt(), &win, [&] {
-            win.grab().save(p.value("screenshot"));
+            QPixmap shot = win.grab();
+            if (auto* b = win.browser()) {  // composite the popup on top
+                QPainter painter(&shot);
+                painter.drawPixmap(win.mapFromGlobal(b->mapToGlobal(QPoint())),
+                                   b->grab());
+            }
+            shot.save(p.value("screenshot"));
             app.quit();
         });
     }

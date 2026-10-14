@@ -5,19 +5,31 @@
 #include <cstdlib>
 #include <new>
 
+#include <execinfo.h>
+#include <unistd.h>
+
 namespace pm::rt {
 namespace {
 
 thread_local bool tlsRealtime = false;
+thread_local std::atomic<std::uint64_t>* tlsThirdParty = nullptr;
 std::atomic<std::uint64_t> gViolations{0};
 std::atomic<Policy> gPolicy{Policy::Count};
 
 void onViolation(const char* what) {
+    if (tlsThirdParty) {
+        tlsThirdParty->fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     gViolations.fetch_add(1, std::memory_order_relaxed);
     if (gPolicy.load(std::memory_order_relaxed) == Policy::Abort) {
         tlsRealtime = false;  // let the report itself allocate if it must
         std::fprintf(stderr, "pm::rt violation: %s on a real-time thread\n",
                      what);
+        // Who did it: backtrace_symbols_fd writes without allocating.
+        void* frames[48];
+        const int n = backtrace(frames, 48);
+        backtrace_symbols_fd(frames, n, STDERR_FILENO);
         std::abort();
     }
 }
@@ -34,6 +46,12 @@ ScopedRealtime::ScopedRealtime() : previous_(tlsRealtime) {
     tlsRealtime = true;
 }
 ScopedRealtime::~ScopedRealtime() { tlsRealtime = previous_; }
+
+ScopedThirdParty::ScopedThirdParty(std::atomic<std::uint64_t>* counter)
+    : previous_(tlsThirdParty) {
+    tlsThirdParty = counter;
+}
+ScopedThirdParty::~ScopedThirdParty() { tlsThirdParty = previous_; }
 
 ScopedNonRealtime::ScopedNonRealtime() : previous_(tlsRealtime) {
     tlsRealtime = false;

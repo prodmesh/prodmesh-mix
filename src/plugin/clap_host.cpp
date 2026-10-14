@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 
+#include "core/rt_guard.h"
 #include "plugin/plugin.h"
 
 #if defined(__APPLE__)
@@ -157,6 +158,7 @@ public:
         plugin_ = factory->create_plugin(factory, &host_, id.c_str());
         if (!plugin_) return fail("not found in bundle");
         PM_TRACE("init");
+        name_ = plugin_->desc && plugin_->desc->name ? plugin_->desc->name : id;
         if (!plugin_->init(plugin_)) {
             plugin_->destroy(plugin_);
             plugin_ = nullptr;
@@ -210,6 +212,7 @@ public:
     }
 
     void process(float* const* ch, int nch, int n) override {
+        rt::ScopedThirdParty attribute(&rtAllocs_);
         if (failed_ || n > maxBlock_) return;  // pass-through
         if (!processing_) {
             PM_TRACE("start_processing");
@@ -250,11 +253,13 @@ public:
     }
 
     void stopProcessing() override {
+        rt::ScopedThirdParty attribute(&rtAllocs_);
         if (processing_) plugin_->stop_processing(plugin_);
         processing_ = false;
     }
 
     int latencySamples() const override { return latency_; }
+    std::string name() const override { return name_; }
 
 private:
     std::shared_ptr<Module> module_;
@@ -266,6 +271,7 @@ private:
         std::vector<float*> ptr;
     };
     int nodeChannels_ = 1, maxBlock_ = 0, mainIn_ = 0, mainOut_ = 0;
+    std::string name_;
     int latency_ = 0;
     std::int64_t steady_ = 0;
     std::vector<Port> inPorts_, outPorts_;
@@ -286,9 +292,12 @@ bool describeClap(const std::string& path, std::vector<PluginInfo>& out,
     for (std::uint32_t i = 0; i < f->get_plugin_count(f); ++i) {
         const auto* d = f->get_plugin_descriptor(f, i);
         if (!d) continue;
+        bool instrument = false;
+        for (auto f = d->features; f && *f; ++f)
+            instrument = instrument || !std::strcmp(*f, CLAP_PLUGIN_FEATURE_INSTRUMENT);
         out.push_back({"clap", path, d->id ? d->id : "", d->name ? d->name : "",
                        d->vendor ? d->vendor : "",
-                       d->version ? d->version : ""});
+                       d->version ? d->version : "", instrument});
     }
     return true;
 }

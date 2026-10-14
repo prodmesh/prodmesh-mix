@@ -1,6 +1,9 @@
 // mix-plugin: plugin scanning and checks, out of the engine's process.
 //
-//   mix-plugin scan [DIR...]          catalog every bundle (JSON lines);
+//   mix-plugin scan [--cache F] [DIR...]
+//                                     catalog every bundle (JSON lines);
+//                                     with --cache, unchanged bundles are
+//                                     not loaded again (see scan());
 //                                     each bundle is described in a child
 //                                     process with a timeout, so a plugin
 //                                     that crashes or hangs on load is
@@ -15,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <fcntl.h>
 #include <spawn.h>
 #include <string>
@@ -23,6 +27,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "core/rt_guard.h"
 #include "engine/engine.h"
 #include "plugin/plugin.h"
 
@@ -51,10 +56,12 @@ int describe(const char* path) {
     }
     for (const auto& p : list)
         std::printf("{\"format\":\"%s\",\"path\":\"%s\",\"id\":\"%s\","
-                    "\"name\":\"%s\",\"vendor\":\"%s\",\"version\":\"%s\"}\n",
+                    "\"name\":\"%s\",\"vendor\":\"%s\",\"version\":\"%s\","
+                    "\"instrument\":%s}\n",
                     p.format.c_str(), jsonEscape(p.path).c_str(),
                     jsonEscape(p.id).c_str(), jsonEscape(p.name).c_str(),
-                    jsonEscape(p.vendor).c_str(), jsonEscape(p.version).c_str());
+                    jsonEscape(p.vendor).c_str(), jsonEscape(p.version).c_str(),
+                    p.instrument ? "true" : "false");
     return 0;
 }
 
@@ -112,36 +119,136 @@ bool describeIsolated(const char* self, const std::string& bundle,
     return true;
 }
 
-int scan(const char* self, std::vector<std::string> dirs) {
+// Identifies a bundle version without loading it: the Info.plist's (or
+// the bundle's) modification time and size.
+std::string stampOf(const fs::path& bundle) {
+    std::error_code ec;
+    fs::path probe = bundle / "Contents" / "Info.plist";
+    if (!fs::exists(probe, ec)) probe = bundle;
+    const auto t = fs::last_write_time(probe, ec).time_since_epoch().count();
+    const auto size = fs::is_regular_file(probe, ec) ? fs::file_size(probe, ec) : 0;
+    return std::to_string(static_cast<long long>(t)) + "-" +
+           std::to_string(static_cast<unsigned long long>(size));
+}
+
+// Value of a string field in one of our own JSON lines (we write them, so
+// only \" and \\ need unescaping).
+std::string field(const std::string& line, const char* key) {
+    const std::string k = std::string("\"") + key + "\":\"";
+    auto at = line.find(k);
+    if (at == std::string::npos) return {};
+    std::string out;
+    for (at += k.size(); at < line.size() && line[at] != '"'; ++at) {
+        if (line[at] == '\\' && at + 1 < line.size()) ++at;
+        out += line[at];
+    }
+    return out;
+}
+
+std::string withStamp(std::string line, const std::string& stamp) {
+    const auto close = line.rfind('}');
+    if (close != std::string::npos)
+        line.insert(close, ",\"stamp\":\"" + stamp + "\"");
+    return line;
+}
+
+// Unchanged bundles come from the cache without loading any plugin code —
+// some plugins pop up licence dialogs (iLok) or hang when loaded, so each
+// version is loaded at most once. Quarantine is remembered the same way.
+int scan(const char* self, std::vector<std::string> args) {
+    std::string cachePath;
+    std::vector<std::string> dirs;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--cache" && i + 1 < args.size()) cachePath = args[++i];
+        else dirs.push_back(args[i]);
+    }
     if (dirs.empty()) {
         const char* home = getenv("HOME");
         const std::string h = home ? home : "";
         dirs = {"/Library/Audio/Plug-Ins/CLAP", h + "/Library/Audio/Plug-Ins/CLAP",
                 "/Library/Audio/Plug-Ins/VST3", h + "/Library/Audio/Plug-Ins/VST3"};
     }
-    int ok = 0, bad = 0;
+    std::map<std::string, std::vector<std::string>> cached;  // path -> lines
+    std::map<std::string, std::string> cachedStamp;
+    if (!cachePath.empty())
+        if (FILE* f = std::fopen(cachePath.c_str(), "r")) {
+            char buf[8192];
+            while (std::fgets(buf, sizeof buf, f)) {
+                std::string line(buf);
+                while (!line.empty() && line.back() == '\n') line.pop_back();
+                const auto path = field(line, "path");
+                const auto stamp = field(line, "stamp");
+                if (path.empty() || stamp.empty()) continue;
+                cached[path].push_back(line);
+                cachedStamp[path] = stamp;
+            }
+            std::fclose(f);
+        }
+
+    int reused = 0, loaded = 0, bad = 0;
     for (const auto& d : dirs) {
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(d, ec)) {
             const auto path = e.path().string();
             const auto ext = e.path().extension();
             if (ext != ".clap" && ext != ".vst3") continue;
+            const auto stamp = stampOf(e.path());
+            if (auto it = cachedStamp.find(path);
+                it != cachedStamp.end() && it->second == stamp) {
+                for (const auto& line : cached[path]) {
+                    std::puts(line.c_str());
+                    bad += field(line, "quarantined").empty() ? 0 : 1;
+                }
+                ++reused;
+                continue;
+            }
             std::string out, why;
+            ++loaded;
             if (describeIsolated(self, path, out, why)) {
-                std::fputs(out.c_str(), stdout);
-                ++ok;
+                std::size_t start = 0, nl;
+                while ((nl = out.find('\n', start)) != std::string::npos) {
+                    std::puts(withStamp(out.substr(start, nl - start), stamp).c_str());
+                    start = nl + 1;
+                }
+                if (out.empty())  // no effects in it: remember that too
+                    std::printf("{\"path\":\"%s\",\"empty\":true,\"stamp\":\"%s\"}\n",
+                                jsonEscape(path).c_str(), stamp.c_str());
             } else {
-                std::printf("{\"path\":\"%s\",\"quarantined\":\"%s\"}\n",
-                            jsonEscape(path).c_str(), why.c_str());
+                std::printf("{\"path\":\"%s\",\"quarantined\":\"%s\",\"stamp\":\"%s\"}\n",
+                            jsonEscape(path).c_str(), why.c_str(), stamp.c_str());
                 ++bad;
             }
         }
     }
-    std::fprintf(stderr, "scanned %d bundle(s), %d quarantined\n", ok + bad, bad);
+    std::fprintf(stderr, "%d bundle(s): %d from cache, %d loaded, %d quarantined\n",
+                 reused + loaded, reused, loaded, bad);
+    return 0;
+}
+
+// Adds current stamps to an unstamped catalog without loading anything:
+// adopts a previous scan's results as the cache for unchanged bundles.
+int stampCatalog(const char* in) {
+    FILE* f = std::fopen(in, "r");
+    if (!f) return 1;
+    char buf[8192];
+    while (std::fgets(buf, sizeof buf, f)) {
+        std::string line(buf);
+        while (!line.empty() && line.back() == '\n') line.pop_back();
+        const auto path = field(line, "path");
+        if (path.empty() || !field(line, "stamp").empty()) {
+            if (!path.empty()) std::puts(line.c_str());
+            continue;
+        }
+        std::puts(withStamp(line, stampOf(path)).c_str());
+    }
+    std::fclose(f);
     return 0;
 }
 
 int bench(const char* bundle, const char* id) {
+    // PM_RT_ABORT=1: abort at the first audio-thread allocation (run it
+    // under lldb to see who allocated).
+    if (std::getenv("PM_RT_ABORT")) rt::setPolicy(rt::Policy::Abort);
     constexpr int kBlock = 128;
     EngineConfig c;
     c.maxBlock = kBlock;
@@ -154,7 +261,8 @@ int bench(const char* bundle, const char* id) {
     NodeDesc strip;
     strip.id = 2;
     // PM_BENCH_CHANNELS=2 benches on a stereo strip (default mono).
-    if (const char* c = std::getenv("PM_BENCH_CHANNELS")) strip.channels = std::atoi(c);
+    if (const char* ch = std::getenv("PM_BENCH_CHANNELS"))
+        strip.channels = std::atoi(ch);
     const std::string format =
         fs::path(bundle).extension() == ".vst3" ? "vst3" : "clap";
     strip.processing.inserts.push_back(InsertDesc::plugin(format, bundle, id));
@@ -184,7 +292,10 @@ int bench(const char* bundle, const char* id) {
     const int blocks = 48000 * 10 / kBlock;  // 10 s of audio
     for (int b = 0; b < blocks; ++b) {
         const auto s = std::chrono::steady_clock::now();
-        e.process(nullptr, 0, outp, 2, kBlock);
+        {
+            rt::ScopedRealtime realtime;  // count allocations, as mixd does
+            e.process(nullptr, 0, outp, 2, kBlock);
+        }
         const double us = std::chrono::duration<double, std::micro>(
                               std::chrono::steady_clock::now() - s).count();
         worst = std::max(worst, us);
@@ -195,6 +306,8 @@ int bench(const char* bundle, const char* id) {
         }
     }
     const double period = 1e6 * kBlock / 48000.0;
+    std::printf("%s\n  rt violations %llu (allocations on the audio thread)\n",
+                id, (unsigned long long)rt::violations());
     std::printf("%s\n  load+activate %.0f ms  mean %.1f us/block (%.2f%% of a "
                 "core)  worst %.0f us  peak %.3f  %s\n",
                 id, loadMs, total / blocks, 100 * total / blocks / period, worst,
@@ -209,6 +322,7 @@ int main(int argc, char** argv) {
     if (argc >= 2 && !std::strcmp(argv[1], "scan"))
         return scan(argv[0], std::vector<std::string>(argv + 2, argv + argc));
     if (argc >= 4 && !std::strcmp(argv[1], "bench")) return bench(argv[2], argv[3]);
+    if (argc >= 3 && !std::strcmp(argv[1], "stamp-catalog")) return stampCatalog(argv[2]);
     std::puts("mix-plugin scan [DIR...] | describe BUNDLE | bench BUNDLE ID");
     return 2;
 }

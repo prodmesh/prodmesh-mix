@@ -19,6 +19,7 @@
 #include <cstring>
 #include <map>
 
+#include "core/rt_guard.h"
 #include "plugin/plugin.h"
 
 #if defined(__APPLE__)
@@ -280,6 +281,13 @@ public:
         };
         TUID cid;
         if (!parseId(id, cid)) return fail("bad class id");
+        name_ = id;
+        for (int32 i = 0; i < module_->factory->countClasses(); ++i) {
+            PClassInfo ci;
+            if (module_->factory->getClassInfo(i, &ci) == kResultOk &&
+                std::memcmp(ci.cid, cid, sizeof(TUID)) == 0)
+                name_ = ci.name;
+        }
         if (module_->factory->createInstance(cid, IComponent::iid,
                                              reinterpret_cast<void**>(&component_)) !=
                 kResultOk ||
@@ -364,6 +372,7 @@ public:
     }
 
     void process(float* const* ch, int nch, int n) override {
+        rt::ScopedThirdParty attribute(&rtAllocs_);
         if (failed_ || n > maxBlock_) return;  // pass-through
         if (!processing_) {
             // kNotImplemented is a valid answer.
@@ -410,11 +419,13 @@ public:
     }
 
     void stopProcessing() override {
+        rt::ScopedThirdParty attribute(&rtAllocs_);
         if (processing_) processor_->setProcessing(false);
         processing_ = false;
     }
 
     int latencySamples() const override { return latency_; }
+    std::string name() const override { return name_; }
 
 private:
     struct Bus {
@@ -425,6 +436,7 @@ private:
     IComponent* component_ = nullptr;
     IAudioProcessor* processor_ = nullptr;
     bool active_ = false, processing_ = false, failed_ = false;
+    std::string name_;
     int latency_ = 0, maxBlock_ = 0;
     std::int64_t time_ = 0;
     std::vector<Bus> inBuses_, outBuses_;
@@ -454,6 +466,8 @@ bool describeVst3(const std::string& path, std::vector<PluginInfo>& out,
         if (f2 && f2->getClassInfo2(i, &c2) == kResultOk) {
             p.version = c2.version;
             if (c2.vendor[0]) p.vendor = c2.vendor;
+            p.instrument = std::strstr(c2.subCategories, "Instrument") != nullptr ||
+                           std::strstr(c2.subCategories, "Generator") != nullptr;
         }
         out.push_back(std::move(p));
     }

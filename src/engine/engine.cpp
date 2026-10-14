@@ -155,6 +155,14 @@ void Engine::setRecordTaps(
     pump();
 }
 
+std::vector<Engine::PluginRtIssue> Engine::pluginRtIssues() const {
+    std::vector<PluginRtIssue> out;
+    for (const auto& [id, inst] : live_.nodes)
+        for (const auto& r : inst->pluginRtReport())
+            out.push_back({id, r.plugin, r.allocations});
+    return out;
+}
+
 int Engine::latencyOf(NodeId id) const {
     auto it = live_.latency.find(id);
     return it == live_.latency.end() ? 0 : it->second;

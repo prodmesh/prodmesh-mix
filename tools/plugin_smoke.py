@@ -11,10 +11,11 @@ is installed).
 """
 import argparse, json, re, subprocess, sys, tempfile
 
-DEFAULT = ["Pro-Q 3", "Pro-C 2", "Pro-L 2", "Pro-MB", "Pro-R 2", "Gullfoss",
-           "Ozone 11 Equalizer", "Auto-Tune Pro", "CLA-2A Mono",
-           "SSLGChannel Mono", "Neutron 4 Elements", "Nectar 4 Elements",
-           "MiniMeters - Loudness"]
+# FabFilter (licensed on the dev machine) and MiniMeters (free). Loading
+# other vendors' plugins can pop up licence dialogs (iLok etc.) on the
+# owner's screen — name them explicitly when you mean to.
+DEFAULT = ["Pro-Q 3", "Pro-Q 4", "Pro-C 2", "Pro-L 2", "Pro-MB", "Pro-DS",
+           "Pro-G", "Pro-R 2", "Saturn 2", "Timeless 3", "MiniMeters - Loudness"]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--build", default="build")

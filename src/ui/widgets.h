@@ -10,6 +10,9 @@
 
 #include <QElapsedTimer>
 #include <QFontDatabase>
+#include <QHelpEvent>
+#include <QMap>
+#include <QToolTip>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
@@ -280,6 +283,117 @@ private:
     }();
 };
 
+// Insert slots, painted. Fixed height (3 slots + add) so faders line up
+// across strips whatever their chains hold. Click a slot to act on it,
+// click the last row to add.
+class InsertList : public QWidget {
+public:
+    static constexpr int kRows = 4, kRowH = 20, kGap = 3;
+    std::function<void(int index, QPoint globalPos)> onSlot;
+    std::function<void(QPoint globalPos)> onAdd;
+
+    InsertList() {
+        setStyleSheet("background: transparent;");
+        setFixedHeight(kRows * (kRowH + kGap) - kGap);
+        setMouseTracking(true);
+        setCursor(Qt::PointingHandCursor);
+    }
+    void setInserts(const QStringList& names) {
+        names_ = names;
+        update();
+    }
+    // Per-slot notes (amber marker + tooltip): a plugin that is not
+    // real-time safe, or one that failed to load.
+    void setNotes(const QMap<int, QString>& notes) {
+        if (notes == notes_) return;
+        notes_ = notes;
+        update();
+    }
+
+protected:
+    QRect row(int i) const {
+        return QRect(0, i * (kRowH + kGap), width(), kRowH);
+    }
+    int addRow() const { return std::min(int(names_.size()), kRows - 1); }
+
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        QFont f = font();
+        f.setPixelSize(11);
+        p.setFont(f);
+        const int shown = std::min(int(names_.size()), kRows - 1);
+        for (int i = 0; i < shown; ++i) {
+            const QRect r = row(i);
+            p.setPen(Qt::NoPen);
+            p.setBrush(i == hover_ ? QColor("#2c3241") : QColor("#262b38"));
+            p.drawRoundedRect(r, 4, 4);
+            p.setBrush(notes_.contains(i) ? theme::warn : theme::accent);
+            p.drawRoundedRect(QRect(r.left(), r.top(), 3, r.height()), 1.5, 1.5);
+            p.setPen(theme::textHi);
+            p.drawText(r.adjusted(8, 0, -4, 0), Qt::AlignVCenter,
+                       p.fontMetrics().elidedText(names_[i], Qt::ElideRight,
+                                                  r.width() - 12));
+        }
+        const QRect add = row(addRow());
+        p.setPen(QPen(i_hoverAdd() ? theme::borderHi : theme::border, 1,
+                      Qt::DashLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(add.adjusted(0, 0, -1, -1), 4, 4);
+        p.setPen(i_hoverAdd() ? theme::textHi : theme::text);
+        const QString more = names_.size() > kRows - 1
+                                 ? QString("+%1 more").arg(names_.size() - (kRows - 1))
+                                 : QStringLiteral("+ Insert");
+        p.drawText(add, Qt::AlignCenter, more);
+    }
+    bool i_hoverAdd() const { return hover_ == addRow(); }
+
+    void mouseMoveEvent(QMouseEvent* e) override {
+        int h = -1;
+        for (int i = 0; i < kRows; ++i)
+            if (row(i).contains(e->pos())) h = i;
+        if (h > addRow()) h = -1;
+        if (h != hover_) {
+            hover_ = h;
+            update();
+        }
+    }
+    void leaveEvent(QEvent*) override {
+        hover_ = -1;
+        update();
+    }
+    bool event(QEvent* e) override {
+        if (e->type() == QEvent::ToolTip) {
+            auto* he = static_cast<QHelpEvent*>(e);
+            for (int i = 0; i < std::min(int(names_.size()), kRows - 1); ++i)
+                if (row(i).contains(he->pos())) {
+                    QToolTip::showText(he->globalPos(),
+                                       notes_.value(i, names_[i]), this);
+                    return true;
+                }
+            QToolTip::hideText();
+            return true;
+        }
+        return QWidget::event(e);
+    }
+    void mousePressEvent(QMouseEvent* e) override {
+        const QPoint g = e->globalPosition().toPoint();
+        for (int i = 0; i <= addRow(); ++i)
+            if (row(i).contains(e->pos())) {
+                if (i == addRow()) {
+                    if (onAdd) onAdd(g);
+                } else if (onSlot) {
+                    onSlot(i, g);
+                }
+            }
+    }
+
+private:
+    QStringList names_;
+    QMap<int, QString> notes_;
+    int hover_ = -1;
+};
+
 class StripWidget : public QWidget {
 public:
     std::function<void(float faderDb, bool mute)> onChange;
@@ -308,6 +422,16 @@ public:
         name_->setToolTip(name);
         setName(name);
         v->addWidget(name_);
+
+        inserts_ = new InsertList;
+        v->addWidget(inserts_);
+        latency_ = new QLabel(this);
+        latency_->setAlignment(Qt::AlignCenter);
+        latency_->setStyleSheet("color: #e0c05c; font-size: 10px;");
+        latency_->setFixedHeight(12);
+        latency_->setToolTip("Latency this path adds (plugin look-ahead), "
+                             "compensated on every path that meets it");
+        v->addWidget(latency_);
 
         fader_ = new FaderMeter(channels, this);
         v->addWidget(fader_, 1, Qt::AlignHCenter);
@@ -362,6 +486,12 @@ public:
     void setMeter(const float peak[2], const float rms[2]) {
         fader_->setMeter(peak, rms);
     }
+    InsertList* inserts() { return inserts_; }
+    void setLatency(int samples, double rate) {
+        latency_->setText(samples > 0 && rate > 0
+                              ? QString("+%1 ms").arg(1000.0 * samples / rate, 0, 'f', 1)
+                              : QString());
+    }
     void clearMeter() { fader_->clearMeter(); }
 
 private:
@@ -371,6 +501,8 @@ private:
     bool syncing_ = false;
     QLabel* name_;
     QLabel* readout_;
+    QLabel* latency_;
+    InsertList* inserts_;
     FaderMeter* fader_;
     QPushButton* mute_;
 };

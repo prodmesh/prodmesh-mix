@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "core/rt_guard.h"
+#include "dsp/dynamics.h"
 #include "engine/engine.h"
 #include "test.h"
 
@@ -131,5 +132,22 @@ TEST(mix_minus_excludes_remote_audio) {
     CHECK(r.engine.setGraph(g));
     r.run(80);
     CHECK(peak(r.out[1], 100 * kBlock) == 0.0f);
+    CHECK(rt::violations() == 0);
+}
+
+TEST(muted_send_is_silent_and_keeps_its_level) {
+    Offline r;
+    GraphDesc g = show();
+    g.find(31)->mixMinus = {};  // a plain aux with one explicit send
+    g.edges.push_back({20, 31, -6, 0, false, true, true});
+    CHECK(r.engine.setGraph(g));
+    r.run(40);
+    CHECK(peak(r.out[1]) == 0.0f);
+    g.edges.back().mute = false;
+    CHECK(r.engine.setGraph(g));
+    r.run(40);
+    const float p = peak(r.out[1], 60 * kBlock);
+    CHECK_MSG(std::fabs(dsp::gainToDb(p) - (-12 - 6)) < 0.5f,
+              "send level " + std::to_string(dsp::gainToDb(p)));
     CHECK(rt::violations() == 0);
 }

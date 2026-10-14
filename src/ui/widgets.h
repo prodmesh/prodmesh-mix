@@ -534,44 +534,48 @@ private:
     QColor active_;
 };
 
-// Sends to aux and mix-minus buses, one row per bus (the same rows on
-// every strip so they line up across the console). Each row:
-//   dot    click = send on/off ("−" = this strip is the one its mix-minus
-//          leaves out)
-//   value  drag up/down = level (Option = fine), double-click = 0 dB, or
-//          back to automatic on a mix-minus
+// The strip's sends, as slots like the inserts (fixed height, so strips
+// line up). A send goes to a bus or straight to an output. Each row:
+//   dot    click = on/off ("−" = left out of this mix-minus, click to put
+//          it back)
+//   rest   drag up/down = level (Option = fine), double-click = 0 dB (or
+//          back to automatic on a mix-minus), right-click = menu
+// The last row adds a send.
 class SendList : public QWidget {
 public:
-    static constexpr int kRowH = 18, kGap = 2, kDotW = 16;
-    enum class State { None, Off, On, Auto, Minus };
+    static constexpr int kRows = 4, kRowH = 18, kGap = 2, kDotW = 16;
+    enum class State { On, Muted, Auto, Minus };
     struct Row {
-        QString bus;
-        State state = State::None;  // None: no send possible (the bus itself)
+        quint32 dest = 0;
+        QString label;
+        State state = State::On;
         float db = 0;
         QString tip;
     };
-    std::function<void(int row)> onToggle;
-    std::function<void(int row, float db)> onLevel;
-    std::function<void(int row)> onReset;
+    std::function<void(quint32 dest)> onToggle;
+    std::function<void(quint32 dest, float db)> onLevel;
+    std::function<void(quint32 dest)> onReset;
+    std::function<void(quint32 dest, QPoint globalPos)> onMenu;
+    std::function<void(QPoint globalPos)> onAdd;
 
     SendList() {
         setStyleSheet("background: transparent;");
         setMouseTracking(true);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        setFixedHeight(0);
+        setFixedHeight(kRows * (kRowH + kGap) - kGap);
     }
     void setRows(const QList<Row>& rows) {
         if (dragRow_ >= 0) return;  // never fight the operator's hand
-        const int h = rows.isEmpty() ? 0 : int(rows.size()) * (kRowH + kGap) - kGap;
-        if (h != height()) setFixedHeight(h);
         rows_ = rows;
         update();
     }
 
 protected:
     QRect row(int i) const { return QRect(0, i * (kRowH + kGap), width(), kRowH); }
+    int shown() const { return std::min(int(rows_.size()), kRows - 1); }
+    int addRow() const { return shown(); }
     int rowAt(QPoint p) const {
-        for (int i = 0; i < int(rows_.size()); ++i)
+        for (int i = 0; i <= addRow(); ++i)
             if (row(i).contains(p)) return i;
         return -1;
     }
@@ -579,22 +583,24 @@ protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        for (int i = 0; i < int(rows_.size()); ++i) {
+        QFont f = font();
+        f.setPixelSize(10);
+        QFont v = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        v.setPixelSize(10);
+        for (int i = 0; i < shown(); ++i) {
             const auto& r = rows_[i];
             const QRect rr = row(i);
-            if (r.state == State::None) continue;
             p.setPen(Qt::NoPen);
             p.setBrush(i == hover_ || i == dragRow_ ? QColor("#20242e")
                                                     : QColor("#191c23"));
             p.drawRoundedRect(rr, 4, 4);
             const bool sending = r.state == State::On || r.state == State::Auto;
-            if (sending) {  // level bar on the fader law
-                p.setBrush(QColor(47, 191, 155, 60));
+            if (r.state != State::Minus) {  // level bar on the fader law
+                p.setBrush(sending ? QColor(47, 191, 155, 60) : QColor(138, 146, 166, 40));
                 const float f = FaderLaw::toPos(r.db);
                 p.drawRoundedRect(QRectF(kDotW, rr.bottom() - 2,
                                          (rr.width() - kDotW) * f, 3), 1.5, 1.5);
             }
-            // The send switch.
             const QPointF c(rr.left() + kDotW / 2.0 + 1, rr.center().y() + 0.5);
             if (r.state == State::Minus) {
                 p.setPen(QPen(theme::textHi, 1.6));
@@ -607,32 +613,43 @@ protected:
                 p.setBrush(Qt::NoBrush);
                 p.drawEllipse(c, 3.5, 3.5);
             }
-            QFont f = font();
-            f.setPixelSize(10);
-            p.setFont(f);
-            QFont v = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-            v.setPixelSize(10);
-            // Only a level the operator set is a number; the dot and the bar
-            // already say "automatic" or "left out" (tooltip spells it out).
-            const QString value = r.state == State::On ? fmtDb(r.db) : QString();
+            // Only a level the operator set is a number; the dot and the
+            // bar say "automatic" or "left out" (the tooltip spells it out).
+            const QString value = r.state == State::On || r.state == State::Muted
+                                      ? fmtDb(r.db) : QString();
             const int vw = value.isEmpty() ? 0 : QFontMetrics(v).horizontalAdvance(value) + 5;
+            p.setFont(f);
             p.setPen(sending ? theme::textHi : theme::text);
             p.drawText(rr.adjusted(kDotW + 2, 0, -vw - 2, 0),
                        Qt::AlignVCenter | Qt::AlignLeft,
-                       p.fontMetrics().elidedText(r.bus, Qt::ElideRight,
+                       p.fontMetrics().elidedText(r.label, Qt::ElideRight,
                                                   rr.width() - kDotW - vw - 4));
             p.setFont(v);
             p.setPen(r.state == State::On ? theme::textMax : theme::text);
             p.drawText(rr.adjusted(0, 0, -5, 0), Qt::AlignVCenter | Qt::AlignRight,
                        value);
         }
+        const QRect add = row(addRow());
+        const bool hot = hover_ == addRow();
+        p.setPen(QPen(hot ? theme::borderHi : theme::border, 1, Qt::DashLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(QRectF(add).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+        p.setFont(f);
+        p.setPen(hot ? theme::textHi : theme::text);
+        const int more = int(rows_.size()) - shown();
+        p.drawText(add, Qt::AlignCenter,
+                   more > 0 ? QString("+%1 more").arg(more) : QStringLiteral("+ Send"));
     }
     bool event(QEvent* e) override {
         if (e->type() == QEvent::ToolTip) {
             auto* he = static_cast<QHelpEvent*>(e);
             const int i = rowAt(he->pos());
-            if (i >= 0 && rows_[i].state != State::None)
+            if (i >= 0 && i < shown())
                 QToolTip::showText(he->globalPos(), rows_[i].tip, this);
+            else if (i == addRow())
+                QToolTip::showText(he->globalPos(),
+                                   "Send this channel to a bus or an output "
+                                   "(monitor mixes, recorders, remote feeds).", this);
             else
                 QToolTip::hideText();
             return true;
@@ -651,18 +668,17 @@ protected:
             float db = grabDb_ + float(grabY_ - e->position().y()) * perPx;
             db = std::clamp(std::round(db * 10.0f) / 10.0f, -60.0f, 10.0f);
             auto& r = rows_[dragRow_];
-            if (db == r.db && r.state == State::On) return;
+            if (db == r.db && r.state != State::Auto) return;
             r.db = db;
-            r.state = State::On;
+            if (r.state == State::Auto) r.state = State::On;
             update();
-            if (onLevel) onLevel(dragRow_, db);
+            if (onLevel) onLevel(r.dest, db);
             return;
         }
         const int h = rowAt(e->pos());
-        const bool onDot = h >= 0 && e->pos().x() < kDotW + 2;
-        setCursor(h < 0 || rows_[h].state == State::None ? Qt::ArrowCursor
-                  : onDot                                ? Qt::PointingHandCursor
-                                                         : Qt::SizeVerCursor);
+        setCursor(h < 0 ? Qt::ArrowCursor
+                  : h == addRow() || e->pos().x() < kDotW + 2 ? Qt::PointingHandCursor
+                                                               : Qt::SizeVerCursor);
         if (h != hover_) {
             hover_ = h;
             update();
@@ -674,15 +690,25 @@ protected:
     }
     void mousePressEvent(QMouseEvent* e) override {
         const int i = rowAt(e->pos());
-        if (i < 0 || rows_[i].state == State::None) return;
-        if (e->pos().x() < kDotW + 2) {
-            if (onToggle) onToggle(i);
+        if (i < 0) return;
+        const QPoint g = e->globalPosition().toPoint();
+        if (i == addRow()) {
+            if (e->button() == Qt::LeftButton && onAdd) onAdd(g);
             return;
         }
+        const auto& r = rows_[i];
+        if (e->button() == Qt::RightButton) {
+            if (onMenu) onMenu(r.dest, g);
+            return;
+        }
+        if (e->pos().x() < kDotW + 2) {
+            if (onToggle) onToggle(r.dest);
+            return;
+        }
+        if (r.state == State::Minus) return;
         dragRow_ = i;
         grabY_ = e->position().y();
-        grabDb_ = rows_[i].state == State::On || rows_[i].state == State::Auto
-                      ? rows_[i].db : -20.0f;  // a new send starts low
+        grabDb_ = r.db;
         lastPerPx_ = 0.25f;
     }
     void mouseReleaseEvent(QMouseEvent*) override {
@@ -691,9 +717,8 @@ protected:
     }
     void mouseDoubleClickEvent(QMouseEvent* e) override {
         const int i = rowAt(e->pos());
-        if (i >= 0 && rows_[i].state != State::None && e->pos().x() >= kDotW + 2 &&
-            onReset)
-            onReset(i);
+        if (i >= 0 && i < shown() && e->pos().x() >= kDotW + 2 && onReset)
+            onReset(rows_[i].dest);
     }
 
 private:
@@ -703,13 +728,14 @@ private:
     float grabDb_ = 0, lastPerPx_ = 0.25f;
 };
 
-// Where this strip goes: "→ Program", "→ Out 3-4". Click for the routing
-// menu. Unassigned is amber: a channel that reaches nothing is almost
-// always a mistake on air.
+// A routing button: "→ Program" (where the strip goes) or "In 3" (what
+// feeds it). Click for the menu. An empty main output is amber: a channel
+// that reaches nothing is almost always a mistake on air.
 class AssignButton : public QWidget {
 public:
     std::function<void(QPoint globalPos)> onClick;
-    AssignButton() {
+    AssignButton(QString prefix, QString empty, bool emptyWarns)
+        : prefix_(std::move(prefix)), empty_(std::move(empty)), warn_(emptyWarns) {
         setFixedHeight(20);
         setCursor(Qt::PointingHandCursor);
         setMouseTracking(true);
@@ -733,9 +759,10 @@ protected:
         f.setWeight(QFont::Medium);
         p.setFont(f);
         const bool none = text_.isEmpty();
-        p.setPen(none ? theme::warn : underMouse() ? theme::textMax : theme::textHi);
+        p.setPen(none ? (warn_ ? theme::warn : theme::text)
+                      : underMouse() ? theme::textMax : theme::textHi);
         p.drawText(rect().adjusted(4, 0, -4, 0), Qt::AlignCenter,
-                   p.fontMetrics().elidedText(none ? "→ nowhere" : "→ " + text_,
+                   p.fontMetrics().elidedText(none ? empty_ : prefix_ + text_,
                                               Qt::ElideRight, width() - 8));
     }
     void enterEvent(QEnterEvent*) override { update(); }
@@ -746,6 +773,8 @@ protected:
     }
 
 private:
+    QString prefix_, empty_;
+    bool warn_;
     QString text_ = "-";
 };
 
@@ -784,6 +813,8 @@ public:
         caption_->setFixedHeight(11);
         v->addWidget(caption_);
 
+        input_ = new AssignButton("", "No input", false);
+        v->addWidget(input_);
         gain_ = new GainField;
         v->addWidget(gain_);
         inserts_ = new InsertList;
@@ -824,7 +855,7 @@ public:
         delays->addWidget(dly_);
         delays->addWidget(cmp_);
         v->addLayout(delays);
-        assign_ = new AssignButton;
+        assign_ = new AssignButton("→ ", "→ nowhere", true);
         v->addWidget(assign_);
 
         fader_->onLevel = [this](float d) {
@@ -859,6 +890,7 @@ public:
     InsertList* inserts() { return inserts_; }
     SendList* sends() { return sends_; }
     AssignButton* assign() { return assign_; }
+    AssignButton* input() { return input_; }
     // A second line under the name ("minus Remote 1" on a mix-minus).
     void setCaption(const QString& c, const QString& tip = {}) {
         caption_->setText(caption_->fontMetrics().elidedText(
@@ -867,13 +899,16 @@ public:
     }
     // Strips fed by a source get a gain field; buses do not.
     GainField* gain() { return gain_; }
-    void setHasGain(bool on) {
-        // Hidden but still taking its space, so faders line up across
-        // strips and buses.
-        auto sp = gain_->sizePolicy();
-        sp.setRetainSizeWhenHidden(true);
-        gain_->setSizePolicy(sp);
-        gain_->setVisible(on);
+    // Channels have an input selector and a gain; buses neither. Hidden
+    // widgets keep their space, so faders line up across the console.
+    void setInputControls(bool selector, bool gain) {
+        for (QWidget* w : {static_cast<QWidget*>(input_), static_cast<QWidget*>(gain_)}) {
+            auto sp = w->sizePolicy();
+            sp.setRetainSizeWhenHidden(true);
+            w->setSizePolicy(sp);
+        }
+        input_->setVisible(selector);
+        gain_->setVisible(gain);
     }
     // chain: this node's own insert latency. comp: (destination name,
     // samples) of the delay applied on each of its outputs. arrival: total
@@ -915,6 +950,7 @@ private:
     QLabel* caption_;
     SendList* sends_;
     AssignButton* assign_;
+    AssignButton* input_;
     QLabel* readout_;
     DelayCell* dly_;
     DelayCell* cmp_;

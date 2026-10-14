@@ -20,6 +20,7 @@
 #include <QFileInfo>
 #include <QInputDialog>
 #include <QMenu>
+#include <QSet>
 #include <QMessageBox>
 #include <QPointer>
 
@@ -397,9 +398,6 @@ private:
                 // A local edit not sent yet is newer than this snapshot.
                 if (!sendTimer_.isActive()) graph_ = g;
                 const auto delay = m["delay"].toObject();
-                for (auto it = gainSource_.cbegin(); it != gainSource_.cend(); ++it)
-                    if (const auto* src = graph_.find(it.value()))
-                        if (auto* st = strips_.value(it.key())) st->gain()->setGain(src->faderDb);
                 for (const auto& n : graph_.nodes)
                     if (auto* st = strips_.value(n.id)) {
                         st->setLevel(n.faderDb, n.mute);
@@ -458,10 +456,6 @@ private:
             const auto id = quint32(m["id"].toDouble());
             if (auto* s = strips_.value(id))
                 s->setLevel(float(m["faderDb"].toDouble()), m["mute"].toBool());
-            for (auto it = gainSource_.cbegin(); it != gainSource_.cend(); ++it)
-                if (it.value() == id)
-                    if (auto* s = strips_.value(it.key()))
-                        s->gain()->setGain(float(m["faderDb"].toDouble()));
         } else if (type == "health") {
             health_->setHealth(m);
             rtIssues_.clear();
@@ -601,7 +595,6 @@ private:
     void build(const GraphDesc& g) {
         for (auto* s : strips_) s->deleteLater();
         strips_.clear();
-        gainSource_.clear();
         pendingGraph_ = g;
 
         auto* row = new QWidget;
@@ -635,20 +628,25 @@ private:
             else delete col;
         };
         const NodeId program = programBus(g);
-        section("Inputs", NodeKind::Strip, 0);
-        auto* newBus = new QPushButton("+ Bus");
-        newBus->setCursor(Qt::PointingHandCursor);
-        newBus->setFixedWidth(64);
-        newBus->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
-        newBus->setToolTip("New aux, group or mix-minus bus");
-        newBus->setStyleSheet(
-            "QPushButton { background: transparent; border: 1px dashed #323848;"
-            " border-radius: 6px; color: #8a92a6; font-size: 11px; }"
-            "QPushButton:hover { border-color: #46506a; color: #e8ecf4; }");
-        connect(newBus, &QPushButton::clicked, this, [this, newBus] {
-            newBusMenu(newBus->mapToGlobal(QPoint(0, 0)));
-        });
-        section("Buses", NodeKind::Bus, program, newBus);
+        auto tile = [this](const QString& text, const QString& tip,
+                           void (MainWindow::*menu)(QPoint)) {
+            auto* b = new QPushButton(text);
+            b->setCursor(Qt::PointingHandCursor);
+            b->setFixedWidth(64);
+            b->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+            b->setToolTip(tip);
+            b->setStyleSheet(
+                "QPushButton { background: transparent; border: 1px dashed #323848;"
+                " border-radius: 6px; color: #8a92a6; font-size: 11px; }"
+                "QPushButton:hover { border-color: #46506a; color: #e8ecf4; }");
+            connect(b, &QPushButton::clicked, this,
+                    [this, b, menu] { (this->*menu)(b->mapToGlobal(QPoint(0, 0))); });
+            return b;
+        };
+        section("Channels", NodeKind::Strip, 0,
+                tile("+ Channel", "New mono or stereo channel", &MainWindow::newChannelMenu));
+        section("Buses", NodeKind::Bus, program,
+                tile("+ Bus", "New aux, group or mix-minus bus", &MainWindow::newBusMenu));
         h->addStretch(1);
         scroll_->setWidget(row);
 
@@ -657,9 +655,13 @@ private:
     }
 
     // --- Routing ---------------------------------------------------------
-    // Assignments (strip -> Program/group bus, bus -> output) are edges;
-    // sends are edges to aux buses: buses that do not reach Program, and
-    // mix-minus buses, which the engine fills by itself (resolveMixMinus).
+    // A channel strip: input (a device input, a stereo pair, a bus or a
+    // test source) -> gain -> processing/inserts -> fader -> main output
+    // (buses and/or outputs), plus sends (to buses or outputs). All of it
+    // is edges; EdgeDesc::send tells sends from the main output. Device
+    // Input nodes always exist (the daemon makes one per channel) and are
+    // always recorded; Output nodes exist while something feeds them.
+    // Mix-minus buses are filled by the engine (resolveMixMinus).
 
     static QMenu* styledMenu(QWidget* parent) {
         auto* m = new QMenu(parent);
@@ -674,17 +676,25 @@ private:
             "QMenu::indicator { width: 12px; left: 6px; }");
         return m;
     }
+    static QAction* heading(QMenu* m, const QString& text) {
+        auto* a = m->addAction(text);
+        a->setEnabled(false);
+        return a;
+    }
 
+    // Aux = a bus that does not reach Program (captions only).
     bool isAux(const NodeDesc& n) const {
         const NodeId program = programBus(graph_);
         return n.kind == NodeKind::Bus && n.id != program &&
                (n.mixMinus.follows || !program || !graph_.reaches(n.id, program));
     }
-    QList<NodeId> auxBuses() const {
-        QList<NodeId> out;
-        for (const auto& n : graph_.nodes)
-            if (isAux(n)) out << n.id;
-        return out;
+    bool isMixMinus(NodeId id) const {
+        const auto* n = graph_.find(id);
+        return n && n->kind == NodeKind::Bus && n->mixMinus.follows;
+    }
+    // Sessions made before EdgeDesc::send had explicit mix-minus sends.
+    bool isSend(const EdgeDesc& e) const {
+        return e.send || e.derived || isMixMinus(e.to);
     }
     static EdgeDesc* edgeOf(GraphDesc& g, NodeId from, NodeId to) {
         for (auto& e : g.edges)
@@ -696,21 +706,41 @@ private:
             return e.from == from && e.to == to;
         });
     }
-    // The pan a strip has in the program; sends keep the same image.
+    // The pan of a channel's main output; sends keep the same image.
     float mainPan(NodeId id) const {
         for (const auto& e : graph_.edges)
-            if (e.from == id && !e.derived)
-                if (const auto* to = graph_.find(e.to); to && !isAux(*to))
-                    return e.pan;
+            if (e.from == id && !isSend(e)) return e.pan;
         return 0;
     }
     static QString outputName(int ioChannel, int channels) {
         return channels > 1 ? QString("Out %1-%2").arg(ioChannel + 1).arg(ioChannel + 2)
                             : QString("Out %1").arg(ioChannel + 1);
     }
+    QString destName(NodeId id) const {
+        const auto* n = graph_.find(id);
+        if (!n) return {};
+        if (n->kind == NodeKind::Output) return outputName(n->ioChannel, n->channels);
+        return QString::fromStdString(n->name);
+    }
     static bool excluded(const NodeDesc& bus, NodeId id) {
         const auto& x = bus.mixMinus.exclude;
         return std::find(x.begin(), x.end(), id) != x.end();
+    }
+    QList<const NodeDesc*> deviceInputs() const {
+        QList<const NodeDesc*> out;
+        for (const auto& n : graph_.nodes)
+            if (n.kind == NodeKind::Input) out << &n;
+        std::sort(out.begin(), out.end(), [](auto* a, auto* b) {
+            return a->ioChannel < b->ioChannel;
+        });
+        return out;
+    }
+    // What feeds a channel: its incoming edges (channels take no sends).
+    QList<NodeId> inputsOf(NodeId id) const {
+        QList<NodeId> out;
+        for (const auto& e : graph_.edges)
+            if (e.to == id) out << e.from;
+        return out;
     }
 
     // Apply an edit: locally at once (so the next edit builds on it), and
@@ -729,74 +759,69 @@ private:
 
     QList<SendList::Row> sendRows(const NodeDesc& n) const {
         QList<SendList::Row> rows;
-        const NodeId program = programBus(graph_);
-        for (NodeId a : auxBuses()) {
-            const auto* bus = graph_.find(a);
+        const QString name = QString::fromStdString(n.name);
+        for (const auto& e : graph_.edges) {
+            if (e.from != n.id || !isSend(e)) continue;
             SendList::Row r;
-            r.bus = QString::fromStdString(bus->name);
-            const QString name = QString::fromStdString(n.name);
-            const bool mm = bus->mixMinus.follows != 0;
-            // Buses do not feed a mix-minus (a group can hide the very
-            // voice it must leave out); no send may close a loop.
-            if (n.id == program || n.id == a || (n.kind == NodeKind::Bus && mm) ||
-                graph_.reaches(a, n.id)) {
-                rows << r;
-                continue;
-            }
-            const EdgeDesc* explicitSend = nullptr;
-            bool derived = false;
-            for (const auto& e : graph_.edges)
-                if (e.from == n.id && e.to == a) {
-                    if (e.derived) derived = true;
-                    else explicitSend = &e;
-                }
-            if (explicitSend) {
-                r.state = SendList::State::On;
-                r.db = explicitSend->gainDb;
-                r.tip = QString("%1 → %2: %3 dB, after the fader.\nDrag to "
-                                "change (Option = fine); double-click for %4.")
-                            .arg(name, r.bus, fmtDb(r.db),
-                                 mm ? "automatic" : "0 dB");
-            } else if (derived) {
+            r.dest = e.to;
+            r.label = destName(e.to);
+            r.db = e.gainDb;
+            if (e.derived) {
                 r.state = SendList::State::Auto;
-                r.tip = QString("%1 is in %2 automatically, like in %3.\n"
-                                "Drag to set its own level; click the dot to "
-                                "leave it out.")
-                            .arg(name, r.bus,
-                                 QString::fromStdString(
-                                     graph_.find(bus->mixMinus.follows)->name));
-            } else if (mm && excluded(*bus, n.id)) {
-                r.state = SendList::State::Minus;
-                r.tip = QString("%1 is left out of %2, so whoever listens to "
-                                "it never hears themselves.\nClick to put it "
-                                "back in.").arg(name, r.bus);
+                const auto* f = graph_.find(graph_.find(e.to)->mixMinus.follows);
+                r.tip = QString("%1 is in %2 automatically, like in %3.\nDrag to "
+                                "set its own level; click the dot to leave it out.")
+                            .arg(name, r.label, f ? QString::fromStdString(f->name) : "Program");
             } else {
-                r.state = SendList::State::Off;
-                r.tip = QString("Not sent to %1. Click the dot to send.").arg(r.bus);
+                r.state = e.mute ? SendList::State::Muted : SendList::State::On;
+                r.tip = QString("Send to %1: %2 dB after the fader%3.\nDot = on/off; "
+                                "drag = level (Option = fine); double-click = %4; "
+                                "right-click for more.")
+                            .arg(r.label, fmtDb(r.db), e.mute ? " (off)" : "",
+                                 isMixMinus(e.to) ? "automatic" : "0 dB");
             }
             rows << r;
         }
+        if (n.kind == NodeKind::Strip)
+            for (const auto& b : graph_.nodes)
+                if (b.mixMinus.follows && excluded(b, n.id)) {
+                    SendList::Row r;
+                    r.dest = b.id;
+                    r.label = QString::fromStdString(b.name);
+                    r.state = SendList::State::Minus;
+                    r.tip = QString("%1 is left out of %2, so whoever listens to it "
+                                    "never hears themselves.\nClick the dash to put "
+                                    "it back in.").arg(name, r.label);
+                    rows << r;
+                }
         return rows;
     }
 
     // "Program", "Talent +1", "Out 3-4"; empty = goes nowhere.
     QPair<QString, QString> assignText(const NodeDesc& n) const {
         QStringList to;
-        for (const auto& e : graph_.edges) {
-            if (e.from != n.id || e.derived) continue;
-            const auto* d = graph_.find(e.to);
-            if (!d) continue;
-            if (d->kind == NodeKind::Output)
-                to << outputName(d->ioChannel, d->channels);
-            else if (d->kind == NodeKind::Bus && !isAux(*d))
-                to << QString::fromStdString(d->name);
-        }
+        for (const auto& e : graph_.edges)
+            if (e.from == n.id && !isSend(e)) to << destName(e.to);
         if (to.isEmpty())
             return {{}, "Not routed anywhere: this channel is not heard. "
                         "Click to assign it."};
         const QString text = to.size() == 1 ? to[0]
                                              : QString("%1 +%2").arg(to[0]).arg(to.size() - 1);
-        return {text, "Routed to " + to.join(", ") + ". Click to change."};
+        return {text, "Main output: " + to.join(", ") + ". Click to change."};
+    }
+
+    QString inputText(NodeId id) const {
+        const auto in = inputsOf(id);
+        if (in.isEmpty()) return {};
+        const auto* a = graph_.find(in[0]);
+        if (in.size() == 2) {
+            const auto* b = graph_.find(in[1]);
+            if (a && b && a->kind == NodeKind::Input && b->kind == NodeKind::Input)
+                return QString("In %1-%2").arg(std::min(a->ioChannel, b->ioChannel) + 1)
+                    .arg(std::max(a->ioChannel, b->ioChannel) + 1);
+        }
+        QString t = a ? QString::fromStdString(a->name) : QString();
+        return in.size() > 1 ? QString("%1 +%2").arg(t).arg(in.size() - 1) : t;
     }
 
     void refreshRouting() {
@@ -806,7 +831,21 @@ private:
             st->sends()->setRows(sendRows(n));
             const auto [text, tip] = assignText(n);
             st->assign()->setText(text, tip);
-            if (n.kind != NodeKind::Bus) continue;
+            if (n.kind == NodeKind::Strip) {
+                const QString in = inputText(n.id);
+                st->input()->setText(in, in.isEmpty()
+                    ? "No input: click to pick a device input, a bus or a test source."
+                    : "Input: " + in + ". Click to change.");
+                const auto ins = inputsOf(n.id);
+                st->setInputControls(true, !ins.isEmpty());
+                for (const auto& e : graph_.edges)
+                    if (e.to == n.id) {
+                        st->gain()->setGain(e.gainDb);
+                        break;
+                    }
+                continue;
+            }
+            st->setInputControls(false, false);
             if (n.mixMinus.follows) {
                 QStringList out;
                 for (NodeId x : n.mixMinus.exclude)
@@ -827,65 +866,139 @@ private:
         }
     }
 
-    const NodeDesc* auxAt(int row) const {
-        const auto a = auxBuses();
-        return row >= 0 && row < a.size() ? graph_.find(a[row]) : nullptr;
+    // --- Input ---
+
+    void inputMenu(NodeId id, QPoint at) {
+        auto* menu = styledMenu(this);
+        const auto current = inputsOf(id);
+        auto option = [&](QMenu* m, const QString& text, QList<NodeId> src, int channels) {
+            auto* a = m->addAction(text);
+            a->setCheckable(true);
+            a->setChecked(QSet<NodeId>(current.begin(), current.end()) ==
+                          QSet<NodeId>(src.begin(), src.end()) && !src.isEmpty());
+            connect(a, &QAction::triggered, this,
+                    [this, id, src, channels] { setInput(id, src, channels); });
+            return a;
+        };
+        auto* none = menu->addAction("No input");
+        connect(none, &QAction::triggered, this, [this, id] { setInput(id, {}, 0); });
+
+        const auto ins = deviceInputs();
+        menu->addSeparator();
+        if (ins.isEmpty()) {
+            heading(menu, "No device inputs (start mixd with --input)");
+        } else {
+            // Long lists go into submenus; short ones stay flat.
+            const bool many = ins.size() > 8;
+            QMenu* mono = many ? menu->addMenu("Mono inputs") : menu;
+            QMenu* stereo = many ? menu->addMenu("Stereo pairs") : menu;
+            if (many) {
+                mono->setStyleSheet(menu->styleSheet());
+                stereo->setStyleSheet(menu->styleSheet());
+            } else {
+                heading(menu, "Device inputs");
+            }
+            for (const auto* in : ins)
+                option(mono, QString("In %1").arg(in->ioChannel + 1), {in->id}, 1);
+            if (!many) menu->addSeparator();
+            for (int i = 0; i + 1 < ins.size(); i += 2)
+                if (ins[i + 1]->ioChannel == ins[i]->ioChannel + 1)
+                    option(stereo, QString("In %1-%2").arg(ins[i]->ioChannel + 1)
+                                       .arg(ins[i]->ioChannel + 2),
+                           {ins[i]->id, ins[i + 1]->id}, 2);
+        }
+        menu->addSeparator();
+        heading(menu, "Buses");
+        for (const auto& b : graph_.nodes) {
+            if (b.kind != NodeKind::Bus) continue;
+            auto* a = option(menu, QString::fromStdString(b.name), {b.id}, b.channels);
+            if (graph_.reaches(id, b.id)) {
+                a->setEnabled(false);  // it listens to this channel
+                a->setText(a->text() + "  (fed by this)");
+            }
+        }
+        bool any = false;
+        for (const auto& g : graph_.nodes)
+            if (g.kind == NodeKind::Generator) {
+                if (!any) {
+                    menu->addSeparator();
+                    heading(menu, "Test sources");
+                    any = true;
+                }
+                option(menu, QString::fromStdString(g.name), {g.id}, g.channels);
+            }
+        menu->popup(at);
     }
 
-    void toggleSend(NodeId id, int row) {
-        const auto* bus = auxAt(row);
-        if (!bus) return;
-        const NodeId a = bus->id;
+    // Replaces what feeds a channel, keeping its gain. The channel takes
+    // the width of its input (a pair or a stereo bus makes it stereo).
+    void setInput(NodeId id, const QList<NodeId>& src, int channels) {
         GraphDesc g = graph_;
-        auto* mm = g.find(a);
-        if (mm->mixMinus.follows && g.find(id)->kind == NodeKind::Strip) {
-            const bool feeding = std::any_of(
-                g.edges.begin(), g.edges.end(),
-                [&](const EdgeDesc& e) { return e.from == id && e.to == a; });
-            auto& x = mm->mixMinus.exclude;
-            if (excluded(*mm, id)) {
-                std::erase(x, id);
-                // A channel that is not in the program has no automatic
-                // send; including it means an explicit one.
-                if (!g.reaches(id, mm->mixMinus.follows))
-                    g.edges.push_back({id, a, 0, mainPan(id)});
-            } else if (feeding) {
-                x.push_back(id);
-                removeEdge(g, id, a);
-            } else {
-                g.edges.push_back({id, a, 0, mainPan(id)});
+        float gain = 0;
+        for (const auto& e : g.edges)
+            if (e.to == id) {
+                gain = e.gainDb;
+                break;
             }
-        } else if (edgeOf(g, id, a)) {
-            removeEdge(g, id, a);
-        } else {
-            g.edges.push_back({id, a, 0, mainPan(id)});
-        }
+        std::erase_if(g.edges, [&](const EdgeDesc& e) { return e.to == id; });
+        for (int i = 0; i < src.size(); ++i)
+            g.edges.push_back({src[i], id, gain,
+                               src.size() == 2 ? (i ? 1.0f : -1.0f) : 0.0f});
+        if (channels) g.find(id)->channels = std::clamp(channels, 1, 2);
         commit(std::move(g));
     }
 
-    void setSendLevel(NodeId id, int row, float db) {
-        const auto* bus = auxAt(row);
-        if (!bus) return;
+    void setGain(NodeId id, float dB) {
         GraphDesc g = graph_;
-        std::erase(g.find(bus->id)->mixMinus.exclude, id);
-        if (auto* e = edgeOf(g, id, bus->id)) {
+        for (auto& e : g.edges)
+            if (e.to == id) e.gainDb = dB;
+        commit(std::move(g), true);
+    }
+
+    // --- Sends ---
+
+    void toggleSend(NodeId id, NodeId dest) {
+        GraphDesc g = graph_;
+        auto* d = g.find(dest);
+        if (!d) return;
+        if (d->mixMinus.follows && g.find(id)->kind == NodeKind::Strip) {
+            auto& x = d->mixMinus.exclude;
+            if (excluded(*d, id)) {
+                std::erase(x, id);
+                // Not in the program: including it takes an explicit send.
+                if (!g.reaches(id, d->mixMinus.follows))
+                    g.edges.push_back({id, dest, 0, mainPan(id), false, true});
+                commit(std::move(g));
+                return;
+            }
+            if (!edgeOf(g, id, dest)) {  // automatic: leave it out
+                x.push_back(id);
+                commit(std::move(g));
+                return;
+            }
+        }
+        if (auto* e = edgeOf(g, id, dest)) e->mute = !e->mute;
+        commit(std::move(g));
+    }
+
+    void setSendLevel(NodeId id, NodeId dest, float db) {
+        GraphDesc g = graph_;
+        if (auto* e = edgeOf(g, id, dest)) {
             e->gainDb = db;
-        } else {
-            removeEdge(g, id, bus->id);  // the automatic one, if any
-            g.edges.push_back({id, bus->id, db, mainPan(id)});
+        } else {  // an automatic mix-minus send becomes the operator's own
+            removeEdge(g, id, dest);
+            g.edges.push_back({id, dest, db, mainPan(id), false, true});
         }
         commit(std::move(g), true);
     }
 
-    void resetSend(NodeId id, int row) {
-        const auto* bus = auxAt(row);
-        if (!bus) return;
+    void resetSend(NodeId id, NodeId dest) {
         GraphDesc g = graph_;
-        auto* b = g.find(bus->id);
-        if (b->mixMinus.follows && g.reaches(id, b->mixMinus.follows)) {
-            std::erase(b->mixMinus.exclude, id);
-            removeEdge(g, id, bus->id);  // back to automatic
-        } else if (auto* e = edgeOf(g, id, bus->id)) {
+        auto* d = g.find(dest);
+        if (d && d->mixMinus.follows && g.reaches(id, d->mixMinus.follows)) {
+            std::erase(d->mixMinus.exclude, id);
+            removeEdge(g, id, dest);  // back to automatic
+        } else if (auto* e = edgeOf(g, id, dest)) {
             e->gainDb = 0;
         } else {
             return;
@@ -893,7 +1006,79 @@ private:
         commit(std::move(g));
     }
 
-    // Output nodes exist while something feeds them.
+    void sendMenu(NodeId id, NodeId dest, QPoint at) {
+        const auto* d = graph_.find(dest);
+        if (!d) return;
+        auto* menu = styledMenu(this);
+        const QString name = destName(dest);
+        GraphDesc probe = graph_;
+        const bool explicitSend = edgeOf(probe, id, dest) != nullptr;
+        if (d->mixMinus.follows) {
+            const bool out = excluded(*d, id);
+            connect(menu->addAction(out ? "Put back into " + name : "Leave out of " + name),
+                    &QAction::triggered, this, [this, id, dest] { toggleSend(id, dest); });
+            if (explicitSend)
+                connect(menu->addAction("Back to automatic level"), &QAction::triggered,
+                        this, [this, id, dest] { resetSend(id, dest); });
+        } else {
+            connect(menu->addAction("Level 0 dB"), &QAction::triggered, this,
+                    [this, id, dest] { resetSend(id, dest); });
+        }
+        if (explicitSend && !d->mixMinus.follows) {
+            menu->addSeparator();
+            connect(menu->addAction("Remove send to " + name), &QAction::triggered,
+                    this, [this, id, dest] {
+                        GraphDesc g = graph_;
+                        removeEdge(g, id, dest);
+                        pruneOutputs(g);
+                        commit(std::move(g));
+                    });
+        }
+        menu->popup(at);
+    }
+
+    // New send: any bus or output this channel does not already reach.
+    void addSendMenu(NodeId id, QPoint at) {
+        auto* menu = styledMenu(this);
+        heading(menu, "Send " + QString::fromStdString(graph_.find(id)->name) + " to");
+        auto taken = [&](NodeId dest) {
+            for (const auto& e : graph_.edges)
+                if (e.from == id && e.to == dest) return true;
+            return false;
+        };
+        for (const auto& b : graph_.nodes) {
+            if (b.kind != NodeKind::Bus || b.id == id || taken(b.id)) continue;
+            if (b.mixMinus.follows && excluded(b, id)) continue;  // its dash row
+            auto* a = menu->addAction(QString::fromStdString(b.name));
+            if (graph_.reaches(b.id, id)) {
+                a->setEnabled(false);
+                a->setText(a->text() + "  (feeds this)");
+            }
+            const NodeId dest = b.id;
+            connect(a, &QAction::triggered, this, [this, id, dest] {
+                GraphDesc g = graph_;
+                g.edges.push_back({id, dest, 0, mainPan(id), false, true});
+                commit(std::move(g));
+            });
+        }
+        menu->addSeparator();
+        for (int ch = 0; ch < deviceOutputs_; ch += 2) {
+            NodeId outId = 0;
+            for (const auto& o : graph_.nodes)
+                if (o.kind == NodeKind::Output && o.ioChannel == ch) outId = o.id;
+            if (outId && taken(outId)) continue;
+            auto* a = menu->addAction(outputName(ch, std::min(2, deviceOutputs_ - ch)));
+            connect(a, &QAction::triggered, this, [this, id, ch] {
+                GraphDesc g = graph_;
+                g.edges.push_back({id, outputNode(g, ch), 0, mainPan(id), false, true});
+                commit(std::move(g));
+            });
+        }
+        menu->popup(at);
+    }
+
+    // --- Main output ---
+
     static void pruneOutputs(GraphDesc& g) {
         std::erase_if(g.nodes, [&](const NodeDesc& n) {
             if (n.kind != NodeKind::Output) return false;
@@ -902,9 +1087,11 @@ private:
             return true;
         });
     }
+    // The first unused id from `from` on: strips 2000+, buses 3000+,
+    // outputs 4000+, as the templates number them.
     static NodeId freeId(const GraphDesc& g, NodeId from) {
         NodeId id = from;
-        for (const auto& n : g.nodes) id = std::max(id, n.id + 1);
+        while (g.find(id)) ++id;
         return id;
     }
     NodeId outputNode(GraphDesc& g, int ioChannel) const {
@@ -935,15 +1122,18 @@ private:
         const auto* n = graph_.find(id);
         if (!n) return;
         auto* menu = styledMenu(this);
-        menu->addAction(QString::fromStdString(n->name) + " goes to")->setEnabled(false);
+        heading(menu, QString::fromStdString(n->name) + " goes to");
+        auto mainEdge = [&](NodeId to) {
+            for (const auto& e : graph_.edges)
+                if (e.from == id && e.to == to && !isSend(e)) return true;
+            return false;
+        };
         for (const auto& b : graph_.nodes) {
-            if (b.kind != NodeKind::Bus || b.id == id || isAux(b)) continue;
+            // Mix-minus buses fill themselves; they are not a destination.
+            if (b.kind != NodeKind::Bus || b.id == id || b.mixMinus.follows) continue;
             auto* act = menu->addAction(QString::fromStdString(b.name));
             act->setCheckable(true);
-            act->setChecked(std::any_of(graph_.edges.begin(), graph_.edges.end(),
-                                        [&](const EdgeDesc& e) {
-                                            return e.from == id && e.to == b.id && !e.derived;
-                                        }));
+            act->setChecked(mainEdge(b.id));
             if (graph_.reaches(b.id, id)) {
                 act->setEnabled(false);  // would feed itself
                 act->setText(act->text() + "  (feeds this)");
@@ -951,8 +1141,8 @@ private:
             const NodeId to = b.id;
             connect(act, &QAction::triggered, this, [this, id, to](bool on) {
                 GraphDesc g = graph_;
+                removeEdge(g, id, to);  // a send to it becomes the main output
                 if (on) g.edges.push_back({id, to, 0, mainPan(id)});
-                else removeEdge(g, id, to);
                 commit(std::move(g));
             });
         }
@@ -965,21 +1155,20 @@ private:
                 outputName(ch, std::min(2, deviceOutputs_ - ch)) +
                 (ch == 0 ? "  (main)" : ""));
             act->setCheckable(true);
-            act->setChecked(outId && std::any_of(graph_.edges.begin(), graph_.edges.end(),
-                                                 [&](const EdgeDesc& e) {
-                                                     return e.from == id && e.to == outId;
-                                                 }));
+            act->setChecked(outId && mainEdge(outId));
             connect(act, &QAction::triggered, this, [this, id, ch](bool on) {
                 GraphDesc g = graph_;
                 const NodeId o = outputNode(g, ch);
-                if (on) g.edges.push_back({id, o, 0, 0});
-                else removeEdge(g, id, o);
+                removeEdge(g, id, o);
+                if (on) g.edges.push_back({id, o, 0, mainPan(id)});
                 pruneOutputs(g);
                 commit(std::move(g));
             });
         }
         menu->popup(at);
     }
+
+    // --- Channels and buses ---
 
     void stripMenu(NodeId id, QPoint at) {
         const auto* n = graph_.find(id);
@@ -993,10 +1182,57 @@ private:
         }
         connect(menu->addAction("Rename " + name + "…"), &QAction::triggered, this,
                 [this, id] { renameNode(id); });
-        if (n->kind == NodeKind::Bus && id != programBus(graph_))
+        if (id != programBus(graph_))
             connect(menu->addAction("Delete " + name + "…"), &QAction::triggered,
-                    this, [this, id] { deleteBus(id); });
+                    this, [this, id] { deleteNode(id); });
         menu->popup(at);
+    }
+
+    void newChannelMenu(QPoint at) {
+        auto* menu = styledMenu(this);
+        connect(menu->addAction("Mono channel"), &QAction::triggered, this,
+                [this] { addChannel(1); });
+        connect(menu->addAction("Stereo channel"), &QAction::triggered, this,
+                [this] { addChannel(2); });
+        menu->popup(at);
+    }
+
+    // A new channel takes the next device input (or pair) nothing uses
+    // yet, and goes to Program.
+    void addChannel(int channels) {
+        GraphDesc g = graph_;
+        NodeDesc s;
+        s.id = freeId(g, 2000);
+        s.kind = NodeKind::Strip;
+        s.channels = channels;
+        int count = 1;
+        for (const auto& n : g.nodes) count += n.kind == NodeKind::Strip;
+        s.name = "Ch " + std::to_string(count);
+        g.nodes.push_back(s);
+        const auto ins = deviceInputs();
+        auto used = [&](NodeId in) {
+            for (const auto& e : g.edges)
+                if (e.from == in) return true;
+            return false;
+        };
+        for (int i = 0; i < ins.size(); ++i) {
+            if (channels == 1 && !used(ins[i]->id)) {
+                g.edges.push_back({ins[i]->id, s.id, 0, 0});
+                s.name = "In " + std::to_string(ins[i]->ioChannel + 1);
+                break;
+            }
+            if (channels == 2 && i + 1 < ins.size() && i % 2 == 0 &&
+                !used(ins[i]->id) && !used(ins[i + 1]->id)) {
+                g.edges.push_back({ins[i]->id, s.id, 0, -1});
+                g.edges.push_back({ins[i + 1]->id, s.id, 0, 1});
+                s.name = "In " + std::to_string(ins[i]->ioChannel + 1) + "-" +
+                         std::to_string(ins[i]->ioChannel + 2);
+                break;
+            }
+        }
+        g.find(s.id)->name = s.name;
+        if (const NodeId program = programBus(g)) g.edges.push_back({s.id, program, 0, 0});
+        commit(std::move(g));
     }
 
     void newBusMenu(QPoint at) {
@@ -1061,15 +1297,17 @@ private:
         commit(std::move(g));
     }
 
-    void deleteBus(NodeId id) {
+    void deleteNode(NodeId id) {
         const auto* n = graph_.find(id);
         if (!n) return;
         const QString name = QString::fromStdString(n->name);
         QMessageBox box(QMessageBox::Warning, "Delete " + name,
-                        "Delete " + name + "?",
-                        QMessageBox::Cancel, this);
-        box.setInformativeText("Everything routed through it stops reaching "
-                               "its destinations (with a short fade).");
+                        "Delete " + name + "?", QMessageBox::Cancel, this);
+        box.setInformativeText(n->kind == NodeKind::Bus
+            ? "Everything routed through it stops reaching its destinations "
+              "(with a short fade)."
+            : "Its processing, inserts and sends go with it (the input stays "
+              "available, and recorded).");
         auto* del = box.addButton("Delete", QMessageBox::DestructiveRole);
         box.exec();
         if (box.clickedButton() != del) return;
@@ -1078,21 +1316,12 @@ private:
         std::erase_if(g.edges, [&](const EdgeDesc& e) {
             return e.from == id || e.to == id;
         });
-        for (auto& x : g.nodes)
+        for (auto& x : g.nodes) {
             if (x.mixMinus.follows == id) x.mixMinus = {};
+            std::erase(x.mixMinus.exclude, id);
+        }
         pruneOutputs(g);
         commit(std::move(g));
-    }
-
-    // The input/generator node feeding a strip: its level is the strip's
-    // input gain (applied before any processing).
-    static NodeId sourceOf(const GraphDesc& g, NodeId strip) {
-        for (const auto& e : g.edges)
-            if (e.to == strip)
-                if (const auto* f = g.find(e.from);
-                    f && (f->kind == NodeKind::Input || f->kind == NodeKind::Generator))
-                    return f->id;
-        return 0;
     }
 
     StripWidget* makeStrip(const NodeDesc& n, bool master) {
@@ -1100,16 +1329,9 @@ private:
                                   master);
         s->setLevel(n.faderDb, n.mute);
         const auto id = n.id;
-        const NodeId source = sourceOf(pendingGraph_, n.id);
-        s->setHasGain(source != 0);
-        if (source) {
-            if (const auto* src = pendingGraph_.find(source)) s->gain()->setGain(src->faderDb);
-            gainSource_[id] = source;
-            s->gain()->onGain = [this, source](float dB) {
-                client_.setLevel(source, dB, false);
-                if (auto* srcNode = graph_.find(source)) srcNode->faderDb = dB;
-            };
-        }
+        s->setInputControls(n.kind == NodeKind::Strip, false);
+        s->gain()->onGain = [this, id](float dB) { setGain(id, dB); };
+        s->input()->onClick = [this, id](QPoint at) { inputMenu(id, at); };
         s->onChange = [this, id](float db, bool mute) {
             client_.setLevel(id, db, mute);
             if (auto* n = graph_.find(id)) {  // so the next edit keeps it
@@ -1118,11 +1340,13 @@ private:
             }
         };
         s->inserts()->onAdd = [this, id](QPoint at) { openBrowser(id, {}, at); };
-        s->sends()->onToggle = [this, id](int row) { toggleSend(id, row); };
-        s->sends()->onLevel = [this, id](int row, float db) {
-            setSendLevel(id, row, db);
+        s->sends()->onToggle = [this, id](quint32 d) { toggleSend(id, d); };
+        s->sends()->onLevel = [this, id](quint32 d, float db) {
+            setSendLevel(id, d, db);
         };
-        s->sends()->onReset = [this, id](int row) { resetSend(id, row); };
+        s->sends()->onReset = [this, id](quint32 d) { resetSend(id, d); };
+        s->sends()->onMenu = [this, id](quint32 d, QPoint at) { sendMenu(id, d, at); };
+        s->sends()->onAdd = [this, id](QPoint at) { addSendMenu(id, at); };
         s->assign()->onClick = [this, id](QPoint at) { assignMenu(id, at); };
         s->onContext = [this, id](QPoint at) { stripMenu(id, at); };
         s->inserts()->onSlot = [this, id](int index, QPoint at) {
@@ -1184,7 +1408,6 @@ private:
     QTimer eventsTimer_;
     QMap<quint32, StripWidget*> strips_;
     GraphDesc graph_, pendingGraph_;
-    QMap<quint32, quint32> gainSource_;  // strip -> its source node
     QJsonArray catalog_;
     bool scanning_ = false;
     QMap<quint32, QMap<QString, QPair<qint64, qint64>>> rtIssues_;  // allocs, missed

@@ -115,6 +115,7 @@ public:
                              : shows::inputs(std::min(ins, 64));
         if (!fresh && loadSession(show))
             qInfo("mixd: restored session %s", qPrintable(sessionPath_));
+        shows::normalize(show, ins);
         if (!engine_->setGraph(show, &err)) {
             *error = QString::fromStdString(err);
             return false;
@@ -564,6 +565,8 @@ int main(int argc, char** argv) {
         {"fresh", "Start from the template, ignoring the saved session"},
         {"audible", "Send program to the device (default: silence)"},
         {"record", "Record every source and the program bus here", "dir"},
+        {"sim-inputs", "With --driver sim: this many (silent) device inputs",
+         "n", "0"},
         {"input", "Input device (name, prefix or UID; \"default\"; or none)",
          "device", "none"},
         {"output", "Output device (name, prefix or UID; default: system)",
@@ -594,6 +597,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<Driver> driver;
     std::string err;
     if (p.value("driver") == "sim") {
+        dc.numInputs = std::clamp(p.value("sim-inputs").toInt(), 0, 128);
         driver = makeSimDriver(dc, false);
 #if defined(__APPLE__)
     } else if (p.value("driver") == "coreaudio") {

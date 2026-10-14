@@ -124,7 +124,7 @@ void resolveMixMinus(GraphDesc& g) {
                     pan = e.pan;
                     break;
                 }
-            add.push_back({s.id, m.id, 0, pan, true});
+            add.push_back({s.id, m.id, 0, pan, true, true});
         }
     }
     g.edges.insert(g.edges.end(), add.begin(), add.end());
@@ -334,7 +334,7 @@ void EdgeInstance::targetsFor(const EdgeDesc* e, int srcCh, int dstCh,
                               float out[kMaxChannels][kMaxChannels]) {
     for (int d = 0; d < kMaxChannels; ++d)
         for (int s = 0; s < kMaxChannels; ++s) out[d][s] = 0;
-    if (!e) return;
+    if (!e || e->mute) return;
     const float g = dsp::dbToGain(e->gainDb);
     if (srcCh == 1 && dstCh == 2) {
         // -3 dB constant-power pan law.

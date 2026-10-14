@@ -84,3 +84,24 @@ TEST(resolved_graph_round_trips) {
     CHECK(e.setGraph(back));
     CHECK(e.graph().edges.size() == resolved.edges.size());
 }
+
+// Every device input exists (and is recorded) whether a channel uses it or
+// not; old sessions' source-fader trims move onto the input edges.
+TEST(normalize_adds_device_inputs_and_moves_trim) {
+    GraphDesc g = shows::inputs(2);
+    g.find(1000)->faderDb = 6;  // a 0.0.1 session: trim on the source
+    shows::normalize(g, 4);
+    int inputs = 0;
+    for (const auto& n : g.nodes) inputs += n.kind == NodeKind::Input;
+    CHECK(inputs == 4);
+    CHECK(g.find(1000)->faderDb == 0);
+    for (const auto& e : g.edges)
+        if (e.from == 1000) CHECK(e.gainDb == 6);
+    const auto n = g.nodes.size();
+    shows::normalize(g, 4);  // idempotent
+    CHECK(g.nodes.size() == n);
+    EngineConfig c;
+    c.numInputs = 4;
+    Engine e(c);
+    CHECK(e.setGraph(g));
+}

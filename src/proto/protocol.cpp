@@ -193,6 +193,8 @@ QJsonObject graphToJson(const GraphDesc& g) {
                       {"gainDb", e.gainDb},
                       {"pan", e.pan}};
         if (e.derived) o["derived"] = true;
+        if (e.send) o["send"] = true;
+        if (e.mute) o["mute"] = true;
         edges.append(o);
     }
     return QJsonObject{{"nodes", nodes}, {"edges", edges}};
@@ -235,7 +237,8 @@ bool graphFromJson(const QJsonObject& o, GraphDesc& g, QString* error) {
             return fail("edge without endpoints");
         out.edges.push_back({NodeId(e["from"].toDouble()),
                              NodeId(e["to"].toDouble()), num(e, "gainDb", 0),
-                             num(e, "pan", 0), e["derived"].toBool(false)});
+                             num(e, "pan", 0), e["derived"].toBool(false),
+                             e["send"].toBool(false), e["mute"].toBool(false)});
     }
     g = std::move(out);
     return true;

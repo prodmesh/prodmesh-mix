@@ -1,5 +1,6 @@
 #include "daemon/shows.h"
 
+#include <algorithm>
 #include <string>
 
 namespace pm::shows {
@@ -71,7 +72,7 @@ GraphDesc livestream() {
         NodeDesc src;
         src.id = 1000 + NodeId(i);
         src.kind = NodeKind::Generator;
-        src.name = std::string(s.name) + " source";
+        src.name = "Test " + std::to_string(i + 1);
         src.generator.seed = std::uint32_t(i + 1);
         src.generator.freqHz = s.freq;
         src.generator.sineDb = -14;
@@ -122,7 +123,7 @@ GraphDesc inputs(int count) {
         in.id = 1000 + NodeId(i);
         in.kind = NodeKind::Input;
         in.ioChannel = i;
-        in.name = "In " + std::to_string(i + 1) + " source";
+        in.name = "In " + std::to_string(i + 1);
         g.nodes.push_back(in);
         NodeDesc strip;
         strip.id = 2000 + NodeId(i);
@@ -141,6 +142,32 @@ GraphDesc inputs(int count) {
     g.nodes.push_back(out);
     g.edges.push_back({kProgram, out.id, 0, 0});
     return g;
+}
+
+void normalize(GraphDesc& g, int deviceInputs) {
+    for (auto& n : g.nodes) {
+        if ((n.kind != NodeKind::Input && n.kind != NodeKind::Generator) ||
+            n.faderDb == 0)
+            continue;
+        for (auto& e : g.edges)
+            if (e.from == n.id) e.gainDb += n.faderDb;
+        n.faderDb = 0;
+    }
+    NodeId next = 1000;
+    for (const auto& n : g.nodes) next = std::max(next, n.id + 1);
+    for (int ch = 0; ch < deviceInputs; ++ch) {
+        bool have = false;
+        for (const auto& n : g.nodes)
+            have |= n.kind == NodeKind::Input && n.ioChannel <= ch &&
+                    ch < n.ioChannel + n.channels;
+        if (have) continue;
+        NodeDesc in;
+        in.id = next++;
+        in.kind = NodeKind::Input;
+        in.ioChannel = ch;
+        in.name = "In " + std::to_string(ch + 1);
+        g.nodes.push_back(in);
+    }
 }
 
 }  // namespace pm::shows

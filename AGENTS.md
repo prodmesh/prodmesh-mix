@@ -116,19 +116,32 @@ cmake -S . -B build -G Ninja && cmake --build build
 
 ## Routing and mix-minus
 
-Routing is edges: a strip's *assignment* is its edge to Program or a group
-bus (a bus that reaches Program); a *send* is an edge to an aux bus (one
-that does not). Output nodes exist while something feeds them (the UI
-creates and prunes them). A **mix-minus** bus (`NodeDesc::mixMinus`:
-`follows` + `exclude`) is a rule, not a list: `resolveMixMinus()` (run by
-`Engine::setGraph` on every edit) feeds it from every strip that reaches
-`follows`, post-fader, except the excluded ones — new strips join by
-themselves. Those edges are `derived`; an explicit edge from a strip to the
-bus overrides its automatic one. Buses never feed a mix-minus automatically
-(a group may contain the voice it must leave out). UI: send rows on every
-strip (dot = on/off/"−" left out, drag = level, double-click = 0 dB or back
-to automatic), "→ destination" button, "+ Bus" tile, right-click a strip
-for "New mix-minus for …".
+The console model: a **channel** (Strip) has an *input* (a device input,
+a stereo pair of them, a bus, or a test source), input gain, processing
+and inserts, a fader, a *main output* (buses and/or outputs) and *sends*
+(to buses or outputs, each with a level and on/off). All of it is edges:
+gain on the input edge is the channel's input gain; `EdgeDesc::send`
+separates sends from the main output (presentation only), and
+`EdgeDesc::mute` silences an edge but keeps its level. Device inputs are
+fixed: `shows::normalize()` gives every device channel a mono Input node,
+so every input is always recorded whether a channel uses it or not, and a
+stereo channel takes two of them panned hard L/R. Output nodes exist while
+something feeds them (the UI creates and prunes them).
+
+A **mix-minus** bus (`NodeDesc::mixMinus`: `follows` + `exclude`) is a
+rule, not a list: `resolveMixMinus()` (run by `Engine::setGraph` on every
+edit) feeds it from every strip that reaches `follows`, post-fader, except
+the excluded ones — new channels join by themselves. Those edges are
+`derived`; an explicit edge from a strip to the bus overrides its automatic
+one. Buses never feed a mix-minus automatically (a group may contain the
+voice it must leave out).
+
+UI: input button at the top of each channel; send slots like insert slots
+(dot = on/off, "−" = left out of a mix-minus; drag = level; double-click
+= 0 dB or back to automatic; right-click = menu; last row = + Send); the
+"→ destination" button; "+ Channel" and "+ Bus" tiles; right-click a strip
+to rename, delete, or make a mix-minus for it. `mixd --driver sim
+--sim-inputs 8` gives silent device inputs to try it without hardware.
 
 ## Recording
 

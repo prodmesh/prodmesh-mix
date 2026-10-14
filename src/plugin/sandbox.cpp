@@ -97,9 +97,14 @@ public:
         for (int c = 0; c < channels_; ++c)
             std::memcpy(view_.in(slot, c), ch[std::min(c, nch - 1)],
                         sizeof(float) * std::size_t(frames));
-        const bool ready = seq > 1 && h.done.load(std::memory_order_acquire) == seq - 1;
+        const std::uint64_t done = h.done.load(std::memory_order_acquire);
+        const bool ready = seq > 1 && done == seq - 1;
+        // A host still starting up (nothing delivered yet) passes dry too,
+        // but is not "late": misses count once it is running. The watchdog
+        // streak always counts, so a plugin that hangs on its first block
+        // is still killed and restarted.
         if (seq > 1 && !ready) {
-            misses_.fetch_add(1, std::memory_order_relaxed);
+            if (done > 0) misses_.fetch_add(1, std::memory_order_relaxed);
             streak_.fetch_add(1, std::memory_order_relaxed);
         } else if (ready) {
             streak_.store(0, std::memory_order_relaxed);
@@ -113,6 +118,7 @@ public:
                             sizeof(float) * std::size_t(frames));
         }
         h.frames[slot] = std::uint32_t(frames);
+        h.requestNs[slot].store(rt::nowNs(), std::memory_order_relaxed);
         h.request.store(seq, std::memory_order_release);
         sandbox::ring(h);
     }

@@ -227,8 +227,19 @@ state, up to 3 times. The host's stdin/stdout is a line protocol
 the host's main thread (CLAP cocoa embedding). Plugin state is an opaque
 base64 blob on `InsertDesc::state`, excluded from structural equality;
 `Engine::collectPluginStates()` refreshes it before every session save.
-Not done yet: VST3 edit controller (parameters, VST3 editors), plugin
-parameter automation, sharing one host across channels.
+Host render threads join their own audio work interval (deadline per
+block), created *before* the host reports Ready: the first
+`AudioWorkIntervalCreate` in a process costs ~100 ms, which once made a
+restarted host pass audio dry. Hosts are accessory processes (no Dock
+icon) that bring themselves forward when an editor opens. Misses count
+only after a host's first delivered block (startup is not "late"); the
+hang watchdog counts from the start. Measure with
+`mix-bench --isolated N [--isolated-plugin FORMAT:PATH:ID]` and
+`PM_HOST_STATS=1` (per-host wake/work timing on stderr). On the dev
+machine, 16 isolated Pro-Q 3 hosts: 0 late blocks; without the work
+interval, wake-ups of up to 2 ms under load (1.2% late in one run).
+Not done yet: plugin parameter automation, sharing one host across
+channels.
 
 ## UX rules (spec: UX principles)
 

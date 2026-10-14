@@ -19,7 +19,7 @@
 namespace pm::sandbox {
 
 inline constexpr std::uint32_t kMagic = 0x504d5342;  // "PMSB"
-inline constexpr std::uint32_t kVersion = 1;
+inline constexpr std::uint32_t kVersion = 2;
 inline constexpr int kMaxChannels = 2;
 
 enum class HostState : std::uint32_t {
@@ -40,6 +40,7 @@ struct Header {
     std::atomic<std::int32_t> latency;    // plugin's own latency, samples
     std::atomic<std::uint64_t> hostAllocs;  // host-side RT allocations
     std::uint32_t frames[2];              // frames in each slot
+    std::atomic<std::uint64_t> requestNs[2];  // when each slot was posted
     char name[64];                        // plugin display name (host)
 };
 

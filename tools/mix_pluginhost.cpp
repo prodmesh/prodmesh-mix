@@ -19,6 +19,10 @@
 
 #if defined(PM_HOST_GUI)
 #include <QApplication>
+#if defined(__APPLE__)
+#include <objc/message.h>
+#include <objc/runtime.h>
+#endif
 #include <QCloseEvent>
 #include <QMap>
 #include <QSocketNotifier>
@@ -29,6 +33,10 @@
 #include "core/base64.h"
 #include "core/rt_guard.h"
 #include "core/rt_thread.h"
+#if defined(__APPLE__)
+#include <AudioToolbox/AudioWorkInterval.h>
+#include <os/workgroup.h>
+#endif
 #include "plugin/plugin.h"
 #include "plugin/sandbox_shm.h"
 
@@ -40,6 +48,18 @@ std::atomic<bool> gQuit{false};
 void onTerm(int) { gQuit.store(true); }
 
 #if defined(PM_HOST_GUI)
+// An accessory process (no Dock icon) is not brought forward by showing a
+// window; a plugin window the operator asked for must come to the front.
+void bringToFront() {
+#if defined(__APPLE__)
+    auto* cls = reinterpret_cast<id>(objc_getClass("NSApplication"));
+    using Shared = id (*)(id, SEL);
+    using Activate = void (*)(id, SEL, BOOL);
+    id nsApp = reinterpret_cast<Shared>(objc_msgSend)(cls, sel_registerName("sharedApplication"));
+    reinterpret_cast<Activate>(objc_msgSend)(nsApp, sel_registerName("activateIgnoringOtherApps:"), YES);
+#endif
+}
+
 // A plugin's editor in its own window; closing the window destroys the
 // editor (the plugin keeps running).
 class EditorWindow : public QWidget {
@@ -57,6 +77,7 @@ public:
         if (!plugin_.createEditor(reinterpret_cast<void*>(winId()), &w, &h))
             return false;
         setFixedSize(w, h);
+        bringToFront();
         raise();
         activateWindow();
         return true;
@@ -104,6 +125,17 @@ int main(int argc, char** argv) {
     // gets only argv[0] — it would read our --plugin as its own -plugin.
     int qtArgc = 1;
     QApplication app(qtArgc, argv);
+#if defined(__APPLE__)
+    // An accessory process: plugin windows, but no Dock icon or menu bar
+    // per host (a show can run dozens). NSApplicationActivationPolicyAccessory.
+    {
+        auto* cls = reinterpret_cast<id>(objc_getClass("NSApplication"));
+        using Shared = id (*)(id, SEL);
+        using SetPolicy = BOOL (*)(id, SEL, long);
+        id nsApp = reinterpret_cast<Shared>(objc_msgSend)(cls, sel_registerName("sharedApplication"));
+        reinterpret_cast<SetPolicy>(objc_msgSend)(nsApp, sel_registerName("setActivationPolicy:"), 1);
+    }
+#endif
     app.setQuitOnLastWindowClosed(false);
 #endif
 
@@ -157,6 +189,16 @@ int main(int argc, char** argv) {
         }
     std::strncpy(h.name, names.c_str(), sizeof h.name - 1);
     h.latency.store(latency);
+#if defined(__APPLE__)
+    // Like the engine's own render threads: an audio work interval with a
+    // deadline per block, so the scheduler knows the render thread is on
+    // the clock (P-cores, priority) rather than inferring it. Without it, a
+    // busy machine (a VM, say) delayed some wake-ups by ~2 ms. Created
+    // before Ready: the first one in a process costs ~100 ms, which must
+    // not be spent passing audio through dry (e.g. after a restart).
+    os_workgroup_interval_t interval = AudioWorkIntervalCreate(
+        "ProdMesh Mix plugin host", OS_CLOCK_MACH_ABSOLUTE_TIME, nullptr);
+#endif
     h.state.store(std::uint32_t(sandbox::HostState::Ready), std::memory_order_release);
 
     // The render loop gets its own real-time thread; the main thread is
@@ -164,12 +206,22 @@ int main(int argc, char** argv) {
     std::thread render([&] {
         const auto period = std::uint64_t(1e9 * maxBlock / rate);
         rt::promoteCurrentThread(period, period / 2);
+#if defined(__APPLE__)
+        rt::WorkgroupMembership member(interval);
+        bool intervalOk = member.joined();
+#endif
         // Allocate before entering the guarded scope: only the plugins'
         // own allocations should be counted against them.
         std::vector<float*> ptr(static_cast<std::size_t>(channels));
         rt::ScopedRealtime realtime;
         rt::ScopedThirdParty attribute(&h.hostAllocs);
         std::uint64_t last = h.done.load();
+        // PM_HOST_STATS=1: per-block timing, printed to stderr at exit.
+        // wake = request posted -> this thread running; work = plugins.
+        const bool stats = std::getenv("PM_HOST_STATS") != nullptr;
+        std::uint64_t blocks = 0, late = 0, maxWake = 0, maxWork = 0;
+        std::uint64_t skipped = 0, firstSkipAt = 0;  // requests never seen
+        std::uint64_t wakeOver[4] = {}, workOver[4] = {};  // >0.25,0.5,0.75,1 period
         while (!gQuit.load(std::memory_order_relaxed)) {
             const std::uint32_t bell = h.doorbell.load(std::memory_order_acquire);
             const std::uint64_t seq = h.request.load(std::memory_order_acquire);
@@ -181,16 +233,62 @@ int main(int argc, char** argv) {
             }
             const int slot = int(seq & 1);
             const int frames = int(h.frames[slot]);
+            const std::uint64_t t0 = stats ? rt::nowNs() : 0;
+            const std::uint64_t posted = h.requestNs[slot].load(std::memory_order_relaxed);
             for (int c = 0; c < channels; ++c) {
                 std::memcpy(view.out(slot, c), view.in(slot, c),
                             sizeof(float) * std::size_t(frames));
                 ptr[std::size_t(c)] = view.out(slot, c);
             }
+#if defined(__APPLE__)
+            if (intervalOk && posted &&
+                os_workgroup_interval_start(interval, rt::nsToHostTicks(posted),
+                                            rt::nsToHostTicks(posted + period),
+                                            nullptr) != 0)
+                intervalOk = false;  // a scheduling hint only
+#endif
             for (auto& p : plugins) p->process(ptr.data(), channels, frames);
             h.done.store(seq, std::memory_order_release);
+#if defined(__APPLE__)
+            if (intervalOk && posted &&
+                os_workgroup_interval_finish(interval, nullptr) != 0)
+                intervalOk = false;
+#endif
+            if (stats && last && seq > last + 1) {
+                if (!skipped) firstSkipAt = seq;
+                skipped += seq - last - 1;
+            }
+            if (stats && seq == last + 1) {
+                const std::uint64_t t1 = rt::nowNs();
+                const std::uint64_t wake = t0 > posted ? t0 - posted : 0, work = t1 - t0;
+                ++blocks;
+                late += wake + work > period;
+                maxWake = std::max(maxWake, wake);
+                maxWork = std::max(maxWork, work);
+                for (int q = 0; q < 4; ++q) {
+                    wakeOver[q] += wake > period * std::uint64_t(q + 1) / 4;
+                    workOver[q] += work > period * std::uint64_t(q + 1) / 4;
+                }
+            }
             last = seq;
         }
+        if (stats)
+            std::fprintf(stderr,
+                         "pluginhost %d: blocks %llu late %llu skipped %llu (first at %llu) | wake max %.0f us, "
+                         ">25/50/75/100%% %llu/%llu/%llu/%llu | work max %.0f us, "
+                         ">25/50/75/100%% %llu/%llu/%llu/%llu\n",
+                         int(getpid()), (unsigned long long)blocks,
+                         (unsigned long long)late, (unsigned long long)skipped,
+                         (unsigned long long)firstSkipAt, maxWake / 1e3,
+                         (unsigned long long)wakeOver[0], (unsigned long long)wakeOver[1],
+                         (unsigned long long)wakeOver[2], (unsigned long long)wakeOver[3],
+                         maxWork / 1e3, (unsigned long long)workOver[0],
+                         (unsigned long long)workOver[1], (unsigned long long)workOver[2],
+                         (unsigned long long)workOver[3]);
         for (auto& p : plugins) p->stopProcessing();
+#if defined(__APPLE__)
+        if (interval) os_release(interval);
+#endif
     });
 #if defined(PM_HOST_GUI)
     // Main thread: plugin editors, and line commands from the engine on
@@ -225,6 +323,7 @@ int main(int argc, char** argv) {
                 const int i = std::atoi(line.c_str() + 7);
                 if (i < 0 || i >= int(plugins.size())) continue;
                 if (auto* w = editors.value(i); w && w->isVisible()) {
+                    bringToFront();
                     w->raise();
                     w->activateWindow();
                     continue;

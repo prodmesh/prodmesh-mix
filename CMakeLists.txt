@@ -137,6 +137,9 @@ else()
     set_target_properties(pm-test-clap PROPERTIES SUFFIX ".clap")
 endif()
 add_dependencies(mix-tests pm-test-clap)
+add_dependencies(mix-bench pm-test-clap mix-pluginhost)
+target_compile_definitions(mix-bench PRIVATE
+    PM_TEST_CLAP="$<TARGET_BUNDLE_DIR:pm-test-clap>")
 target_compile_definitions(mix-tests PRIVATE
     PM_TEST_CLAP="$<TARGET_BUNDLE_DIR:pm-test-clap>")
 

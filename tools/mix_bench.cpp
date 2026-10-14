@@ -42,6 +42,9 @@ struct Options {
     int stallMs = 0;        // stall the disk writer this long ...
     double stallAt = 5;     // ... this many seconds in
     double ringSeconds = 30;
+    // Isolated plugins: one host process each on the first N strips.
+    int isolated = 0;
+    std::string isolatedFormat = "clap", isolatedPath, isolatedId;
 };
 
 void usage() {
@@ -50,7 +53,10 @@ void usage() {
         "          [--driver sim|free|coreaudio] [--workers N]\n"
         "          [--heavy N] [--heavy-ops N] [--edits PER_SEC] [--json]\n"
         "          [--audible]   (coreaudio renders silence unless set)\n"
-        "          [--record DIR [--stall-ms MS] [--stall-at S] [--ring-seconds S]]");
+        "          [--record DIR [--stall-ms MS] [--stall-at S] [--ring-seconds S]]\n"
+        "          [--isolated N [--isolated-plugin FORMAT:PATH:ID]]\n"
+        "              N strips get an isolated plugin (default: the in-tree\n"
+        "              test gain); reports blocks their hosts were late for");
 }
 
 bool parse(int argc, char** argv, Options& o) {
@@ -74,6 +80,15 @@ bool parse(int argc, char** argv, Options& o) {
         else if (is("--stall-ms")) o.stallMs = std::atoi(val());
         else if (is("--stall-at")) o.stallAt = std::atof(val());
         else if (is("--ring-seconds")) o.ringSeconds = std::atof(val());
+        else if (is("--isolated")) o.isolated = std::atoi(val());
+        else if (is("--isolated-plugin")) {
+            const std::string v = val();
+            const auto a = v.find(':'), b = v.rfind(':');
+            if (a == std::string::npos || a == b) return false;
+            o.isolatedFormat = v.substr(0, a);
+            o.isolatedPath = v.substr(a + 1, b - a - 1);
+            o.isolatedId = v.substr(b + 1);
+        }
         else return false;
     }
     return true;
@@ -179,7 +194,23 @@ int main(int argc, char** argv) {
     rp.paths = o.paths;
     rp.heavyInserts = o.heavy;
     rp.heavyOpsPerSample = o.heavyOps;
-    if (!engine.setGraph(bench::makeReferenceGraph(rp), &err)) {
+    GraphDesc graph = bench::makeReferenceGraph(rp);
+    if (o.isolated > 0) {
+#ifdef PM_TEST_CLAP
+        if (o.isolatedPath.empty()) {
+            o.isolatedPath = PM_TEST_CLAP;
+            o.isolatedId = "com.prodmesh.test.gain";
+        }
+#endif
+        int n = 0;
+        for (auto& node : graph.nodes)
+            if (node.kind == NodeKind::Strip && n < o.isolated) {
+                node.processing.inserts.push_back(InsertDesc::plugin(
+                    o.isolatedFormat, o.isolatedPath, o.isolatedId, true));
+                ++n;
+            }
+    }
+    if (!engine.setGraph(graph, &err)) {
         std::fprintf(stderr, "graph: %s\n", err.c_str());
         return 1;
     }
@@ -336,6 +367,18 @@ int main(int argc, char** argv) {
         std::printf("load: mean %.1f%%  worst %.1f%% of period  "
                     "(T0-2 target < 70%%)\n",
                     100 * meanUs / periodUs, 100 * maxUs / periodUs);
+    }
+    if (o.isolated > 0 && !o.json) {
+        std::uint64_t missed = 0;
+        int hosts = 0;
+        for (const auto& i : engine.pluginRtIssues()) missed += i.missed;
+        for (const auto& node : engine.graph().nodes)
+            for (const auto& ins : node.processing.inserts) hosts += ins.sandboxed;
+        const double blocks = double(hist.count) * hosts;
+        std::printf("isolated: %d hosts, %llu late blocks of %.0f (%.3f%%), "
+                    "passed through dry\n",
+                    hosts, (unsigned long long)missed, blocks,
+                    blocks > 0 ? 100.0 * double(missed) / blocks : 0.0);
     }
     if (recorder && !o.json)
         std::printf("recording: %zu tracks, %.1f s each, dropped %llu frames, "

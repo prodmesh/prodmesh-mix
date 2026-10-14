@@ -403,6 +403,91 @@ private:
     int hover_ = -1;
 };
 
+// Input gain (trim) before any processing: a compact drag field.
+// Drag up/down (Option = fine), scroll, double-click = 0 dB.
+class GainField : public QWidget {
+public:
+    std::function<void(float)> onGain;
+    static constexpr float kMin = -20, kMax = 40;
+
+    GainField() {
+        setFixedHeight(20);
+        setCursor(Qt::SizeVerCursor);
+        setToolTip("Input gain — before EQ, dynamics and inserts.\n"
+                   "Drag up/down (hold Option for fine), double-click for 0 dB.");
+    }
+    void setGain(float dB) {
+        if (dragging_) return;
+        gain_ = dB;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        p.setBrush(dragging_ ? QColor("#2c3241") : QColor("#191c23"));
+        p.drawRoundedRect(rect(), 4, 4);
+        // A thin bar shows where in the range the gain sits.
+        const float f = (gain_ - kMin) / (kMax - kMin);
+        p.setBrush(QColor(47, 191, 155, 60));
+        p.drawRoundedRect(QRectF(0, height() - 3, width() * f, 3), 1.5, 1.5);
+        QFont lf = font();
+        lf.setPixelSize(8);
+        lf.setWeight(QFont::DemiBold);
+        lf.setLetterSpacing(QFont::AbsoluteSpacing, 0.6);
+        p.setFont(lf);
+        p.setPen(theme::text);
+        p.drawText(rect().adjusted(5, 0, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, "GAIN");
+        QFont v = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        v.setPixelSize(10);
+        p.setFont(v);
+        p.setPen(gain_ != 0.0f ? theme::textMax : QColor("#5a6172"));
+        p.drawText(rect().adjusted(0, 0, -5, 0), Qt::AlignVCenter | Qt::AlignRight,
+                   (gain_ > 0.05f ? "+" : "") + QString::number(double(gain_), 'f', 1));
+    }
+    void mousePressEvent(QMouseEvent* e) override {
+        dragging_ = true;
+        grabY_ = e->position().y();
+        grabGain_ = gain_;
+        update();
+    }
+    void mouseMoveEvent(QMouseEvent* e) override {
+        if (!dragging_) return;
+        const float perPx = e->modifiers() & Qt::AltModifier ? 0.02f : 0.2f;
+        if (perPx != lastPerPx_) {  // re-anchor when switching fine/coarse
+            grabY_ = e->position().y();
+            grabGain_ = gain_;
+            lastPerPx_ = perPx;
+            return;
+        }
+        commit(grabGain_ + float(grabY_ - e->position().y()) * perPx);
+    }
+    void mouseReleaseEvent(QMouseEvent*) override {
+        dragging_ = false;
+        lastPerPx_ = 0.2f;
+        update();
+    }
+    void mouseDoubleClickEvent(QMouseEvent*) override { commit(0); }
+    void wheelEvent(QWheelEvent* e) override {
+        const int notches = e->angleDelta().y() / 120;
+        if (notches) commit(gain_ + 0.5f * float(notches));
+    }
+
+private:
+    void commit(float dB) {
+        dB = std::clamp(std::round(dB * 10.0f) / 10.0f, kMin, kMax);
+        if (dB == gain_) return;
+        gain_ = dB;
+        update();
+        if (onGain) onGain(dB);
+    }
+    float gain_ = 0, grabGain_ = 0, lastPerPx_ = 0.2f;
+    double grabY_ = 0;
+    bool dragging_ = false;
+};
+
 // "DLY 3115" / "CMP 64": a quiet label and a value that only takes colour
 // when it is non-zero.
 class DelayCell : public QWidget {
@@ -477,6 +562,8 @@ public:
         setName(name);
         v->addWidget(name_);
 
+        gain_ = new GainField;
+        v->addWidget(gain_);
         inserts_ = new InsertList;
         v->addWidget(inserts_);
 
@@ -544,6 +631,16 @@ public:
         fader_->setMeter(peak, rms);
     }
     InsertList* inserts() { return inserts_; }
+    // Strips fed by a source get a gain field; buses do not.
+    GainField* gain() { return gain_; }
+    void setHasGain(bool on) {
+        // Hidden but still taking its space, so faders line up across
+        // strips and buses.
+        auto sp = gain_->sizePolicy();
+        sp.setRetainSizeWhenHidden(true);
+        gain_->setSizePolicy(sp);
+        gain_->setVisible(on);
+    }
     // chain: this node's own insert latency. comp: (destination name,
     // samples) of the delay applied on each of its outputs. arrival: total
     // latency at this node's output.
@@ -579,6 +676,7 @@ private:
     QLabel* readout_;
     DelayCell* dly_;
     DelayCell* cmp_;
+    GainField* gain_;
     InsertList* inserts_;
     FaderMeter* fader_;
     QPushButton* mute_;

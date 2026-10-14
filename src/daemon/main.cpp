@@ -5,6 +5,8 @@
 //   mixd [--driver coreaudio|sim] [--rate HZ] [--block N] [--workers N]
 //        [--socket NAME] [--session FILE] [--fresh] [--audible]
 //        [--record DIR] [--ring-seconds S]
+//        [--input DEVICE|none] [--output DEVICE] [--show demo|inputs]
+//        [--list-devices]
 //
 // The show is saved to --session (default: the app data dir) within half a
 // second of any change, atomically, and reloaded on start — restarting the
@@ -27,6 +29,7 @@
 #include <QSocketNotifier>
 #include <QTimer>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <sys/socket.h>
@@ -101,10 +104,15 @@ public:
     }
 
     bool start(const QString& socketName, const QString& session, bool fresh,
-               QString* error) {
+               const QString& showName, QString* error) {
         sessionPath_ = session;
         std::string err;
-        GraphDesc show = shows::livestream();
+        // Real inputs when the device has them (or when asked), the demo
+        // show of generators otherwise.
+        const int ins = driver_->config().numInputs;
+        GraphDesc show = showName == "demo" || (showName.isEmpty() && ins == 0)
+                             ? shows::livestream()
+                             : shows::inputs(std::min(ins, 64));
         if (!fresh && loadSession(show))
             qInfo("mixd: restored session %s", qPrintable(sessionPath_));
         if (!engine_->setGraph(show, &err)) {
@@ -136,10 +144,10 @@ public:
         saveTimer_.setInterval(500);
         connect(&saveTimer_, &QTimer::timeout, this, &Daemon::saveSession);
 
-        qInfo("mixd: %s %.0f Hz, block %d, socket %s",
-              driver_->config().numOutputs ? "running" : "running (no outputs)",
-              driver_->config().sampleRate, driver_->config().blockSize,
-              qPrintable(server_.fullServerName()));
+        qInfo("mixd: running on %s: %d in / %d out, %.0f Hz, block %d, socket %s",
+              driver_->deviceName().c_str(), driver_->config().numInputs,
+              driver_->config().numOutputs, driver_->config().sampleRate,
+              driver_->config().blockSize, qPrintable(server_.fullServerName()));
         return true;
     }
 
@@ -438,7 +446,9 @@ private:
                 {"latency", latency},
                 {"delay", delay},
                 {"warnings", warnings},
-                {"engine", QJsonObject{{"sampleRate", dc.sampleRate},
+                {"engine", QJsonObject{{"device", QString::fromStdString(driver_->deviceName())},
+                                       {"inputs", dc.numInputs},
+                                       {"sampleRate", dc.sampleRate},
                                        {"block", dc.blockSize},
                                        {"outputs", dc.numOutputs},
                                        {"periodUs", periodUs_}}}};
@@ -554,14 +564,33 @@ int main(int argc, char** argv) {
         {"fresh", "Start from the template, ignoring the saved session"},
         {"audible", "Send program to the device (default: silence)"},
         {"record", "Record every source and the program bus here", "dir"},
+        {"input", "Input device (name, prefix or UID; \"default\"; or none)",
+         "device", "none"},
+        {"output", "Output device (name, prefix or UID; default: system)",
+         "device"},
+        {"show", "Starting show when there is no session: demo or inputs",
+         "name"},
+        {"list-devices", "List audio devices and exit"},
         {"ring-seconds", "Per-track disk buffer (T0-8 headroom)", "s", "30"},
     });
     p.process(app);
 
+#if defined(__APPLE__)
+    if (p.isSet("list-devices")) {
+        for (const auto& d : listAudioDevices())
+            std::printf("%-34s in %3d  out %3d  %6.0f Hz%s%s\n", d.name.c_str(),
+                        d.inputs, d.outputs, d.sampleRate,
+                        d.defaultInput ? "  [default input]" : "",
+                        d.defaultOutput ? "  [default output]" : "");
+        return 0;
+    }
+#endif
     DriverConfig dc;
     dc.sampleRate = p.value("rate").toDouble();
     dc.blockSize = p.value("block").toInt();
     dc.numOutputs = 4;
+    dc.inputDevice = p.value("input") == "default" ? "" : p.value("input").toStdString();
+    dc.outputDevice = p.value("output").toStdString();
     std::unique_ptr<Driver> driver;
     std::string err;
     if (p.value("driver") == "sim") {
@@ -595,7 +624,8 @@ int main(int argc, char** argv) {
             ? p.value("session")
             : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
                   "/session.json";
-    if (!daemon->start(p.value("socket"), session, p.isSet("fresh"), &why)) {
+    if (!daemon->start(p.value("socket"), session, p.isSet("fresh"),
+                       p.value("show"), &why)) {
         qCritical("mixd: %s", qPrintable(why));
         return 1;
     }

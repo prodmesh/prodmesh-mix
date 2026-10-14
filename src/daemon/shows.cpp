@@ -107,4 +107,39 @@ GraphDesc livestream() {
     return g;
 }
 
+GraphDesc inputs(int count) {
+    GraphDesc g;
+    NodeDesc program;
+    program.id = kProgram;
+    program.kind = NodeKind::Bus;
+    program.channels = 2;
+    program.name = "Program";
+    program.processing = busChain(true);
+    g.nodes.push_back(program);
+    for (int i = 0; i < count; ++i) {
+        NodeDesc in;
+        in.id = 1000 + NodeId(i);
+        in.kind = NodeKind::Input;
+        in.ioChannel = i;
+        in.name = "In " + std::to_string(i + 1) + " source";
+        g.nodes.push_back(in);
+        NodeDesc strip;
+        strip.id = 2000 + NodeId(i);
+        strip.name = "In " + std::to_string(i + 1);
+        strip.processing.hpf = true;
+        g.nodes.push_back(strip);
+        const float pan = count > 1 ? -0.6f + 1.2f * float(i) / float(count - 1) : 0.0f;
+        g.edges.push_back({in.id, strip.id, 0, 0});
+        g.edges.push_back({strip.id, kProgram, 0, pan});
+    }
+    NodeDesc out;
+    out.id = 4000;
+    out.kind = NodeKind::Output;
+    out.channels = 2;
+    out.name = "Program out";
+    g.nodes.push_back(out);
+    g.edges.push_back({kProgram, out.id, 0, 0});
+    return g;
+}
+
 }  // namespace pm::shows

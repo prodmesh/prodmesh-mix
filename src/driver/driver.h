@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/rt_thread.h"
 #include "core/spsc_queue.h"
@@ -33,6 +34,16 @@ struct DriverConfig {
     int blockSize = 128;
     int numInputs = 0;
     int numOutputs = 2;
+    // CoreAudio: device name (or prefix) / UID; "" = system default.
+    // inputDevice "none" opens no inputs (and asks for no mic permission).
+    std::string inputDevice = "none", outputDevice;
+};
+
+struct AudioDeviceInfo {
+    std::string name, uid;
+    int inputs = 0, outputs = 0;
+    double sampleRate = 0;
+    bool defaultInput = false, defaultOutput = false;
 };
 
 class Driver {
@@ -43,6 +54,7 @@ public:
     virtual const DriverConfig& config() const = 0;
     // The OS audio workgroup render workers should join, if any.
     virtual rt::Workgroup workgroup() const { return nullptr; }
+    virtual std::string deviceName() const { return "simulated clock"; }
     DriverStats& stats() { return stats_; }
 
 protected:
@@ -54,10 +66,13 @@ protected:
 std::unique_ptr<Driver> makeSimDriver(const DriverConfig& cfg, bool freeRun);
 
 #if defined(__APPLE__)
-// Default CoreAudio output device, opened and configured (the actual rate
-// and block size land in config()). Inputs are not opened (no mic prompt).
+// CoreAudio devices from cfg (input + output, combined into a private
+// drift-corrected aggregate when they differ), opened and configured; the
+// actual rate, block size and channel counts land in config(). Opening an
+// input makes macOS ask for microphone permission once.
 std::unique_ptr<Driver> makeCoreAudioDriver(const DriverConfig& cfg,
                                             std::string* error);
+std::vector<AudioDeviceInfo> listAudioDevices();
 #endif
 
 }  // namespace pm

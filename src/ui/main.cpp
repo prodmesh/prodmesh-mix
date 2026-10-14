@@ -99,8 +99,9 @@ public:
         connected_ = c;
         update();
     }
-    void setFormat(double rate, int block) {
-        format_ = QString("%1 kHz · %2 samples")
+    void setFormat(double rate, int block, const QString& device) {
+        format_ = QString("%1 · %2 kHz · %3 samples")
+                      .arg(device.isEmpty() ? "Engine" : device)
                       .arg(rate / 1000.0, 0, 'g', 3)
                       .arg(block);
         update();
@@ -381,12 +382,15 @@ private:
             }
             const auto eng = m["engine"].toObject();
             rate_ = eng["sampleRate"].toDouble();
-            health_->setFormat(rate_, eng["block"].toInt());
+            health_->setFormat(rate_, eng["block"].toInt(), eng["device"].toString());
             GraphDesc g;
             if (proto::graphFromJson(m["graph"].toObject(), g, nullptr)) {
                 if (!sameLayout(g, graph_) || strips_.isEmpty()) build(g);
                 graph_ = g;
                 const auto delay = m["delay"].toObject();
+                for (auto it = gainSource_.cbegin(); it != gainSource_.cend(); ++it)
+                    if (const auto* src = graph_.find(it.value()))
+                        if (auto* st = strips_.value(it.key())) st->gain()->setGain(src->faderDb);
                 for (const auto& n : graph_.nodes)
                     if (auto* st = strips_.value(n.id)) {
                         st->setLevel(n.faderDb, n.mute);
@@ -441,8 +445,13 @@ private:
                 s->setMeter(pk, rms);
             }
         } else if (type == "level") {
-            if (auto* s = strips_.value(quint32(m["id"].toDouble())))
+            const auto id = quint32(m["id"].toDouble());
+            if (auto* s = strips_.value(id))
                 s->setLevel(float(m["faderDb"].toDouble()), m["mute"].toBool());
+            for (auto it = gainSource_.cbegin(); it != gainSource_.cend(); ++it)
+                if (it.value() == id)
+                    if (auto* s = strips_.value(it.key()))
+                        s->gain()->setGain(float(m["faderDb"].toDouble()));
         } else if (type == "health") {
             health_->setHealth(m);
             rtIssues_.clear();
@@ -582,6 +591,8 @@ private:
     void build(const GraphDesc& g) {
         for (auto* s : strips_) s->deleteLater();
         strips_.clear();
+        gainSource_.clear();
+        pendingGraph_ = g;
 
         auto* row = new QWidget;
         row->setObjectName("root");
@@ -618,11 +629,32 @@ private:
             masterHost_->layout()->addWidget(makeStrip(*p, true));
     }
 
+    // The input/generator node feeding a strip: its level is the strip's
+    // input gain (applied before any processing).
+    static NodeId sourceOf(const GraphDesc& g, NodeId strip) {
+        for (const auto& e : g.edges)
+            if (e.to == strip)
+                if (const auto* f = g.find(e.from);
+                    f && (f->kind == NodeKind::Input || f->kind == NodeKind::Generator))
+                    return f->id;
+        return 0;
+    }
+
     StripWidget* makeStrip(const NodeDesc& n, bool master) {
         auto* s = new StripWidget(QString::fromStdString(n.name), n.channels,
                                   master);
         s->setLevel(n.faderDb, n.mute);
         const auto id = n.id;
+        const NodeId source = sourceOf(pendingGraph_, n.id);
+        s->setHasGain(source != 0);
+        if (source) {
+            if (const auto* src = pendingGraph_.find(source)) s->gain()->setGain(src->faderDb);
+            gainSource_[id] = source;
+            s->gain()->onGain = [this, source](float dB) {
+                client_.setLevel(source, dB, false);
+                if (auto* srcNode = graph_.find(source)) srcNode->faderDb = dB;
+            };
+        }
         s->onChange = [this, id](float db, bool mute) {
             client_.setLevel(id, db, mute);
             if (auto* n = graph_.find(id)) {  // so the next edit keeps it
@@ -689,7 +721,8 @@ private:
     QLabel* events_;
     QTimer eventsTimer_;
     QMap<quint32, StripWidget*> strips_;
-    GraphDesc graph_;
+    GraphDesc graph_, pendingGraph_;
+    QMap<quint32, quint32> gainSource_;  // strip -> its source node
     QJsonArray catalog_;
     bool scanning_ = false;
     QMap<quint32, QMap<QString, QPair<qint64, qint64>>> rtIssues_;  // allocs, missed

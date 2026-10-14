@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <random>
 #include <string>
 #include <thread>
@@ -215,6 +216,8 @@ int main(int argc, char** argv) {
     }
 
     Histogram hist;
+    std::uint64_t seenXruns = 0;
+    std::uint32_t windowMaxNs = 0;  // slowest render since the last check
     bool stalled = false;
     double maxFill = 0;
     std::mt19937 rng(42);
@@ -228,7 +231,24 @@ int main(int argc, char** argv) {
         const double elapsed = std::chrono::duration<double>(now - t0).count();
         if (elapsed >= o.seconds) break;
         engine.pump();
-        while (auto s = driver->stats().samples.pop()) hist.add(s->durationNs);
+        while (auto s = driver->stats().samples.pop()) {
+            hist.add(s->durationNs);
+            windowMaxNs = std::max(windowMaxNs, s->durationNs);
+        }
+        // Every xrun is logged with the time and how long our renders took
+        // around it: a fast render during an xrun points at the system or
+        // the device, a slow one at us.
+        if (const auto x = driver->stats().xruns.load(); x != seenXruns) {
+            const auto t = std::time(nullptr);
+            char when[32];
+            std::strftime(when, sizeof when, "%H:%M:%S", std::localtime(&t));
+            std::fprintf(stderr, "  XRUN at %s (%.0fs): total %llu, slowest render "
+                                 "in the last ~2 ms window %.0f us (%.0f%% of period)\n",
+                         when, elapsed, (unsigned long long)x, windowMaxNs / 1e3,
+                         100.0 * windowMaxNs / 1e3 / (1e6 * cfg.blockSize / cfg.sampleRate));
+            seenXruns = x;
+        }
+        windowMaxNs = 0;
         if (recorder) {
             if (o.stallMs && !stalled && elapsed >= o.stallAt) {
                 recorder->simulateStall(o.stallMs);

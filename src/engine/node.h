@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,6 +51,18 @@ public:
         return false;
     }
     virtual void destroyEditor() {}
+    // Hosting process, main thread, ~30 Hz: housekeeping such as passing
+    // the processor's meter values to a VST3 controller (its editor).
+    virtual void idle() {}
+    // Dev/test aid: set a parameter by (case-insensitive) title, exactly as
+    // the plugin's own editor would. Main thread of the hosting process.
+    virtual bool setParameterByTitle(const std::string& /*title*/,
+                                     double /*normalized*/) {
+        return false;
+    }
+    // Set by the window that hosts the editor; the plugin may ask for a
+    // new size.
+    std::function<void(int w, int h)> onEditorResize;
 
     // Plugin state as raw bytes, in the process that hosts the plugin (its
     // main/control thread).

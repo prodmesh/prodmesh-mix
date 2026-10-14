@@ -47,6 +47,7 @@ public:
     explicit EditorWindow(Processor& p) : plugin_(p) {
         setAttribute(Qt::WA_NativeWindow);
         setWindowTitle(QString::fromStdString(p.name()));
+        plugin_.onEditorResize = [this](int w, int h) { setFixedSize(w, h); };
     }
     bool open() {
         // The native view must exist before the plugin attaches to it.
@@ -63,6 +64,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* e) override {
+        plugin_.onEditorResize = nullptr;
         plugin_.destroyEditor();
         e->accept();
         deleteLater();
@@ -246,6 +248,12 @@ int main(int argc, char** argv) {
         if (gQuit.load()) app.quit();
     });
     quitCheck.start(100);
+    // ~30 Hz main-thread housekeeping (VST3: meters to the controller).
+    QTimer idle;
+    QObject::connect(&idle, &QTimer::timeout, [&] {
+        for (auto& p : plugins) p->idle();
+    });
+    idle.start(33);
     app.exec();
     gQuit.store(true);
     for (auto* w : editors) w->close();

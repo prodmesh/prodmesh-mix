@@ -28,7 +28,8 @@ if args.catalog:
 else:
     lines = subprocess.run([f"{args.build}/mix-plugin", "scan"],
                            capture_output=True, text=True).stdout.splitlines()
-rows = [json.loads(l) for l in lines if l.startswith("{") and "quarantined" not in l]
+rows = [r for r in (json.loads(l) for l in lines if l.startswith("{"))
+        if "format" in r and "quarantined" not in r and not r.get("instrument")]
 
 picks = []
 for want in args.names or DEFAULT:

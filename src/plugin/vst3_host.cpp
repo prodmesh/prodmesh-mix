@@ -7,7 +7,11 @@
 // context, and a buffer for every bus the plugin declares.
 #include <pluginterfaces/base/ibstream.h>
 #include <pluginterfaces/base/ipluginbase.h>
+#include <pluginterfaces/gui/iplugview.h>
+#include <pluginterfaces/vst/ivstattributes.h>
 #include <pluginterfaces/vst/ivstaudioprocessor.h>
+#include <pluginterfaces/vst/ivsteditcontroller.h>
+#include <pluginterfaces/vst/ivstmessage.h>
 #include <pluginterfaces/vst/ivstcomponent.h>
 #include <pluginterfaces/vst/ivstevents.h>
 #include <pluginterfaces/vst/ivsthostapplication.h>
@@ -18,14 +22,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
+#include <atomic>
 #include <map>
+#include <variant>
 
 #include "core/rt_guard.h"
+#include "core/spsc_queue.h"
 #include "plugin/plugin.h"
 
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #endif
+
+// The SDK's vstinitiids.cpp does not cover the GUI interfaces.
+namespace Steinberg {
+DEF_CLASS_IID(IPlugView)
+DEF_CLASS_IID(IPlugFrame)
+}  // namespace Steinberg
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -51,6 +65,104 @@ bool tracing() {
     uint32 PLUGIN_API addRef() override { return 1; }    \
     uint32 PLUGIN_API release() override { return 1; }
 
+#define PM_REFCOUNT                                                  \
+    std::atomic<uint32> refs_{1};                                    \
+    uint32 PLUGIN_API addRef() override { return ++refs_; }          \
+    uint32 PLUGIN_API release() override {                           \
+        const uint32 r = --refs_;                                    \
+        if (r == 0) delete this;                                     \
+        return r;                                                    \
+    }
+
+// Messages between a plugin's processor and controller travel through
+// host-created objects; plugins create them with IHostApplication.
+class HostAttributes final : public IAttributeList {
+public:
+    using Value = std::variant<int64, double, std::u16string, std::string>;
+    tresult PLUGIN_API setInt(AttrID id, int64 v) override { return set(id, v); }
+    tresult PLUGIN_API getInt(AttrID id, int64& v) override { return get(id, v); }
+    tresult PLUGIN_API setFloat(AttrID id, double v) override { return set(id, v); }
+    tresult PLUGIN_API getFloat(AttrID id, double& v) override { return get(id, v); }
+    tresult PLUGIN_API setString(AttrID id, const TChar* s) override {
+        std::u16string str;
+        for (; s && *s; ++s) str += char16_t(*s);
+        return set(id, str);
+    }
+    tresult PLUGIN_API getString(AttrID id, TChar* out, uint32 sizeBytes) override {
+        auto it = values_.find(id);
+        if (it == values_.end() || !std::holds_alternative<std::u16string>(it->second))
+            return kResultFalse;
+        const auto& str = std::get<std::u16string>(it->second);
+        const uint32 n = std::min<uint32>(uint32(str.size()), sizeBytes / sizeof(TChar) - 1);
+        for (uint32 i = 0; i < n; ++i) out[i] = TChar(str[i]);
+        out[n] = 0;
+        return kResultOk;
+    }
+    tresult PLUGIN_API setBinary(AttrID id, const void* d, uint32 size) override {
+        return set(id, std::string(static_cast<const char*>(d), size));
+    }
+    tresult PLUGIN_API getBinary(AttrID id, const void*& d, uint32& size) override {
+        auto it = values_.find(id);
+        if (it == values_.end() || !std::holds_alternative<std::string>(it->second))
+            return kResultFalse;
+        const auto& b = std::get<std::string>(it->second);
+        d = b.data();
+        size = uint32(b.size());
+        return kResultOk;
+    }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, IAttributeList::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            addRef();
+            *obj = this;
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    PM_REFCOUNT
+
+private:
+    template <typename T>
+    tresult set(AttrID id, T v) {
+        if (!id) return kInvalidArgument;
+        values_[id] = std::move(v);
+        return kResultOk;
+    }
+    template <typename T>
+    tresult get(AttrID id, T& v) {
+        auto it = values_.find(id ? id : "");
+        if (it == values_.end() || !std::holds_alternative<T>(it->second))
+            return kResultFalse;
+        v = std::get<T>(it->second);
+        return kResultOk;
+    }
+    std::map<std::string, Value> values_;
+};
+
+class HostMessage final : public IMessage {
+public:
+    ~HostMessage() { attrs_->release(); }
+    FIDString PLUGIN_API getMessageID() override { return id_.c_str(); }
+    void PLUGIN_API setMessageID(FIDString id) override { id_ = id ? id : ""; }
+    IAttributeList* PLUGIN_API getAttributes() override { return attrs_; }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, IMessage::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            addRef();
+            *obj = this;
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    PM_REFCOUNT
+
+private:
+    std::string id_;
+    HostAttributes* attrs_ = new HostAttributes;
+};
+
 class HostApp final : public IHostApplication {
 public:
     tresult PLUGIN_API getName(String128 name) override {
@@ -60,7 +172,17 @@ public:
         name[i] = 0;
         return kResultOk;
     }
-    tresult PLUGIN_API createInstance(TUID, TUID, void** obj) override {
+    tresult PLUGIN_API createInstance(TUID cid, TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(cid, IMessage::iid) &&
+            FUnknownPrivate::iidEqual(iid, IMessage::iid)) {
+            *obj = static_cast<IMessage*>(new HostMessage);
+            return kResultOk;
+        }
+        if (FUnknownPrivate::iidEqual(cid, IAttributeList::iid) &&
+            FUnknownPrivate::iidEqual(iid, IAttributeList::iid)) {
+            *obj = static_cast<IAttributeList*>(new HostAttributes);
+            return kResultOk;
+        }
         *obj = nullptr;
         return kResultFalse;
     }
@@ -306,9 +428,71 @@ bool parseId(const std::string& hex, TUID out) {
     return true;
 }
 
+// Parameter edits from the plugin's editor (controller, main thread) to
+// its processor (audio thread), through a wait-free queue.
+struct ParamEdit {
+    ParamID id = 0;
+    ParamValue value = 0;
+};
+
+class ComponentHandler final : public IComponentHandler {
+public:
+    SpscQueue<ParamEdit>* edits = nullptr;
+    tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue v) override {
+        if (edits) edits->push({id, v});
+        return kResultOk;
+    }
+    tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, IComponentHandler::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = this;
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    PM_NO_REFCOUNT
+};
+
+class PlugFrame final : public IPlugFrame {
+public:
+    std::function<void(int, int)>* onResize = nullptr;
+    tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* r) override {
+        if (!view || !r) return kInvalidArgument;
+        if (onResize && *onResize) (*onResize)(r->getWidth(), r->getHeight());
+        view->onSize(r);
+        return kResultTrue;
+    }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, IPlugFrame::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = this;
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    PM_NO_REFCOUNT
+};
+
 class Vst3Processor final : public Processor {
 public:
     ~Vst3Processor() override {
+        destroyEditor();
+        if (controller_) {
+            controller_->setComponentHandler(nullptr);
+            if (componentCP_ && controllerCP_) {
+                componentCP_->disconnect(controllerCP_);
+                controllerCP_->disconnect(componentCP_);
+            }
+            if (componentCP_) componentCP_->release();
+            if (controllerCP_) controllerCP_->release();
+            if (separateController_) controller_->terminate();
+            controller_->release();
+        }
         if (component_) {
             if (active_) component_->setActive(false);
             component_->terminate();
@@ -346,6 +530,8 @@ public:
                 kResultOk ||
             !processor_)
             return fail("not an audio processor");
+
+        setUpController();
 
         const int32 nIn = component_->getBusCount(kAudio, kInput);
         const int32 nOut = component_->getBusCount(kAudio, kOutput);
@@ -446,6 +632,11 @@ public:
         d.inputs = inBufs_.data();
         d.outputs = outBufs_.data();
         paramsOut_.clear();
+        paramsIn_.clear();
+        while (auto e = edits_.pop()) {
+            int32 index = 0;
+            if (auto* q = paramsIn_.addParameterData(e->id, index)) q->addPoint(0, e->value, index);
+        }
         d.inputParameterChanges = &paramsIn_;
         d.outputParameterChanges = &paramsOut_;
         d.inputEvents = &eventsIn_;
@@ -463,17 +654,101 @@ public:
                         sizeof(float) * std::size_t(n));
     }
 
+    // Blob: "PMV3", u32 component bytes, component state, u32 controller
+    // bytes, controller state. A bare blob is component state alone.
     bool saveState(std::string& out) override {
-        MemStream ms;
-        if (component_->getState(&ms) != kResultOk) return false;
-        out = std::move(ms.data);
+        MemStream comp, ctrl;
+        if (component_->getState(&comp) != kResultOk) return false;
+        if (controller_) controller_->getState(&ctrl);
+        auto u32 = [&out](std::uint32_t v) { out.append(reinterpret_cast<char*>(&v), 4); };
+        out = "PMV3";
+        u32(std::uint32_t(comp.data.size()));
+        out += comp.data;
+        u32(std::uint32_t(ctrl.data.size()));
+        out += ctrl.data;
         return true;
     }
 
     bool loadState(const std::string& in) override {
-        MemStream ms;
-        ms.data = in;
-        return component_->setState(&ms) == kResultOk;
+        MemStream comp, ctrl;
+        if (in.size() >= 8 && in.compare(0, 4, "PMV3") == 0) {
+            std::uint32_t n = 0;
+            std::memcpy(&n, in.data() + 4, 4);
+            if (8 + std::size_t(n) > in.size()) return false;
+            comp.data = in.substr(8, n);
+            std::size_t at = 8 + n;
+            if (at + 4 <= in.size()) {
+                std::uint32_t m = 0;
+                std::memcpy(&m, in.data() + at, 4);
+                if (at + 4 + m <= in.size()) ctrl.data = in.substr(at + 4, m);
+            }
+        } else {
+            comp.data = in;
+        }
+        if (component_->setState(&comp) != kResultOk) return false;
+        if (controller_) {
+            comp.pos = 0;
+            controller_->setComponentState(&comp);
+            if (!ctrl.data.empty()) controller_->setState(&ctrl);
+        }
+        return true;
+    }
+
+    // --- controller & editor (main thread of the hosting process) --------
+    bool hasEditor() const override { return controller_ != nullptr; }
+
+    bool createEditor(void* parent, int* w, int* h) override {
+        if (!controller_ || view_) return false;
+        view_ = controller_->createView(ViewType::kEditor);
+        if (!view_) return false;
+        if (view_->isPlatformTypeSupported(kPlatformTypeNSView) != kResultTrue) {
+            view_->release();
+            view_ = nullptr;
+            return false;
+        }
+        frame_.onResize = &onEditorResize;
+        view_->setFrame(&frame_);
+        ViewRect r;
+        view_->getSize(&r);
+        if (view_->attached(parent, kPlatformTypeNSView) != kResultOk) {
+            view_->release();
+            view_ = nullptr;
+            return false;
+        }
+        if (w) *w = r.getWidth();
+        if (h) *h = r.getHeight();
+        return true;
+    }
+
+    void destroyEditor() override {
+        if (!view_) return;
+        view_->setFrame(nullptr);
+        view_->removed();
+        view_->release();
+        view_ = nullptr;
+    }
+
+    bool setParameterByTitle(const std::string& title, double v) override {
+        if (!controller_) return false;
+        for (int32 i = 0; i < controller_->getParameterCount(); ++i) {
+            ParameterInfo info{};
+            if (controller_->getParameterInfo(i, info) != kResultOk) continue;
+            std::string name;
+            for (int k = 0; info.title[k] && k < 128; ++k) name += char(info.title[k]);
+            if (strcasecmp(name.c_str(), title.c_str()) != 0) continue;
+            // The same path a knob in the editor takes.
+            controller_->setParamNormalized(info.id, v);
+            handler_.performEdit(info.id, v);
+            return true;
+        }
+        return false;
+    }
+
+    // Processor -> controller: meter values the plugin reported.
+    void idle() override {
+        if (!controller_) return;
+        while (auto e = toController_.pop())
+            controller_->setParamNormalized(e->id, e->value);
     }
 
     void stopProcessing() override {
@@ -490,9 +765,56 @@ private:
         std::vector<float> data;
         std::vector<float*> ptr;
     };
+    // Single-component plugins implement IEditController on the component;
+    // otherwise the controller is its own object, created and connected.
+    void setUpController() {
+        if (component_->queryInterface(IEditController::iid,
+                                       reinterpret_cast<void**>(&controller_)) == kResultOk &&
+            controller_) {
+            separateController_ = false;
+        } else {
+            controller_ = nullptr;
+            TUID ccid;
+            if (component_->getControllerClassId(ccid) != kResultOk) return;
+            if (module_->factory->createInstance(ccid, IEditController::iid,
+                                                 reinterpret_cast<void**>(&controller_)) !=
+                    kResultOk ||
+                !controller_)
+                return;
+            if (controller_->initialize(&gHost) != kResultOk) {
+                controller_->release();
+                controller_ = nullptr;
+                return;
+            }
+            separateController_ = true;
+            component_->queryInterface(IConnectionPoint::iid,
+                                       reinterpret_cast<void**>(&componentCP_));
+            controller_->queryInterface(IConnectionPoint::iid,
+                                        reinterpret_cast<void**>(&controllerCP_));
+            if (componentCP_ && controllerCP_) {
+                componentCP_->connect(controllerCP_);
+                controllerCP_->connect(componentCP_);
+            }
+        }
+        handler_.edits = &edits_;
+        controller_->setComponentHandler(&handler_);
+        MemStream st;
+        if (component_->getState(&st) == kResultOk) {
+            st.pos = 0;
+            controller_->setComponentState(&st);
+        }
+    }
+
     std::shared_ptr<Module> module_;
     IComponent* component_ = nullptr;
     IAudioProcessor* processor_ = nullptr;
+    IEditController* controller_ = nullptr;
+    IConnectionPoint *componentCP_ = nullptr, *controllerCP_ = nullptr;
+    bool separateController_ = false;
+    IPlugView* view_ = nullptr;
+    ComponentHandler handler_;
+    PlugFrame frame_;
+    SpscQueue<ParamEdit> edits_{1024}, toController_{4096};
     bool active_ = false, processing_ = false, failed_ = false;
     std::string name_;
     int latency_ = 0, maxBlock_ = 0;

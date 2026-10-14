@@ -245,6 +245,44 @@ int stampCatalog(const char* in) {
     return 0;
 }
 
+// mix-plugin param BUNDLE ID TITLE VALUE: renders 2 s, sets the parameter
+// through the editor path, renders 2 s more; prints the output peak of each
+// half (the edit must change the sound).
+int paramCheck(const char* bundle, const char* id, const char* title, double v) {
+    constexpr int kBlock = 128;
+    const std::string format = fs::path(bundle).extension() == ".vst3" ? "vst3" : "clap";
+    std::string err;
+    auto p = plugin::load(format, bundle, id, 48000, kBlock, 1, &err);
+    if (!p) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    std::vector<float> buf(kBlock);
+    float* ch[1] = {buf.data()};
+    double phase = 0;
+    auto block = [&] {  // a loud 220 Hz tone, -6 dBFS
+        for (auto& x : buf) {
+            x = 0.5f * float(std::sin(phase));
+            phase += 2 * 3.14159265358979 * 220 / 48000;
+        }
+        p->process(ch, 1, kBlock);
+        float pk = 0;
+        for (float x : buf) pk = std::max(pk, std::fabs(x));
+        return pk;
+    };
+    float before = 0, after = 0;
+    for (int b = 0; b < 750; ++b) before = std::max(before, b > 375 ? block() : (block(), 0.0f));
+    if (!p->setParameterByTitle(title, v)) {
+        std::fprintf(stderr, "no parameter \"%s\"\n", title);
+        return 1;
+    }
+    for (int b = 0; b < 750; ++b) after = std::max(after, b > 375 ? block() : (block(), 0.0f));
+    std::printf("%s: output peak %.1f dBFS before, %.1f dBFS after %s = %.2f\n", id,
+                20 * std::log10(before), 20 * std::log10(after), title, v);
+    p->stopProcessing();
+    return std::fabs(20 * std::log10(after / before)) > 1.0 ? 0 : 1;
+}
+
 int bench(const char* bundle, const char* id) {
     // PM_RT_ABORT=1: abort at the first audio-thread allocation (run it
     // under lldb to see who allocated).
@@ -323,6 +361,8 @@ int main(int argc, char** argv) {
         return scan(argv[0], std::vector<std::string>(argv + 2, argv + argc));
     if (argc >= 4 && !std::strcmp(argv[1], "bench")) return bench(argv[2], argv[3]);
     if (argc >= 3 && !std::strcmp(argv[1], "stamp-catalog")) return stampCatalog(argv[2]);
+    if (argc >= 6 && !std::strcmp(argv[1], "param"))
+        return paramCheck(argv[2], argv[3], argv[4], std::atof(argv[5]));
     std::puts("mix-plugin scan [DIR...] | describe BUNDLE | bench BUNDLE ID");
     return 2;
 }

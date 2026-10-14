@@ -198,8 +198,16 @@ MeterState::Reading MeterState::take() {
     return r;
 }
 
-EdgeInstance::EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh)
-    : from_(from), to_(to), srcCh_(srcCh), dstCh_(dstCh) {}
+EdgeInstance::EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh,
+                           int delaySamples, int maxBlock)
+    : from_(from), to_(to), srcCh_(srcCh), dstCh_(dstCh),
+      delay_(std::max(0, delaySamples)) {
+    if (delay_ > 0)
+        for (int c = 0; c < srcCh_; ++c) {
+            line_[c].assign(std::size_t(delay_), 0.0f);
+            delayed_[c].assign(std::size_t(std::max(maxBlock, 1)), 0.0f);
+        }
+}
 
 void EdgeInstance::targetsFor(const EdgeDesc* e, int srcCh, int dstCh,
                               float out[kMaxChannels][kMaxChannels]) {
@@ -235,9 +243,27 @@ bool EdgeInstance::silent() const {
 
 void EdgeInstance::mixInto(float* const* dst, const float* const* src,
                            int n) {
+    const float* in[kMaxChannels] = {src[0], srcCh_ > 1 ? src[1] : nullptr};
+    if (delay_ > 0) {
+        // The delay line advances every block, even while the edge is
+        // silent, so it is primed when it fades in.
+        const std::size_t len = std::size_t(delay_);
+        for (int c = 0; c < srcCh_; ++c) {
+            float* line = line_[c].data();
+            float* out = delayed_[c].data();
+            std::size_t p = pos_;
+            for (int i = 0; i < n; ++i) {
+                out[i] = line[p];
+                line[p] = src[c][i];
+                if (++p == len) p = 0;
+            }
+            in[c] = out;
+        }
+        pos_ = (pos_ + std::size_t(n)) % len;
+    }
     for (int d = 0; d < dstCh_; ++d)
         for (int s = 0; s < srcCh_; ++s)
-            if (!m_[d][s].silent()) m_[d][s].mixInto(dst[d], src[s], n);
+            if (!m_[d][s].silent()) m_[d][s].mixInto(dst[d], in[s], n);
 }
 
 }  // namespace pm

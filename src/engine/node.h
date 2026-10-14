@@ -110,10 +110,16 @@ private:
 };
 
 // A live connection. Holds a ramped dst×src gain matrix so routing changes
-// and pans fade instead of stepping.
+// and pans fade instead of stepping, and the delay that aligns its source
+// with the latest-arriving input of its destination (plugin delay
+// compensation). The delay is fixed per instance: when compensation
+// changes, a new edge fades in as the old one fades out.
 class EdgeInstance {
 public:
-    EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh);
+    EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh,
+                 int delaySamples = 0, int maxBlock = 0);
+
+    int delay() const { return delay_; }
 
     NodeId from() const { return from_; }
     NodeId to() const { return to_; }
@@ -134,6 +140,10 @@ private:
     NodeId from_, to_;
     int srcCh_, dstCh_;
     LinearRamp m_[kMaxChannels][kMaxChannels];
+    int delay_ = 0;
+    std::size_t pos_ = 0;
+    std::vector<float> line_[kMaxChannels];     // delay_ samples each
+    std::vector<float> delayed_[kMaxChannels];  // maxBlock scratch
 };
 
 }  // namespace pm

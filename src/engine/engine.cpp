@@ -155,6 +155,11 @@ void Engine::setRecordTaps(
     pump();
 }
 
+int Engine::latencyOf(NodeId id) const {
+    auto it = live_.latency.find(id);
+    return it == live_.latency.end() ? 0 : it->second;
+}
+
 bool Engine::takeMeter(NodeId id, MeterReading& out) {
     auto it = live_.meters.find(id);
     if (it == live_.meters.end()) return false;
@@ -378,36 +383,65 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
     plan->levelStart.push_back(int(plan->steps.size()));
 
     // 5. Edge instances and per-step contributions, sorted by source key
-    //    so summation order never depends on edit history.
+    //    so summation order never depends on edit history. Steps are in
+    //    topological order, so each step's arrival latency is known before
+    //    its consumers: every input is delayed to line up with the latest
+    //    one (plugin delay compensation).
     std::sort(edges.begin(), edges.end(), [](const auto& a, const auto& b) {
         return a.to != b.to ? a.to < b.to : a.from < b.from;
     });
+    std::vector<int> arrival(plan->steps.size(), 0);
     for (int si = 0; si < int(plan->steps.size()); ++si) {
         auto& s = plan->steps[si];
         s.firstContrib = int(plan->contribs.size());
         const Key me = stepKey[si];
+        int inArrival = 0;
+        bool anyLive = false;
+        for (const auto& e : edges)
+            if (e.to == me && e.desc) anyLive = true;
+        for (const auto& e : edges)
+            if (e.to == me && (e.desc || !anyLive))
+                inArrival = std::max(inArrival, arrival[stepOf[e.from]]);
+        arrival[si] = inArrival + (s.node ? s.node->latencySamples() : 0);
+        if (!s.dying) live->latency[s.id] = arrival[si];
+
         for (const auto& e : edges) {
             if (e.to != me) continue;
-            const auto& src = plan->steps[stepOf[e.from]];
-            std::shared_ptr<EdgeInstance> inst;
+            const int srcStep = stepOf[e.from];
+            const auto& src = plan->steps[srcStep];
+            const int delay = inArrival - arrival[srcStep];
             const bool oldSide = !e.desc;
             const bool newOfShadowed =
                 e.desc && (shadowed.count(e.fromId) || shadowed.count(e.toId));
+            std::shared_ptr<EdgeInstance> inst, retiring;
             if (!newOfShadowed) {
                 auto it = live_.edges.find({e.fromId, e.toId});
                 if (it != live_.edges.end() &&
                     it->second->srcChannels() == src.nch &&
-                    it->second->dstChannels() == s.nch)
-                    inst = it->second;
+                    it->second->dstChannels() == s.nch) {
+                    if (oldSide || it->second->delay() == std::max(0, delay))
+                        inst = it->second;
+                    else
+                        retiring = it->second;  // compensation changed
+                }
             }
             if (!inst && oldSide) continue;  // nothing to fade
+            if (retiring) {
+                EdgeTarget t{retiring.get(), {}};
+                EdgeInstance::targetsFor(nullptr, src.nch, s.nch, t.m);
+                plan->edgeTargets.push_back(t);
+                plan->contribs.push_back({retiring.get(), srcStep});
+                plan->edges.push_back(std::move(retiring));
+                plan->needsCleanup = true;
+            }
             if (!inst)
-                inst = std::make_shared<EdgeInstance>(e.fromId, e.toId,
-                                                      src.nch, s.nch);
+                inst = std::make_shared<EdgeInstance>(
+                    e.fromId, e.toId, src.nch, s.nch, std::max(0, delay),
+                    cfg_.maxBlock);
             EdgeTarget t{inst.get(), {}};
             EdgeInstance::targetsFor(e.desc, src.nch, s.nch, t.m);
             plan->edgeTargets.push_back(t);
-            plan->contribs.push_back({inst.get(), stepOf[e.from]});
+            plan->contribs.push_back({inst.get(), srcStep});
             if (e.desc) live->edges[{e.fromId, e.toId}] = inst;
             plan->edges.push_back(std::move(inst));
         }
@@ -491,7 +525,8 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
             std::memset(buf[c], 0, sizeof(float) * frames);
         for (int k = 0; k < s.numContrib; ++k) {
             const auto& con = p.contribs[s.firstContrib + k];
-            if (con.edge->silent()) continue;
+            // A delayed edge keeps its line moving even while silent.
+            if (con.edge->silent() && con.edge->delay() == 0) continue;
             con.edge->mixInto(buf, &p.chan[p.steps[con.srcStep].buf],
                               frames);
         }

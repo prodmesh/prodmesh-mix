@@ -163,3 +163,63 @@ TEST(clap_latency_is_reported) {
     CHECK_MSG(p != nullptr, err);
     CHECK(p->latencySamples() == 64);
 }
+
+namespace {
+
+// gen(1) -> A(2) -> bus(4) -> out(5)
+//        \-> B(3) -/
+GraphDesc parallel(bool delayOnA) {
+    GraphDesc g;
+    NodeDesc gen;
+    gen.id = 1;
+    gen.kind = NodeKind::Generator;
+    gen.generator = {11, 150, -12, -30, false};
+    NodeDesc a, b, bus, out;
+    a.id = 2;
+    b.id = 3;
+    bus.id = 4;
+    bus.kind = NodeKind::Bus;
+    out.id = 5;
+    out.kind = NodeKind::Output;
+    if (delayOnA)
+        a.processing.inserts.push_back(InsertDesc::plugin(
+            "clap", PM_TEST_CLAP, "com.prodmesh.test.delay"));
+    g.nodes = {gen, a, b, bus, out};
+    g.edges = {{1, 2, 0, 0}, {1, 3, 0, 0}, {2, 4, 0, 0}, {3, 4, 0, 0},
+               {4, 5, 0, 0}};
+    return g;
+}
+
+}  // namespace
+
+TEST(pdc_aligns_parallel_paths_exactly) {
+    Engine ref(cfg()), pdc(cfg());
+    CHECK(ref.setGraph(parallel(false)));
+    CHECK(pdc.setGraph(parallel(true)));
+    const auto x = run(ref, 40), y = run(pdc, 40);
+    CHECK(pdc.latencyOf(2) == 64 && pdc.latencyOf(3) == 0);
+    CHECK(pdc.latencyOf(4) == 64 && pdc.latencyOf(5) == 64);
+    // Both paths arrive together: the bus is the reference, 64 samples late.
+    for (std::size_t n = 64; n < x.size(); ++n)
+        if (y[n] != x[n - 64]) {
+            CHECK_MSG(false, "misaligned at sample " + std::to_string(n));
+            break;
+        }
+}
+
+TEST(pdc_change_is_continuous) {
+    Engine e(cfg());
+    CHECK(e.setGraph(parallel(false)));
+    const auto x = run(e, 80, [&](int b) {
+        if (b == 20) CHECK(e.setGraph(parallel(true)));
+    });
+    float steady = 0;
+    for (std::size_t i = 1; i < 19 * kBlock; ++i)
+        steady = std::max(steady, std::fabs(x[i] - x[i - 1]));
+    float worst = 0;
+    for (std::size_t i = 1; i < x.size(); ++i)
+        worst = std::max(worst, std::fabs(x[i] - x[i - 1]));
+    CHECK_MSG(worst <= steady * 1.05f, "step when compensation changed: " +
+                                           std::to_string(worst / steady));
+    CHECK(e.settled());
+}

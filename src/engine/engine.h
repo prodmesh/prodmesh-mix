@@ -98,6 +98,10 @@ public:
     // Reads reset the accumulators, so one reader (the daemon) owns them.
     bool takeMeter(NodeId id, MeterReading& out);
 
+    // Samples from a source to this node's output in the published plan:
+    // plugin latency along the slowest path, with compensation applied.
+    int latencyOf(NodeId id) const;
+
     // Plugins that failed to load (passed through), oldest first.
     const std::vector<std::string>& warnings() const { return warnings_; }
 
@@ -124,6 +128,7 @@ private:
             edges;
         std::unordered_map<NodeId, std::shared_ptr<LevelState>> levels;
         std::unordered_map<NodeId, std::shared_ptr<MeterState>> meters;
+        std::unordered_map<NodeId, int> latency;  // output arrival, samples
     };
 
     enum class Fail { None, Invalid, FadingCycle };

@@ -8,6 +8,10 @@
 #include <execinfo.h>
 #include <unistd.h>
 
+#if defined(PM_RTSAN_ENABLED)
+#include <sanitizer/rtsan_interface.h>
+#endif
+
 namespace pm::rt {
 namespace {
 
@@ -47,11 +51,21 @@ ScopedRealtime::ScopedRealtime() : previous_(tlsRealtime) {
 }
 ScopedRealtime::~ScopedRealtime() { tlsRealtime = previous_; }
 
+// Under RealtimeSanitizer, plugin code is not ours to police: its
+// allocations are attributed to the plugin instead.
 ScopedThirdParty::ScopedThirdParty(std::atomic<std::uint64_t>* counter)
     : previous_(tlsThirdParty) {
     tlsThirdParty = counter;
+#if defined(PM_RTSAN_ENABLED)
+    __rtsan_disable();
+#endif
 }
-ScopedThirdParty::~ScopedThirdParty() { tlsThirdParty = previous_; }
+ScopedThirdParty::~ScopedThirdParty() {
+#if defined(PM_RTSAN_ENABLED)
+    __rtsan_enable();
+#endif
+    tlsThirdParty = previous_;
+}
 
 ScopedNonRealtime::ScopedNonRealtime() : previous_(tlsRealtime) {
     tlsRealtime = false;

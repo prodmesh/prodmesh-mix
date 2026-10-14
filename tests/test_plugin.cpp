@@ -104,7 +104,7 @@ TEST(clap_bundle_describes_its_plugins) {
     std::vector<plugin::PluginInfo> list;
     std::string err;
     CHECK_MSG(plugin::describeBundle(PM_TEST_CLAP, list, &err), err);
-    CHECK(list.size() == 4);
+    CHECK(list.size() == 5);
     CHECK(list[0].id == "com.prodmesh.test.gain" && list[0].format == "clap");
 }
 
@@ -234,6 +234,11 @@ TEST(pdc_change_is_continuous) {
 }
 
 TEST(plugin_allocations_are_attributed_not_counted_as_engine_bugs) {
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+    return;  // TSan's runtime owns operator new for the plugin's image
+#endif
+#endif
     Engine e(cfg());
     CHECK(e.setGraph(withPlugin(sine(), "com.prodmesh.test.alloc")));
     run(e, 20);
@@ -373,19 +378,60 @@ TEST(state_change_does_not_rebuild_the_plugin) {
 }
 
 TEST(crashed_host_comes_back_with_its_settings) {
-    Engine e(cfg());
+    Engine e(cfg()), ref(cfg());
     CHECK(e.setGraph(gainWithState(true, 0.5f, "com.prodmesh.test.crash")));
-    Engine ref(cfg());
     CHECK(ref.setGraph(sine()));
-    const auto x = runPaced(ref, 98), y = runPaced(e, 98);
-    // Crash at block 50; restarted with gain 0.5 well before block 70.
-    const float ratio = peak(y, 75 * kBlock, 98 * kBlock) /
-                        peak(x, 74 * kBlock, 97 * kBlock);
+    // Render until the host has crashed (block 50) and been restarted —
+    // immediately when it dies, or via the 0.5 s watchdog when it is slow
+    // to die (a sanitizer writing its report) — then 40 blocks more.
+    std::vector<float> x, y, buf(kBlock);
+    float* out[1] = {buf.data()};
+    std::vector<std::string> events;
+    int restartedAt = -1;
+    for (int b = 0; b < 2000 && (restartedAt < 0 || b < restartedAt + 40); ++b) {
+        for (auto* eng : {&ref, &e}) {
+            eng->pump();
+            {
+                rt::ScopedRealtime scope;
+                eng->process(nullptr, 0, out, 1, kBlock);
+            }
+            (eng == &ref ? x : y).insert((eng == &ref ? x : y).end(), buf.begin(), buf.end());
+        }
+        for (auto& ev : e.drainEvents()) {
+            if (restartedAt < 0 && ev.find("last saved settings") != std::string::npos)
+                restartedAt = b;
+            events.push_back(ev);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (std::getenv("PM_TEST_VERBOSE"))
+        for (const auto& ev : events) std::printf("        event: %s\n", ev.c_str());
+    CHECK_MSG(restartedAt > 0, "never restarted with its settings");
+    if (restartedAt <= 0) return;
+    const std::size_t from = std::size_t(restartedAt + 10) * kBlock,
+                      to = std::size_t(restartedAt + 38) * kBlock;
+    const float ratio = peak(y, from, to) / peak(x, from - kBlock, to - kBlock);
     CHECK_MSG(std::fabs(ratio - 0.5f) < 0.01f,
               "after restart the gain ratio is " + std::to_string(ratio));
-    bool restartedWithSettings = false;
-    for (const auto& ev : e.drainEvents())
-        restartedWithSettings = restartedWithSettings ||
-                                ev.find("last saved settings") != std::string::npos;
-    CHECK(restartedWithSettings);
+}
+
+TEST(hung_host_is_killed_and_restarted) {
+    Engine e(cfg());
+    CHECK(e.setGraph(withSandboxed(sine(), "com.prodmesh.test.hang")));
+    bool killed = false;
+    std::vector<float> buf(kBlock);
+    float* out[1] = {buf.data()};
+    // Hangs at block 50; 0.5 s of audio (~188 blocks) later it is killed.
+    for (int b = 0; b < 600 && !killed; ++b) {
+        e.pump();
+        {
+            rt::ScopedRealtime scope;
+            e.process(nullptr, 0, out, 1, kBlock);
+        }
+        for (const auto& ev : e.drainEvents())
+            killed = killed || ev.find("stopped responding") != std::string::npos;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK_MSG(killed, "hung host never killed");
+    CHECK(rt::violations() == 0);
 }

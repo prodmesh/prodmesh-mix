@@ -98,7 +98,12 @@ public:
             std::memcpy(view_.in(slot, c), ch[std::min(c, nch - 1)],
                         sizeof(float) * std::size_t(frames));
         const bool ready = seq > 1 && h.done.load(std::memory_order_acquire) == seq - 1;
-        if (seq > 1 && !ready) misses_.fetch_add(1, std::memory_order_relaxed);
+        if (seq > 1 && !ready) {
+            misses_.fetch_add(1, std::memory_order_relaxed);
+            streak_.fetch_add(1, std::memory_order_relaxed);
+        } else if (ready) {
+            streak_.store(0, std::memory_order_relaxed);
+        }
         for (int c = 0; c < nch; ++c) {
             const int src = std::min(c, channels_ - 1);
             if (seq == 1)
@@ -130,11 +135,22 @@ public:
         }
         if (pid_ <= 0) return {};
         int status = 0;
-        if (waitpid(pid_, &status, WNOHANG) != pid_) return {};
+        bool hung = false;
+        if (waitpid(pid_, &status, WNOHANG) != pid_) {
+            // Alive but silent: a hung plugin (or one still writing its
+            // crash report). Half a second without audio -> kill it.
+            const double silentS = double(streak_.load()) * maxBlock_ / rate_;
+            if (silentS < 0.5) return {};
+            kill(pid_, SIGKILL);
+            waitpid(pid_, &status, 0);
+            hung = true;
+        }
         pid_ = -1;
+        streak_.store(0);
         const std::string why =
-            WIFSIGNALED(status) ? std::string("crashed (") + strsignal(WTERMSIG(status)) + ")"
-                                : "exited";
+            hung ? std::string("stopped responding (0.5 s without audio)")
+            : WIFSIGNALED(status) ? std::string("crashed (") + strsignal(WTERMSIG(status)) + ")"
+                                  : "exited";
         ++crashes_;
         if (crashes_ > 3)
             return name_ + " " + why + " again; left bypassed";
@@ -333,6 +349,7 @@ private:
     std::chrono::steady_clock::time_point lastStateAsk_{};
     std::uint64_t seq_ = 0;  // audio thread
     std::atomic<std::uint64_t> misses_{0};
+    std::atomic<std::uint64_t> streak_{0};  // consecutive misses
 };
 
 }  // namespace

@@ -5,6 +5,8 @@
 //                              that is not real-time safe)
 //   com.prodmesh.test.crash    unity, segfaults on its 50th process() call
 //                              (sandbox tests only!)
+//   com.prodmesh.test.hang     unity, never returns from its 50th call
+//                              (sandbox tests only!)
 // Every instance also checks the host against CLAP's lifecycle rules and
 // counts violations; tests read them through pm_test_counters(). Like many
 // commercial plugins, they declare a mono sidechain input and expect the
@@ -12,6 +14,8 @@
 #include <clap/clap.h>
 
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <cstring>
 #include <vector>
 
@@ -22,7 +26,7 @@ std::atomic<int> gStarts{0}, gStops{0}, gViolations{0}, gLive{0};
 struct Plugin {
     clap_plugin_t clap{};
     const clap_host_t* host = nullptr;
-    bool delay = false, alloc = false, crash = false;
+    bool delay = false, alloc = false, crash = false, hang = false;
     int calls = 0;
     float gain = 0.5f;  // the plugin's state (clap.state: 4 bytes)
     bool active = false, processing = false;
@@ -78,6 +82,8 @@ clap_process_status process(const clap_plugin_t* p, const clap_process_t* pr) {
         volatile int* null = nullptr;
         *null = 1;  // the bug a sandbox exists for
     }
+    if (s->hang && ++s->calls == 50)
+        for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
     if (s->alloc) {
         int* volatile leak = new int(1);  // what a careless plugin does
         delete leak;
@@ -147,8 +153,10 @@ const clap_plugin_descriptor_t kDescs[] = {
      "", "", "1.0", "", kFeatures},
     {CLAP_VERSION, "com.prodmesh.test.crash", "PM Test Crash", "ProdMesh", "",
      "", "", "1.0", "", kFeatures},
+    {CLAP_VERSION, "com.prodmesh.test.hang", "PM Test Hang", "ProdMesh", "",
+     "", "", "1.0", "", kFeatures},
 };
-constexpr uint32_t kCount = 4;
+constexpr uint32_t kCount = 5;
 
 uint32_t count(const clap_plugin_factory_t*) { return kCount; }
 const clap_plugin_descriptor_t* desc(const clap_plugin_factory_t*, uint32_t i) {
@@ -165,7 +173,8 @@ const clap_plugin_t* create(const clap_plugin_factory_t*, const clap_host_t* hos
     s->delay = which == 1;
     s->alloc = which == 2;
     s->crash = which == 3;
-    s->gain = (s->alloc || s->crash) ? 1.0f : 0.5f;
+    s->hang = which == 4;
+    s->gain = (s->alloc || s->crash || s->hang) ? 1.0f : 0.5f;
     s->clap = {&kDescs[which], s,       init,           destroy,
                activate,       deactivate, startProcessing, stopProcessing,
                reset,          process, getExtension,  onMainThread};

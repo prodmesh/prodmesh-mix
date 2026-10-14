@@ -49,9 +49,20 @@ add_library(mix_engine STATIC
     src/record/recorder.cpp
     src/plugin/plugin.cpp
     src/plugin/clap_host.cpp
+    src/plugin/vst3_host.cpp
+    third_party/vst3sdk/pluginterfaces/base/funknown.cpp
+    third_party/vst3sdk/pluginterfaces/base/coreiids.cpp
+    third_party/vst3sdk/public.sdk/source/vst/vstinitiids.cpp
 )
 target_include_directories(mix_engine PUBLIC src)
-target_include_directories(mix_engine SYSTEM PRIVATE third_party/clap/include)
+target_include_directories(mix_engine SYSTEM PRIVATE
+    third_party/clap/include third_party/vst3sdk)
+# Third-party sources build without our warning set.
+set_source_files_properties(
+    third_party/vst3sdk/pluginterfaces/base/funknown.cpp
+    third_party/vst3sdk/pluginterfaces/base/coreiids.cpp
+    third_party/vst3sdk/public.sdk/source/vst/vstinitiids.cpp
+    PROPERTIES COMPILE_OPTIONS "-w")
 if(APPLE)
     target_sources(mix_engine PRIVATE src/driver/coreaudio_driver.cpp)
     target_link_libraries(mix_engine PUBLIC

@@ -127,6 +127,23 @@ default 30 s rings; a 5 s ring must report drops but keep 0 xruns).
 Power-loss durability (F_FULLFSYNC) is not done yet — fsync covers process
 and OS crashes only.
 
+## Plugin hosting
+
+`src/plugin/`: CLAP (`clap_host.cpp`) and VST3 (`vst3_host.cpp`, SDK
+interface headers only) adapters behind `plugin::load()`. Lessons paid for
+with segfaults in real commercial plugins — keep them:
+- give **every** declared port/bus a buffer (sidechains fed silence), even
+  inactive ones; FabFilter CLAPs read the sidechain unconditionally;
+- VST3: pass real parameter-change containers, event lists and a process
+  context, never null; plugins write meters to output parameter changes
+  without checking for a null queue (FabFilter Pro-C 2 / Pro-L 2).
+Never load a plugin to *scan* it in the engine: `mix-plugin scan` does it
+in child processes with a timeout. `PM_PLUGIN_TRACE=1` logs host->plugin
+calls; `tools/plugin_smoke.py` runs installed real plugins as inserts
+(19/19 on the dev machine) — run it after touching an adapter.
+Not done yet: VST3 edit controller (parameters, state), plugin UIs,
+out-of-process sandbox.
+
 ## UX rules (spec: UX principles)
 
 - Never show stale data as if it were live: on disconnect, meters empty

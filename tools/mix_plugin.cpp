@@ -7,11 +7,12 @@
 //                                     reported as quarantined, nothing more
 //   mix-plugin describe BUNDLE        (the child) list one bundle's plugins
 //   mix-plugin bench BUNDLE ID        load in-process and time it as an
-//                                     insert on a mono strip
+//                                     insert on a mono strip (.clap/.vst3)
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -114,15 +115,17 @@ bool describeIsolated(const char* self, const std::string& bundle,
 int scan(const char* self, std::vector<std::string> dirs) {
     if (dirs.empty()) {
         const char* home = getenv("HOME");
-        dirs = {"/Library/Audio/Plug-Ins/CLAP",
-                std::string(home ? home : "") + "/Library/Audio/Plug-Ins/CLAP"};
+        const std::string h = home ? home : "";
+        dirs = {"/Library/Audio/Plug-Ins/CLAP", h + "/Library/Audio/Plug-Ins/CLAP",
+                "/Library/Audio/Plug-Ins/VST3", h + "/Library/Audio/Plug-Ins/VST3"};
     }
     int ok = 0, bad = 0;
     for (const auto& d : dirs) {
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(d, ec)) {
             const auto path = e.path().string();
-            if (e.path().extension() != ".clap") continue;
+            const auto ext = e.path().extension();
+            if (ext != ".clap" && ext != ".vst3") continue;
             std::string out, why;
             if (describeIsolated(self, path, out, why)) {
                 std::fputs(out.c_str(), stdout);
@@ -142,7 +145,7 @@ int bench(const char* bundle, const char* id) {
     constexpr int kBlock = 128;
     EngineConfig c;
     c.maxBlock = kBlock;
-    c.numOutputs = 1;
+    c.numOutputs = 2;
     Engine e(c);
     GraphDesc g;
     NodeDesc gen;
@@ -150,10 +153,15 @@ int bench(const char* bundle, const char* id) {
     gen.kind = NodeKind::Generator;
     NodeDesc strip;
     strip.id = 2;
-    strip.processing.inserts.push_back(InsertDesc::plugin("clap", bundle, id));
+    // PM_BENCH_CHANNELS=2 benches on a stereo strip (default mono).
+    if (const char* c = std::getenv("PM_BENCH_CHANNELS")) strip.channels = std::atoi(c);
+    const std::string format =
+        fs::path(bundle).extension() == ".vst3" ? "vst3" : "clap";
+    strip.processing.inserts.push_back(InsertDesc::plugin(format, bundle, id));
     NodeDesc out;
     out.id = 3;
     out.kind = NodeKind::Output;
+    out.channels = strip.channels;
     g.nodes = {gen, strip, out};
     g.edges = {{1, 2, 0, 0}, {2, 3, 0, 0}};
 
@@ -164,18 +172,19 @@ int bench(const char* bundle, const char* id) {
                               std::chrono::steady_clock::now() - t0).count();
     for (const auto& w : e.warnings()) std::printf("warning: %s\n", w.c_str());
     std::string lerr;
-    if (auto probe = plugin::load("clap", bundle, id, 48000, kBlock, 1, &lerr))
+    if (auto probe = plugin::load(format, bundle, id, 48000, kBlock,
+                                  strip.channels, &lerr))
         std::printf("latency %d samples\n", probe->latencySamples());
 
-    std::vector<float> buf(kBlock);
-    float* outp[1] = {buf.data()};
+    std::vector<float> buf(kBlock), buf2(kBlock);
+    float* outp[2] = {buf.data(), buf2.data()};
     double worst = 0, total = 0;
     float peak = 0;
     bool finite = true;
     const int blocks = 48000 * 10 / kBlock;  // 10 s of audio
     for (int b = 0; b < blocks; ++b) {
         const auto s = std::chrono::steady_clock::now();
-        e.process(nullptr, 0, outp, 1, kBlock);
+        e.process(nullptr, 0, outp, 2, kBlock);
         const double us = std::chrono::duration<double, std::micro>(
                               std::chrono::steady_clock::now() - s).count();
         worst = std::max(worst, us);

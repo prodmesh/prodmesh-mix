@@ -1,0 +1,222 @@
+#include "engine/node.h"
+
+#include <algorithm>
+#include <cmath>
+#include <numbers>
+
+namespace pm {
+namespace {
+
+class GainInsert final : public Processor {
+public:
+    explicit GainInsert(float dB) : g_(dsp::dbToGain(dB)) {}
+    void process(float* const* ch, int nch, int n) override {
+        for (int c = 0; c < nch; ++c)
+            for (int i = 0; i < n; ++i) ch[c][i] *= g_;
+    }
+
+private:
+    float g_;
+};
+
+// Models a heavy plugin: a dependent chain of multiply-adds the compiler
+// can't vectorise or elide, then a gain of exactly 1.
+class CpuLoadInsert final : public Processor {
+public:
+    explicit CpuLoadInsert(float opsPerSample)
+        : ops_(int(opsPerSample)) {}
+    void process(float* const* ch, int nch, int n) override {
+        for (int c = 0; c < nch; ++c) {
+            float acc = state_;
+            for (int i = 0; i < n; ++i)
+                for (int k = 0; k < ops_; ++k) acc = acc * 0.999f + ch[c][i];
+            state_ = acc;
+        }
+        sink_ = state_;
+    }
+
+private:
+    int ops_;
+    float state_ = 0;
+    volatile float sink_ = 0;
+};
+
+dsp::BiquadCoeffs bandCoeffs(double fs, const EqBand& b) {
+    switch (b.type) {
+    case EqBand::Type::LowShelf:
+        return dsp::BiquadCoeffs::lowShelf(fs, b.freqHz, b.gainDb);
+    case EqBand::Type::HighShelf:
+        return dsp::BiquadCoeffs::highShelf(fs, b.freqHz, b.gainDb);
+    case EqBand::Type::Peak:
+        break;
+    }
+    return dsp::BiquadCoeffs::peaking(fs, b.freqHz, b.q, b.gainDb);
+}
+
+float levelGain(float faderDb, bool mute) {
+    return mute ? 0.0f : dsp::dbToGain(faderDb);
+}
+
+}  // namespace
+
+bool sameStructure(const ProcessingDesc& a, const ProcessingDesc& b) {
+    return a.hpf == b.hpf && a.hpfHz == b.hpfHz && a.gate == b.gate &&
+           a.gateParams == b.gateParams && a.eq == b.eq &&
+           a.bands == b.bands && a.comp == b.comp &&
+           a.compParams == b.compParams && a.limiter == b.limiter &&
+           a.limiterCeilingDb == b.limiterCeilingDb &&
+           a.inserts == b.inserts;
+}
+
+const NodeDesc* GraphDesc::find(NodeId id) const {
+    for (const auto& n : nodes)
+        if (n.id == id) return &n;
+    return nullptr;
+}
+
+NodeDesc* GraphDesc::find(NodeId id) {
+    for (auto& n : nodes)
+        if (n.id == id) return &n;
+    return nullptr;
+}
+
+NodeInstance::NodeInstance(const NodeDesc& d, double fs, int /*maxBlock*/)
+    : id_(d.id),
+      kind_(d.kind),
+      channels_(d.channels < 1 ? 1 : d.channels > 2 ? 2 : d.channels),
+      processing_(d.processing) {
+    const auto& p = processing_;
+    generator_.prepare(fs, d.generator);
+    for (int c = 0; c < channels_; ++c) {
+        hpf_[c].setCoeffs(dsp::BiquadCoeffs::highpass(fs, p.hpfHz, 0.7071));
+        for (int b = 0; b < 4; ++b) eq_[b][c].setCoeffs(bandCoeffs(fs, p.bands[b]));
+        gate_[c].prepare(fs, p.gateParams);
+        gate_[c].reset();
+    }
+    comp_.prepare(fs, p.compParams);
+    limiter_.prepare(fs, p.limiterCeilingDb, 50);
+    for (const auto& ins : p.inserts) {
+        switch (ins.type) {
+        case InsertDesc::Type::Gain:
+            inserts_.push_back(std::make_unique<GainInsert>(ins.value));
+            break;
+        case InsertDesc::Type::CpuLoad:
+            inserts_.push_back(std::make_unique<CpuLoadInsert>(ins.value));
+            break;
+        }
+    }
+}
+
+void NodeInstance::process(float* const* ch, int n) {
+    const auto& p = processing_;
+    if (kind_ == NodeKind::Generator) {
+        generator_.process(ch[0], n);
+        for (int c = 1; c < channels_; ++c)
+            for (int i = 0; i < n; ++i) ch[c][i] = ch[0][i];
+    }
+    for (int c = 0; c < channels_; ++c) {
+        if (p.hpf) hpf_[c].process(ch[c], n);
+        if (p.gate) gate_[c].process(ch[c], n);
+        if (p.eq)
+            for (int b = 0; b < 4; ++b) eq_[b][c].process(ch[c], n);
+    }
+    if (p.comp) comp_.process(ch, channels_, n);
+    for (auto& ins : inserts_) ins->process(ch, channels_, n);
+    if (p.limiter) limiter_.process(ch, channels_, n);
+}
+
+LevelState::LevelState(float faderDb, bool mute)
+    : gain_(levelGain(faderDb, mute)) {}
+
+void LevelState::set(float faderDb, bool mute, int rampSamples,
+                     std::uint64_t seq) {
+    if (seq <= seq_) return;
+    seq_ = seq;
+    gain_.setTarget(levelGain(faderDb, mute), rampSamples);
+}
+
+void LevelState::apply(float* const* ch, int nch, int n) {
+    if (nch == 1) {
+        gain_.apply(ch[0], n);
+        return;
+    }
+    // The ramp must advance identically on every channel.
+    for (int i = 0; i < n; ++i) {
+        const float g = gain_.next();
+        for (int c = 0; c < nch; ++c) ch[c][i] *= g;
+    }
+}
+
+void MeterState::accumulate(const float* const* ch, int n) {
+    for (int c = 0; c < channels_; ++c) {
+        float pk = 0;
+        double e = 0;
+        for (int i = 0; i < n; ++i) {
+            const float v = ch[c][i];
+            pk = std::max(pk, std::fabs(v));
+            e += double(v) * v;
+        }
+        float cur = peak_[c].load(std::memory_order_relaxed);
+        while (pk > cur && !peak_[c].compare_exchange_weak(
+                               cur, pk, std::memory_order_relaxed)) {
+        }
+        energy_[c].fetch_add(e, std::memory_order_relaxed);
+    }
+    samples_.fetch_add(std::uint32_t(n), std::memory_order_release);
+}
+
+MeterState::Reading MeterState::take() {
+    Reading r;
+    r.channels = channels_;
+    const auto n = samples_.exchange(0, std::memory_order_acquire);
+    for (int c = 0; c < channels_; ++c) {
+        r.peak[c] = peak_[c].exchange(0, std::memory_order_relaxed);
+        const double e = energy_[c].exchange(0, std::memory_order_relaxed);
+        r.rms[c] = n ? float(std::sqrt(e / n)) : 0.0f;
+    }
+    return r;
+}
+
+EdgeInstance::EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh)
+    : from_(from), to_(to), srcCh_(srcCh), dstCh_(dstCh) {}
+
+void EdgeInstance::targetsFor(const EdgeDesc* e, int srcCh, int dstCh,
+                              float out[kMaxChannels][kMaxChannels]) {
+    for (int d = 0; d < kMaxChannels; ++d)
+        for (int s = 0; s < kMaxChannels; ++s) out[d][s] = 0;
+    if (!e) return;
+    const float g = dsp::dbToGain(e->gainDb);
+    if (srcCh == 1 && dstCh == 2) {
+        // -3 dB constant-power pan law.
+        const double theta = (std::clamp(e->pan, -1.0f, 1.0f) + 1) *
+                             std::numbers::pi / 4;
+        out[0][0] = g * float(std::cos(theta));
+        out[1][0] = g * float(std::sin(theta));
+    } else if (srcCh == 2 && dstCh == 1) {
+        out[0][0] = out[0][1] = g * 0.5f;
+    } else {
+        for (int c = 0; c < srcCh; ++c) out[c][c] = g;
+    }
+}
+
+void EdgeInstance::setTargets(const float t[kMaxChannels][kMaxChannels],
+                              int samples) {
+    for (int d = 0; d < dstCh_; ++d)
+        for (int s = 0; s < srcCh_; ++s) m_[d][s].setTarget(t[d][s], samples);
+}
+
+bool EdgeInstance::silent() const {
+    for (int d = 0; d < dstCh_; ++d)
+        for (int s = 0; s < srcCh_; ++s)
+            if (!m_[d][s].silent()) return false;
+    return true;
+}
+
+void EdgeInstance::mixInto(float* const* dst, const float* const* src,
+                           int n) {
+    for (int d = 0; d < dstCh_; ++d)
+        for (int s = 0; s < srcCh_; ++s)
+            if (!m_[d][s].silent()) m_[d][s].mixInto(dst[d], src[s], n);
+}
+
+}  // namespace pm

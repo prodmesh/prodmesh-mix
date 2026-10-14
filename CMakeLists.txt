@@ -1,0 +1,103 @@
+cmake_minimum_required(VERSION 3.24)
+project(ProdMeshMix VERSION 0.0.1 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo)
+endif()
+
+option(PM_SANITIZE "Build with ASan + UBSan" OFF)
+option(PM_UBSAN "Build with UBSan only" OFF)
+option(PM_TSAN "Build with ThreadSanitizer" OFF)
+option(PM_RTSAN "Build with RealtimeSanitizer (LLVM 20+, not Apple clang)" OFF)
+
+if(MSVC)
+    add_compile_options(/W4)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter)
+endif()
+if(PM_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+if(PM_UBSAN)
+    add_compile_options(-fsanitize=undefined -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=undefined)
+endif()
+if(PM_RTSAN)
+    add_compile_options(-fsanitize=realtime -Wno-function-effects)
+    add_compile_definitions(PM_RTSAN_ENABLED)
+    add_link_options(-fsanitize=realtime)
+endif()
+if(PM_TSAN)
+    add_compile_options(-fsanitize=thread)
+    add_link_options(-fsanitize=thread)
+endif()
+
+# --- engine: headless, no Qt ---------------------------------------------
+add_library(mix_engine STATIC
+    src/core/rt_guard.cpp
+    src/core/rt_thread.cpp
+    src/engine/node.cpp
+    src/engine/engine.cpp
+    src/engine/worker_pool.cpp
+    src/driver/sim_driver.cpp
+)
+target_include_directories(mix_engine PUBLIC src)
+if(APPLE)
+    target_sources(mix_engine PRIVATE src/driver/coreaudio_driver.cpp)
+    target_link_libraries(mix_engine PUBLIC
+        "-framework CoreAudio" "-framework CoreFoundation"
+        "-framework AudioToolbox")
+endif()
+
+# --- tools ----------------------------------------------------------------
+add_executable(mix-bench tools/mix_bench.cpp tools/bench_graph.cpp)
+target_link_libraries(mix-bench PRIVATE mix_engine)
+
+# --- tests ----------------------------------------------------------------
+enable_testing()
+add_executable(mix-tests
+    tests/test_main.cpp
+    tests/test_core.cpp
+    tests/test_engine.cpp
+    tools/bench_graph.cpp
+)
+target_include_directories(mix-tests PRIVATE tests tools)
+target_link_libraries(mix-tests PRIVATE mix_engine)
+add_test(NAME mix-tests COMMAND mix-tests)
+
+# --- daemon + protocol (Qt Core/Network; the engine itself stays Qt-free) --
+find_package(Qt6 COMPONENTS Core Network Widgets)
+if(Qt6_FOUND)
+    qt_standard_project_setup()
+
+    add_library(mix_proto STATIC src/proto/protocol.cpp)
+    target_link_libraries(mix_proto PUBLIC mix_engine Qt6::Core)
+
+    qt_add_executable(mixd src/daemon/main.cpp src/daemon/shows.cpp)
+    target_link_libraries(mixd PRIVATE mix_proto Qt6::Network)
+    set_target_properties(mixd PROPERTIES MACOSX_BUNDLE FALSE)
+
+    add_executable(mix-proto-tests
+        tests/test_main.cpp tests/test_proto.cpp
+        src/daemon/shows.cpp tools/bench_graph.cpp)
+    target_include_directories(mix-proto-tests PRIVATE tests tools)
+    target_link_libraries(mix-proto-tests PRIVATE mix_proto)
+    add_test(NAME mix-proto-tests COMMAND mix-proto-tests)
+endif()
+
+# --- UI ---------------------------------------------------------------------
+if(Qt6_FOUND)
+    qt_add_executable(mix-ui src/ui/main.cpp src/ui/widgets.h src/ui/theme.h)
+    target_link_libraries(mix-ui PRIVATE mix_proto Qt6::Widgets Qt6::Network)
+    set_target_properties(mix-ui PROPERTIES OUTPUT_NAME "ProdMeshMix")
+    if(APPLE)
+        set_target_properties(mix-ui PROPERTIES MACOSX_BUNDLE TRUE
+            MACOSX_BUNDLE_GUI_IDENTIFIER "com.prodmesh.mix"
+            MACOSX_BUNDLE_BUNDLE_NAME "ProdMesh Mix")
+    endif()
+endif()

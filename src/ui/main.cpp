@@ -16,6 +16,7 @@
 #include "proto/protocol.h"
 #include "ui/theme.h"
 #include "ui/plugin_browser.h"
+#include "ui/scene_bar.h"
 #include "ui/widgets.h"
 #include <QFileInfo>
 #include <QInputDialog>
@@ -61,6 +62,10 @@ public:
 
     void setLevel(quint32 id, float db, bool mute) {
         pending_[id] = {db, mute};
+    }
+    void op(QJsonObject o) {
+        flushLevels();
+        send(o);
     }
     void openEditor(quint32 id, int insert) {
         send({{"op", "openEditor"}, {"id", double(id)}, {"insert", insert}});
@@ -284,6 +289,14 @@ public:
         outer->setSpacing(0);
         health_ = new HealthBar;
         outer->addWidget(health_);
+        scenes_ = new SceneBar;
+        outer->addWidget(scenes_);
+        scenes_->onRecall = [this](int id) {
+            client_.op({{"op", "recallScene"}, {"id", id}});
+        };
+        scenes_->onStore = [this] { client_.op({{"op", "storeScene"}}); };
+        scenes_->onUndo = [this] { client_.op({{"op", "undoRecall"}}); };
+        scenes_->onMenu = [this](int id, QPoint at) { sceneMenu(id, at); };
 
         banner_ = new QLabel(
             "Audio engine not reachable. Program audio is down until the "
@@ -373,6 +386,7 @@ private:
         masterHost_->setVisible(!strips_.isEmpty());
         scroll_->setEnabled(!off);
         masterHost_->setEnabled(!off);
+        scenes_->setEnabled(!off);
         if (off)
             for (auto* st : strips_) st->clearMeter();
     }
@@ -437,6 +451,9 @@ private:
                              " — audio passed straight through meanwhile.");
             events_->show();
             eventsTimer_.start(15000);
+        } else if (type == "scenes") {
+            sceneList_ = m["scenes"].toArray();
+            scenes_->setScenes(m);
         } else if (type == "catalog") {
             catalog_ = m["plugins"].toArray();
             scanning_ = m["scanning"].toBool();
@@ -859,6 +876,8 @@ private:
             const auto [text, tip] = assignText(n);
             st->assign()->setText(text, tip);
             if (n.kind == NodeKind::Strip) {
+                st->setCaption(n.recallSafe ? "recall safe" : "",
+                               "Scene recalls leave this channel alone.");
                 const QString in = inputText(n.id);
                 st->input()->setText(in, in.isEmpty()
                     ? "No input: click to pick a device input, a bus or a test source."
@@ -888,7 +907,8 @@ private:
             } else if (n.id == programBus(graph_)) {
                 st->setCaption("");
             } else {
-                st->setCaption(isAux(n) ? "aux" : "group");
+                st->setCaption(QString(isAux(n) ? "aux" : "group") +
+                               (n.recallSafe ? " · safe" : ""));
             }
         }
     }
@@ -1252,11 +1272,84 @@ private:
                     &QAction::triggered, this, [this, id] { addBus(BusKind::MixMinus, id); });
             menu->addSeparator();
         }
+        auto* safe = menu->addAction("Recall safe  (scenes leave it alone)");
+        safe->setCheckable(true);
+        const bool wasSafe = n->recallSafe;
+        safe->setChecked(wasSafe);
+        connect(safe, &QAction::triggered, this, [this, id, wasSafe] {
+            GraphDesc g = graph_;
+            g.find(id)->recallSafe = !wasSafe;
+            commit(std::move(g));
+        });
+        menu->addSeparator();
         connect(menu->addAction("Rename " + name + "…"), &QAction::triggered, this,
                 [this, id] { renameNode(id); });
         if (id != programBus(graph_))
             connect(menu->addAction("Delete " + name + "…"), &QAction::triggered,
                     this, [this, id] { deleteNode(id); });
+        menu->popup(at);
+    }
+
+    void sceneMenu(int id, QPoint at) {
+        QString name;
+        double fade = 0;
+        int index = -1;
+        for (int i = 0; i < sceneList_.size(); ++i)
+            if (sceneList_[i].toObject()["id"].toInt() == id) {
+                name = sceneList_[i].toObject()["name"].toString();
+                fade = sceneList_[i].toObject()["fadeMs"].toDouble();
+                index = i;
+            }
+        if (index < 0) return;
+        auto* menu = styledMenu(this);
+        auto act = [&](const QString& text, std::function<void()> fn) {
+            connect(menu->addAction(text), &QAction::triggered, this, fn);
+        };
+        act("Recall " + name + " now", [this, id] {
+            client_.op({{"op", "recallScene"}, {"id", id}});
+        });
+        act("Update " + name + " with the current mix", [this, id] {
+            client_.op({{"op", "updateScene"}, {"id", id}});
+        });
+        menu->addSeparator();
+        act("Rename…", [this, id, name] {
+            bool ok = false;
+            const QString n = QInputDialog::getText(this, "Rename scene", "Name:",
+                                                    QLineEdit::Normal, name, &ok).trimmed();
+            if (ok && !n.isEmpty())
+                client_.op({{"op", "editScene"}, {"id", id}, {"name", n}});
+        });
+        auto* fades = menu->addMenu("Fade time");
+        fades->setStyleSheet(menu->styleSheet());
+        for (const auto& [label, ms] : {std::pair{"None (instant)", 0}, {"0.5 s", 500},
+                                        {"1 s", 1000}, {"2 s", 2000}, {"5 s", 5000},
+                                        {"10 s", 10000}}) {
+            auto* a = fades->addAction(label);
+            a->setCheckable(true);
+            a->setChecked(int(fade) == ms);
+            const int v = ms;
+            connect(a, &QAction::triggered, this, [this, id, v] {
+                client_.op({{"op", "editScene"}, {"id", id}, {"fadeMs", v}});
+            });
+        }
+        if (index > 0)
+            act("Move left", [this, id, index] {
+                client_.op({{"op", "moveScene"}, {"id", id}, {"to", index - 1}});
+            });
+        if (index + 1 < sceneList_.size())
+            act("Move right", [this, id, index] {
+                client_.op({{"op", "moveScene"}, {"id", id}, {"to", index + 1}});
+            });
+        menu->addSeparator();
+        act("Delete " + name + "…", [this, id, name] {
+            QMessageBox box(QMessageBox::Warning, "Delete " + name,
+                            "Delete scene " + name + "?", QMessageBox::Cancel, this);
+            box.setInformativeText("The live mix does not change.");
+            auto* del = box.addButton("Delete", QMessageBox::DestructiveRole);
+            box.exec();
+            if (box.clickedButton() == del)
+                client_.op({{"op", "deleteScene"}, {"id", id}});
+        });
         menu->popup(at);
     }
 
@@ -1473,6 +1566,8 @@ private:
     }();
     bool loggedSnapshot_ = false;
     HealthBar* health_;
+    SceneBar* scenes_;
+    QJsonArray sceneList_;
     QHBoxLayout* bodyLayout_;
     QScrollArea* scroll_;
     QWidget* masterHost_;

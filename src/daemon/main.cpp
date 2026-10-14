@@ -28,6 +28,7 @@
 #include <QLocalSocket>
 #include <QSocketNotifier>
 #include <QTimer>
+#include <optional>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -75,6 +76,14 @@ void onSignal(int) {
 }
 
 class Daemon : public QObject {
+    // Scenes: stored mixes, recalled with an optional fade.
+    struct Scene {
+        int id = 0;
+        QString name;
+        double fadeMs = 0;
+        GraphDesc graph;
+    };
+
 public:
     Daemon(std::unique_ptr<Driver> driver, int workers, bool audible)
         : driver_(std::move(driver)) {
@@ -144,6 +153,15 @@ public:
         saveTimer_.setSingleShot(true);
         saveTimer_.setInterval(500);
         connect(&saveTimer_, &QTimer::timeout, this, &Daemon::saveSession);
+        // "Modified since recall": checked at 4 Hz, sent only on change.
+        connect(&sceneTimer_, &QTimer::timeout, this, [this] {
+            const bool mod = sceneDiffers();
+            if (mod != sceneModified_) {
+                sceneModified_ = mod;
+                broadcast(scenesMessage(), nullptr);
+            }
+        });
+        sceneTimer_.start(250);
 
         qInfo("mixd: running on %s: %d in / %d out, %.0f Hz, block %d, socket %s",
               driver_->deviceName().c_str(), driver_->config().numInputs,
@@ -182,6 +200,7 @@ private:
         if (op == "hello") {
             send(s, snapshot());
             send(s, catalogMessage());
+            send(s, scenesMessage());
         } else if (op == "ping") {
             send(s, {{"type", "pong"}, {"t", m["t"]}});
         } else if (op == "setLevel") {
@@ -218,9 +237,102 @@ private:
                 snapshotPending_ = true;
                 saveTimer_.start();
             }
+        } else if (op.endsWith("Scene") || op == "undoRecall") {
+            handleScene(s, op, m);
         } else {
             send(s, {{"type", "error"}, {"op", op}, {"message", "unknown op"}});
         }
+    }
+
+    // --- scenes ------------------------------------------------------------
+
+    Scene* scene(int id) {
+        for (auto& sc : scenes_)
+            if (sc.id == id) return &sc;
+        return nullptr;
+    }
+    bool sceneDiffers() {
+        const Scene* sc = scene(currentScene_);
+        return sc && !sceneMatches(engine_->graph(), sc->graph);
+    }
+    QJsonObject scenesMessage() {
+        QJsonArray list;
+        for (const auto& sc : scenes_)
+            list.append(QJsonObject{{"id", sc.id}, {"name", sc.name}, {"fadeMs", sc.fadeMs}});
+        return {{"type", "scenes"},
+                {"scenes", list},
+                {"current", currentScene_},
+                {"modified", sceneModified_},
+                {"canUndo", beforeRecall_.has_value()}};
+    }
+    bool recall(const GraphDesc& target, double fadeMs, QString* err) {
+        std::string e;
+        if (!engine_->setGraph(applyScene(engine_->graph(), target), &e, fadeMs)) {
+            *err = QString::fromStdString(e);
+            return false;
+        }
+        snapshotPending_ = true;
+        return true;
+    }
+
+    void handleScene(QLocalSocket* s, const QString& op, const QJsonObject& m) {
+        auto fail = [&](const QString& why) {
+            send(s, {{"type", "error"}, {"op", op}, {"message", why}});
+        };
+        const int id = m["id"].toInt();
+        if (op == "storeScene") {
+            Scene sc;
+            sc.id = nextSceneId_++;
+            sc.name = m["name"].toString().trimmed();
+            if (sc.name.isEmpty()) sc.name = QString("Scene %1").arg(sc.id);
+            sc.fadeMs = m["fadeMs"].toDouble(0);
+            sc.graph = engine_->graph();
+            scenes_.append(sc);
+            currentScene_ = sc.id;
+        } else if (op == "updateScene") {
+            Scene* sc = scene(id);
+            if (!sc) return fail("no such scene");
+            sc->graph = engine_->graph();
+            currentScene_ = id;
+        } else if (op == "recallScene") {
+            Scene* sc = scene(id);
+            if (!sc) return fail("no such scene");
+            const GraphDesc before = engine_->graph();
+            QString err;
+            if (!recall(sc->graph, m["fadeMs"].toDouble(sc->fadeMs), &err))
+                return fail(err);
+            beforeRecall_ = before;
+            beforeRecallScene_ = currentScene_;
+            currentScene_ = id;
+        } else if (op == "undoRecall") {
+            if (!beforeRecall_) return fail("nothing to undo");
+            QString err;
+            if (!recall(*beforeRecall_, 0, &err)) return fail(err);
+            beforeRecall_.reset();
+            currentScene_ = scene(beforeRecallScene_) ? beforeRecallScene_ : 0;
+        } else if (op == "editScene") {
+            Scene* sc = scene(id);
+            if (!sc) return fail("no such scene");
+            if (m.contains("name") && !m["name"].toString().trimmed().isEmpty())
+                sc->name = m["name"].toString().trimmed();
+            if (m.contains("fadeMs")) sc->fadeMs = std::clamp(m["fadeMs"].toDouble(), 0.0, 60000.0);
+        } else if (op == "deleteScene") {
+            if (!scene(id)) return fail("no such scene");
+            scenes_.removeIf([&](const Scene& sc) { return sc.id == id; });
+            if (currentScene_ == id) currentScene_ = 0;
+        } else if (op == "moveScene") {
+            const int to = m["to"].toInt();
+            int from = -1;
+            for (int i = 0; i < scenes_.size(); ++i)
+                if (scenes_[i].id == id) from = i;
+            if (from < 0 || to < 0 || to >= scenes_.size()) return fail("no such scene");
+            scenes_.move(from, to);
+        } else {
+            return fail("unknown op");
+        }
+        sceneModified_ = sceneDiffers();
+        saveTimer_.start();
+        broadcast(scenesMessage(), nullptr);
     }
 
     // Repairs WAVs whose header lags their data (the engine died mid-take).
@@ -350,7 +462,32 @@ private:
             return false;
         }
         out = std::move(g);
+        loadScenes(doc);
         return true;
+    }
+
+    QJsonArray scenesJson() const {
+        QJsonArray a;
+        for (const auto& sc : scenes_)
+            a.append(QJsonObject{{"id", sc.id},
+                                 {"name", sc.name},
+                                 {"fadeMs", sc.fadeMs},
+                                 {"graph", proto::graphToJson(sc.graph)}});
+        return a;
+    }
+    void loadScenes(const QJsonDocument& doc) {
+        for (const auto& v : doc["scenes"].toArray()) {
+            const auto o = v.toObject();
+            Scene sc;
+            sc.id = o["id"].toInt();
+            sc.name = o["name"].toString();
+            sc.fadeMs = o["fadeMs"].toDouble();
+            if (sc.id <= 0 || !proto::graphFromJson(o["graph"].toObject(), sc.graph, nullptr))
+                continue;
+            nextSceneId_ = std::max(nextSceneId_, sc.id + 1);
+            scenes_.append(sc);
+        }
+        currentScene_ = doc["currentScene"].toInt(0);
     }
 
     // QSaveFile writes a temp file and renames it over the old one, so a
@@ -365,7 +502,9 @@ private:
         f.write(QJsonDocument(QJsonObject{
                                   {"format", "prodmesh-mix-session"},
                                   {"version", 1},
-                                  {"graph", proto::graphToJson(engine_->graph())}})
+                                  {"graph", proto::graphToJson(engine_->graph())},
+                                  {"scenes", scenesJson()},
+                                  {"currentScene", currentScene_}})
                     .toJson(QJsonDocument::Indented));
         if (!f.commit())
             qWarning("mixd: could not save session %s", qPrintable(sessionPath_));
@@ -541,6 +680,12 @@ private:
     QJsonArray catalog_;
     bool snapshotPending_ = false;
     QProcess* scanner_ = nullptr;
+    QList<Scene> scenes_;
+    int currentScene_ = 0, nextSceneId_ = 1;
+    bool sceneModified_ = false;
+    std::optional<GraphDesc> beforeRecall_;  // for "undo recall"
+    int beforeRecallScene_ = 0;
+    QTimer sceneTimer_;
     double periodUs_ = 0;
     double windowSum_ = 0, windowMax_ = 0;
     std::uint64_t windowCount_ = 0;

@@ -188,3 +188,74 @@ TEST(pre_fader_send) {
     CHECK(peak(r.out[1], r.out[1].size() - 20 * kBlock) == 0.0f);
     CHECK(rt::violations() == 0);
 }
+
+// --- scenes ------------------------------------------------------------------
+
+TEST(scene_recalls_the_mix_not_the_structure) {
+    GraphDesc stored = show();
+    stored.find(20)->faderDb = -10;
+    stored.find(21)->mute = true;
+    stored.edges[2].pan = 0.7f;           // 20 -> 30
+    stored.edges[0].gainDb = 6;           // input gain of 20
+    stored.find(31)->mixMinus.exclude = {};  // remote back in the feed
+
+    GraphDesc now = show();
+    NodeDesc extra;  // a channel added after the scene was stored
+    extra.id = 22;
+    now.nodes.push_back(extra);
+    now.edges.push_back({22, 30, 0, 0});
+    resolveMixMinus(now);
+    CHECK(!sceneMatches(now, stored));
+
+    const GraphDesc r = applyScene(now, stored);
+    CHECK(r.find(20)->faderDb == -10);
+    CHECK(r.find(21)->mute);
+    CHECK(r.edges[2].pan == 0.7f);
+    CHECK(r.edges[0].gainDb == 6);
+    CHECK(r.find(31)->mixMinus.exclude.empty());
+    CHECK(r.find(22) != nullptr);  // structure untouched
+    CHECK(r.nodes.size() == now.nodes.size());
+    CHECK(sceneMatches(r, stored));
+}
+
+TEST(recall_safe_channel_is_left_alone) {
+    GraphDesc stored = show();
+    stored.find(21)->faderDb = -20;
+    stored.edges[1].gainDb = 9;              // 11 -> 21: input gain of 21
+    stored.find(31)->mixMinus.exclude = {};  // would put 21 back in
+    GraphDesc now = show();
+    now.find(21)->recallSafe = true;
+    const GraphDesc r = applyScene(now, stored);
+    CHECK(r.find(21)->faderDb == 0);
+    CHECK(r.edges[1].gainDb == 0);
+    CHECK(r.find(31)->mixMinus.exclude == std::vector<NodeId>{21});
+}
+
+// A recall with a fade glides the fader; a mute in the same recall is fast.
+TEST(scene_recall_glides_faders) {
+    Offline r;
+    GraphDesc g = show();
+    g.find(21)->mute = true;
+    CHECK(r.engine.setGraph(g));
+    r.run(40);
+    g.find(20)->faderDb = -20;
+    CHECK(r.engine.setGraph(g, nullptr, 500));  // 500 ms glide
+    const std::size_t from = r.out[0].size();
+    r.run(int(0.25 * 48000 / kBlock));  // halfway through
+    // Linear in gain: halfway between 1.0 and 0.1 is 0.55 (-5.2 dB).
+    const float mid = peak(r.out[0], r.out[0].size() - 4 * kBlock);
+    CHECK_MSG(std::fabs(mid / dsp::dbToGain(-12) - 0.55f) < 0.05f,
+              "mid-glide gain " + std::to_string(mid / dsp::dbToGain(-12)));
+    r.run(int(0.35 * 48000 / kBlock));
+    const float end = peak(r.out[0], r.out[0].size() - 4 * kBlock);
+    CHECK(std::fabs(dsp::gainToDb(end) - (-32)) < 0.5f);
+    (void)from;
+
+    // Mute in a gliding recall: silent within a few ms, not 500.
+    g.find(20)->mute = true;
+    g.find(20)->faderDb = 0;
+    CHECK(r.engine.setGraph(g, nullptr, 500));
+    r.run(int(0.02 * 48000 / kBlock) + 2);
+    CHECK(peak(r.out[0], r.out[0].size() - kBlock) == 0.0f);
+    CHECK(rt::violations() == 0);
+}

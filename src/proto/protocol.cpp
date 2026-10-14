@@ -179,6 +179,7 @@ QJsonObject graphToJson(const GraphDesc& g) {
                                          {"sineDb", n.generator.sineDb},
                                          {"noiseDb", n.generator.noiseDb},
                                          {"bursts", n.generator.bursts}};
+        if (n.recallSafe) o["recallSafe"] = true;
         if (n.mixMinus.follows) {
             QJsonArray ex;
             for (auto id : n.mixMinus.exclude) ex.append(double(id));
@@ -226,6 +227,7 @@ bool graphFromJson(const QJsonObject& o, GraphDesc& g, QString* error) {
         d.generator.sineDb = num(gen, "sineDb", d.generator.sineDb);
         d.generator.noiseDb = num(gen, "noiseDb", d.generator.noiseDb);
         d.generator.bursts = gen["bursts"].toBool(d.generator.bursts);
+        d.recallSafe = n["recallSafe"].toBool(false);
         const auto mm = n["mixMinus"].toObject();
         d.mixMinus.follows = NodeId(mm["follows"].toDouble(0));
         for (const auto& x : mm["exclude"].toArray())

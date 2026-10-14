@@ -43,6 +43,7 @@ add_library(mix_engine STATIC
     src/core/rt_thread.cpp
     src/engine/node.cpp
     src/engine/engine.cpp
+    src/engine/scene.cpp
     src/engine/worker_pool.cpp
     src/driver/sim_driver.cpp
     src/record/wav_writer.cpp
@@ -114,7 +115,7 @@ endif()
 # --- UI ---------------------------------------------------------------------
 if(Qt6_FOUND)
     qt_add_executable(mix-ui src/ui/main.cpp src/ui/widgets.h src/ui/theme.h
-        src/ui/plugin_browser.h)
+        src/ui/plugin_browser.h src/ui/scene_bar.h)
     target_link_libraries(mix-ui PRIVATE mix_proto Qt6::Widgets Qt6::Network)
     add_dependencies(mixd mix-plugin)  # mixd runs it to scan plugins
     set_target_properties(mix-ui PROPERTIES OUTPUT_NAME "ProdMeshMix")

@@ -9,6 +9,12 @@
 //   {"op":"setLevel","id":2001,"faderDb":-3.5,"mute":false}
 //   {"op":"setGraph","graph":{...}}
 //   {"op":"openEditor","id":2000,"insert":0}   isolated plugins only
+//   {"op":"storeScene","name":"Pregame","fadeMs":0}   current mix -> new scene
+//   {"op":"updateScene","id":2}         current mix -> scene 2
+//   {"op":"recallScene","id":2}         (optional "fadeMs" overrides the scene's)
+//   {"op":"undoRecall"}                 back to the mix before the last recall
+//   {"op":"editScene","id":2,"name":"Game","fadeMs":2000}
+//   {"op":"moveScene","id":2,"to":0}   {"op":"deleteScene","id":2}
 //   {"op":"ping","t":123}
 //
 // daemon -> client
@@ -16,6 +22,8 @@
 //   {"type":"level","id":2001,"faderDb":-3.5,"mute":false}
 //   {"type":"meters","m":[[id,peakL,peakR,rmsL,rmsR],...]}   dBFS, ~30 Hz
 //   {"type":"health","xruns":0,"callbacks":N,"meanLoad":0.14,...}  ~2 Hz
+//   {"type":"scenes","scenes":[{"id":1,"name":"Pregame","fadeMs":0},...],
+//    "current":1,"modified":false,"canUndo":true}
 //   {"type":"error","op":"setGraph","message":"graph has a cycle"}
 //   {"type":"pong","t":123}
 #pragma once

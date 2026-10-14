@@ -271,12 +271,12 @@ void NodeInstance::process(float* const* ch, int n) {
 LevelState::LevelState(float faderDb, bool mute)
     : fader_(levelGain(faderDb, false)), on_(mute ? 0.0f : 1.0f) {}
 
-void LevelState::set(float faderDb, bool mute, int rampSamples,
+void LevelState::set(float faderDb, bool mute, int faderRamp, int muteRamp,
                      std::uint64_t seq) {
     if (seq <= seq_) return;
     seq_ = seq;
-    fader_.setTarget(levelGain(faderDb, false), rampSamples);
-    on_.setTarget(mute ? 0.0f : 1.0f, rampSamples);
+    fader_.setTarget(levelGain(faderDb, false), faderRamp);
+    on_.setTarget(mute ? 0.0f : 1.0f, muteRamp);
 }
 
 void LevelState::apply(float* const* ch, int nch, int n, float* const* pre) {

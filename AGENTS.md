@@ -25,6 +25,7 @@ an allocation/lock on the audio thread.
 | `src/ui/` | `ProdMeshMix.app`, the mixer client: theme tokens (mirrors RTA), strip/fader/meter widgets |
 | `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread) |
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
+| `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
 | `tools/t05_ui_isolation.py` | T0-5 gate: SIGKILL the UI repeatedly under load, check 0 xruns and < 2 s reconnect |
 | `tools/mix_bench.cpp` | Tier 0 bench: reference graph on a driver, timing histogram, live edits |
 | `tools/bench_graph.*` | The reference graph shared by bench and tests |
@@ -156,6 +157,27 @@ plugin, in order, isolated or not). Without it, adding, removing or
 reordering an insert reverted the channel's other plugins to their last
 saved settings. `mixd --driver sim
 --sim-inputs 8` gives silent device inputs to try it without hardware.
+
+## Scenes
+
+A scene is a stored copy of the graph; recalling it applies the *mix*
+(`applyScene`: faders, mutes, and level / pan / on-off / pre-post of
+connections present in both graphs, mix-minus exclusions) and never the
+*structure* (channels, buses, patching, inserts and plugin state), so a
+recall cannot remove a channel or reload a plugin. `NodeDesc::recallSafe`
+nodes, and connections touching them, are skipped. Built-in EQ/dynamics
+are not recalled yet: a processing change rebuilds the node instance,
+plugins included — split built-in DSP from the insert chain first.
+
+Scenes live in mixd (the session file), not the UI. `recallScene` calls
+`Engine::setGraph(g, err, fadeMs)`: the plan carries a fader ramp and
+glide lengths for connections that survive the edit; mutes and new or
+removed connections keep their short fades, so cleanup timing is
+unchanged. Later plans re-arm the same targets (a no-op) and do not cut
+a glide short; an operator's fader move (newer sequence) takes over.
+`undoRecall` restores the mix and the live scene from just before the
+last recall. UI: select a scene, then GO (double-click = recall now);
+clicking the selected scene opens its menu.
 
 ## Recording
 

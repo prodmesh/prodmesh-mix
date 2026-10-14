@@ -62,7 +62,8 @@ Engine::~Engine() {
 
 // --- control thread ------------------------------------------------------
 
-bool Engine::setGraph(const GraphDesc& in, std::string* error) {
+bool Engine::setGraph(const GraphDesc& in, std::string* error,
+                      double glideMs) {
     GraphDesc g = in;
     resolveMixMinus(g);
     carryPluginStates(g);
@@ -70,6 +71,9 @@ bool Engine::setGraph(const GraphDesc& in, std::string* error) {
     // A dry run (no Live): structure only, no instances, no plugin loads.
     if (!compile(g, nullptr, nullptr, error, nullptr)) return false;
     desired_ = std::move(g);
+    // Coalesced edits glide if any of them asked to.
+    glideSamples_ = std::max(glideSamples_,
+                             int(std::max(0.0, glideMs) * cfg_.sampleRate / 1000));
     dirty_ = true;
     pump();
     return true;
@@ -268,6 +272,12 @@ void Engine::publish(std::unique_ptr<RenderPlan> plan, Live live,
                      const GraphDesc& g) {
     plan->serial = nextSerial_++;
     plan->levelSeq = ++levelSeq_;
+    if (glideSamples_ > 0) {
+        plan->levelRamp = glideSamples_;
+        for (auto& t : plan->edgeTargets)
+            if (t.samples < 0) t.samples = glideSamples_;  // surviving edges
+        glideSamples_ = 0;
+    }
     publishedSerial_ = plan->serial;
     publishedNeedsCleanup_ = plan->needsCleanup;
     published_ = g;
@@ -529,7 +539,9 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
                 inst = std::make_shared<EdgeInstance>(
                     e.fromId, e.toId, src.nch, s.nch, std::max(0, delay),
                     cfg_.maxBlock, e.desc->preFader);
-            EdgeTarget t{inst.get(), {}};
+            const bool survives = e.desc && !retiring && live_.edges.count({e.fromId, e.toId}) &&
+                                  live_.edges.at({e.fromId, e.toId}) == inst;
+            EdgeTarget t{inst.get(), {}, survives ? -1 : 0};  // -1: may glide
             EdgeInstance::targetsFor(e.desc, src.nch, s.nch, t.m);
             plan->edgeTargets.push_back(t);
             plan->contribs.push_back({inst.get(), srcStep});
@@ -594,10 +606,11 @@ void Engine::activate(RenderPlan* plan) {
     for (NodeInstance* n : plan->stopping) n->stopProcessing();
     active_ = plan;
     for (const auto& t : plan->edgeTargets)
-        t.edge->setTargets(t.m, plan->xfadeLen);
+        t.edge->setTargets(t.m, t.samples > 0 ? t.samples : plan->xfadeLen);
+    const int faderRamp = plan->levelRamp > 0 ? plan->levelRamp : levelRampSamples_;
     for (const auto& s : plan->steps)
         if (!s.dying)
-            s.level->set(s.faderDb, s.mute, levelRampSamples_,
+            s.level->set(s.faderDb, s.mute, faderRamp, levelRampSamples_,
                          plan->levelSeq);
     plan->xfadePos = 0;
     activeSerial_.store(plan->serial, std::memory_order_release);
@@ -675,6 +688,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out,
     while (auto cmd = levels_.pop())
         if (const PlanStep* s = p.stepFor(cmd->id))
             s->level->set(cmd->faderDb, cmd->mute, levelRampSamples_,
+                          levelRampSamples_,
                           cmd->seq);
 
     // Blocks larger than the plan's buffers are rendered in slices.

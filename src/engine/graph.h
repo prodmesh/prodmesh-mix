@@ -107,6 +107,7 @@ struct NodeDesc {
     float faderDb = 0;
     bool mute = false;
     MixMinusDesc mixMinus;  // Bus only
+    bool recallSafe = false;  // scene recalls leave this node alone
 };
 
 // A connection with its own level (a send, or a strip's bus assignment).
@@ -139,5 +140,15 @@ struct GraphDesc {
 // Replaces every derived edge with the ones the mix-minus buses call for
 // now. Idempotent; Engine::setGraph() applies it to every edit.
 void resolveMixMinus(GraphDesc& g);
+
+// Scenes recall the mix, never the structure: faders, mutes, and the
+// level / pan / on-off / pre-post of connections that exist in both graphs
+// (input gain, sends, assignments), plus mix-minus exclusions. Channels,
+// buses, patching and inserts are left as they are now, so a recall can
+// neither remove a channel nor reload a plugin. Nodes marked recallSafe,
+// and connections touching them, are skipped.
+GraphDesc applyScene(const GraphDesc& now, const GraphDesc& scene);
+// True if recalling `scene` would change nothing.
+bool sceneMatches(const GraphDesc& now, const GraphDesc& scene);
 
 }  // namespace pm

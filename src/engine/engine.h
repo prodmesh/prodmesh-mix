@@ -74,8 +74,12 @@ public:
     // --- control thread -------------------------------------------------
 
     // Sets the desired graph. Returns false (and changes nothing) if the
-    // graph is invalid, with the reason in `error`.
-    bool setGraph(const GraphDesc& g, std::string* error = nullptr);
+    // graph is invalid, with the reason in `error`. `glideMs` > 0 moves
+    // faders and the levels/pans of connections that survive the edit
+    // there over that time (a scene recall); mutes, new and removed
+    // connections keep their short fades.
+    bool setGraph(const GraphDesc& g, std::string* error = nullptr,
+                  double glideMs = 0);
 
     // Fader / mute move: ramps on the live instance without a recompile.
     void setLevel(NodeId id, float faderDb, bool mute);
@@ -198,6 +202,7 @@ private:
     bool publishedNeedsCleanup_ = false;
     bool resyncLevels_ = false;
     std::uint64_t levelSeq_ = 0;
+    int glideSamples_ = 0;  // for the next published plan
     std::string lastError_;
     Live live_;
     std::vector<NodeInstance*> publishedNodes_;

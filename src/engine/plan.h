@@ -42,6 +42,7 @@ struct PlanStep {
 struct EdgeTarget {
     EdgeInstance* edge;
     float m[kMaxChannels][kMaxChannels];
+    int samples = 0;  // ramp length; 0 = the plan's crossfade
 };
 
 struct RenderPlan {
@@ -66,6 +67,7 @@ struct RenderPlan {
     std::vector<float*> chan;
 
     int xfadeLen = 0;
+    int levelRamp = 0;  // fader ramp, samples; 0 = the engine's default
     int xfadePos = 0;
     bool needsCleanup = false;  // has dying steps or fadeOuts to drop
 

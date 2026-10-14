@@ -161,7 +161,9 @@ public:
     LevelState(float faderDb, bool mute);
 
     // Audio thread. Ignored if `seq` is not newer than the last applied.
-    void set(float faderDb, bool mute, int rampSamples, std::uint64_t seq);
+    // Mutes always switch fast; a fader may glide (scene recall).
+    void set(float faderDb, bool mute, int faderRamp, int muteRamp,
+             std::uint64_t seq);
     // ch *= fader * mute. With `pre`, also pre = ch * mute (the pre-fader
     // tap: mute still applies, the fader does not).
     void apply(float* const* ch, int nch, int n, float* const* pre = nullptr);

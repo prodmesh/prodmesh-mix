@@ -60,6 +60,8 @@ GraphDesc livestream() {
     };
     bus(kProgram, "Program", true);
     bus(kMixMinus, "Mix-minus", false);
+    // Remote guests hear everyone but themselves.
+    g.nodes.back().mixMinus.follows = kProgram;
     bus(kTalent, "Talent", false);
     bus(kRemotes, "Remotes", false);
 
@@ -86,8 +88,7 @@ GraphDesc livestream() {
         const float pan = -0.5f + float(i) / float(count - 1);
         g.edges.push_back({src.id, strip.id, 0, 0});
         g.edges.push_back({strip.id, s.group ? s.group : kProgram, 0, pan});
-        // Remote guests hear everyone but themselves.
-        if (!s.remote) g.edges.push_back({strip.id, kMixMinus, -3, 0});
+        if (s.remote) g.find(kMixMinus)->mixMinus.exclude.push_back(strip.id);
     }
     g.edges.push_back({kTalent, kProgram, 0, 0});
     g.edges.push_back({kRemotes, kProgram, 0, 0});

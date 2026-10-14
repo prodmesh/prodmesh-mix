@@ -114,6 +114,22 @@ cmake -S . -B build -G Ninja && cmake --build build
 - clangd may show false errors until `build/compile_commands.json` exists
   (it is symlinked to the repo root by the first configure).
 
+## Routing and mix-minus
+
+Routing is edges: a strip's *assignment* is its edge to Program or a group
+bus (a bus that reaches Program); a *send* is an edge to an aux bus (one
+that does not). Output nodes exist while something feeds them (the UI
+creates and prunes them). A **mix-minus** bus (`NodeDesc::mixMinus`:
+`follows` + `exclude`) is a rule, not a list: `resolveMixMinus()` (run by
+`Engine::setGraph` on every edit) feeds it from every strip that reaches
+`follows`, post-fader, except the excluded ones — new strips join by
+themselves. Those edges are `derived`; an explicit edge from a strip to the
+bus overrides its automatic one. Buses never feed a mix-minus automatically
+(a group may contain the voice it must leave out). UI: send rows on every
+strip (dot = on/off/"−" left out, drag = level, double-click = 0 dB or back
+to automatic), "→ destination" button, "+ Bus" tile, right-click a strip
+for "New mix-minus for …".
+
 ## Recording
 
 `mixd --record DIR` records every source (raw) and the program bus from

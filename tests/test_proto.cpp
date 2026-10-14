@@ -46,6 +46,8 @@ TEST(graph_json_round_trip_renders_identically) {
                                    back, &err));
         CHECK(back.nodes.size() == g.nodes.size());
         CHECK(back.edges.size() == g.edges.size());
+        for (std::size_t i = 0; i < g.nodes.size(); ++i)
+            CHECK(back.nodes[i].mixMinus == g.nodes[i].mixMinus);
         CHECK(sameRender(g, back));
     }
 }
@@ -66,4 +68,19 @@ TEST(livestream_show_is_valid) {
     Engine e(c);
     std::string err;
     CHECK_MSG(e.setGraph(shows::livestream(), &err), err);
+}
+
+// What a client gets back (with derived sends) can be sent again as is.
+TEST(resolved_graph_round_trips) {
+    EngineConfig c;
+    Engine e(c);
+    CHECK(e.setGraph(shows::livestream()));
+    const auto resolved = e.graph();
+    int derived = 0;
+    for (const auto& x : resolved.edges) derived += x.derived;
+    CHECK(derived == 6);  // 8 strips, 2 remotes excluded
+    GraphDesc back;
+    CHECK(proto::graphFromJson(proto::graphToJson(resolved), back, nullptr));
+    CHECK(e.setGraph(back));
+    CHECK(e.graph().edges.size() == resolved.edges.size());
 }

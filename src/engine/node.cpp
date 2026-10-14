@@ -83,6 +83,53 @@ NodeDesc* GraphDesc::find(NodeId id) {
     return nullptr;
 }
 
+bool GraphDesc::reaches(NodeId from, NodeId to) const {
+    std::vector<NodeId> stack{from}, seen;
+    while (!stack.empty()) {
+        const NodeId n = stack.back();
+        stack.pop_back();
+        if (n == to) return true;
+        if (std::find(seen.begin(), seen.end(), n) != seen.end()) continue;
+        seen.push_back(n);
+        for (const auto& e : edges)
+            if (e.from == n) stack.push_back(e.to);
+    }
+    return false;
+}
+
+void resolveMixMinus(GraphDesc& g) {
+    std::erase_if(g.edges, [](const EdgeDesc& e) { return e.derived; });
+    std::vector<EdgeDesc> add;
+    for (const auto& m : g.nodes) {
+        const auto& mm = m.mixMinus;
+        if (m.kind != NodeKind::Bus || !mm.follows || mm.follows == m.id ||
+            !g.find(mm.follows))
+            continue;
+        for (const auto& s : g.nodes) {
+            if (s.kind != NodeKind::Strip) continue;
+            if (std::find(mm.exclude.begin(), mm.exclude.end(), s.id) !=
+                mm.exclude.end())
+                continue;
+            bool explicitSend = false;
+            for (const auto& e : g.edges)
+                explicitSend |= e.from == s.id && e.to == m.id;
+            // Never feed a strip that listens to this bus (a cycle).
+            if (explicitSend || !g.reaches(s.id, mm.follows) ||
+                g.reaches(m.id, s.id))
+                continue;
+            // Same image as in the program: the pan of its assignment.
+            float pan = 0;
+            for (const auto& e : g.edges)
+                if (e.from == s.id && g.reaches(e.to, mm.follows)) {
+                    pan = e.pan;
+                    break;
+                }
+            add.push_back({s.id, m.id, 0, pan, true});
+        }
+    }
+    g.edges.insert(g.edges.end(), add.begin(), add.end());
+}
+
 NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
     : id_(d.id),
       kind_(d.kind),

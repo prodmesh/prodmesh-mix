@@ -62,11 +62,13 @@ Engine::~Engine() {
 
 // --- control thread ------------------------------------------------------
 
-bool Engine::setGraph(const GraphDesc& g, std::string* error) {
+bool Engine::setGraph(const GraphDesc& in, std::string* error) {
+    GraphDesc g = in;
+    resolveMixMinus(g);
     // Validate by compiling against nothing; the result is discarded.
     // A dry run (no Live): structure only, no instances, no plugin loads.
     if (!compile(g, nullptr, nullptr, error, nullptr)) return false;
-    desired_ = g;
+    desired_ = std::move(g);
     dirty_ = true;
     pump();
     return true;

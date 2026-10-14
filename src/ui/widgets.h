@@ -8,6 +8,7 @@
 //   - the clip light latches until clicked
 #pragma once
 
+#include <QContextMenuEvent>
 #include <QElapsedTimer>
 #include <QFontDatabase>
 #include <QHelpEvent>
@@ -533,9 +534,225 @@ private:
     QColor active_;
 };
 
+// Sends to aux and mix-minus buses, one row per bus (the same rows on
+// every strip so they line up across the console). Each row:
+//   dot    click = send on/off ("−" = this strip is the one its mix-minus
+//          leaves out)
+//   value  drag up/down = level (Option = fine), double-click = 0 dB, or
+//          back to automatic on a mix-minus
+class SendList : public QWidget {
+public:
+    static constexpr int kRowH = 18, kGap = 2, kDotW = 16;
+    enum class State { None, Off, On, Auto, Minus };
+    struct Row {
+        QString bus;
+        State state = State::None;  // None: no send possible (the bus itself)
+        float db = 0;
+        QString tip;
+    };
+    std::function<void(int row)> onToggle;
+    std::function<void(int row, float db)> onLevel;
+    std::function<void(int row)> onReset;
+
+    SendList() {
+        setStyleSheet("background: transparent;");
+        setMouseTracking(true);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setFixedHeight(0);
+    }
+    void setRows(const QList<Row>& rows) {
+        if (dragRow_ >= 0) return;  // never fight the operator's hand
+        const int h = rows.isEmpty() ? 0 : int(rows.size()) * (kRowH + kGap) - kGap;
+        if (h != height()) setFixedHeight(h);
+        rows_ = rows;
+        update();
+    }
+
+protected:
+    QRect row(int i) const { return QRect(0, i * (kRowH + kGap), width(), kRowH); }
+    int rowAt(QPoint p) const {
+        for (int i = 0; i < int(rows_.size()); ++i)
+            if (row(i).contains(p)) return i;
+        return -1;
+    }
+
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        for (int i = 0; i < int(rows_.size()); ++i) {
+            const auto& r = rows_[i];
+            const QRect rr = row(i);
+            if (r.state == State::None) continue;
+            p.setPen(Qt::NoPen);
+            p.setBrush(i == hover_ || i == dragRow_ ? QColor("#20242e")
+                                                    : QColor("#191c23"));
+            p.drawRoundedRect(rr, 4, 4);
+            const bool sending = r.state == State::On || r.state == State::Auto;
+            if (sending) {  // level bar on the fader law
+                p.setBrush(QColor(47, 191, 155, 60));
+                const float f = FaderLaw::toPos(r.db);
+                p.drawRoundedRect(QRectF(kDotW, rr.bottom() - 2,
+                                         (rr.width() - kDotW) * f, 3), 1.5, 1.5);
+            }
+            // The send switch.
+            const QPointF c(rr.left() + kDotW / 2.0 + 1, rr.center().y() + 0.5);
+            if (r.state == State::Minus) {
+                p.setPen(QPen(theme::textHi, 1.6));
+                p.drawLine(QPointF(c.x() - 3.5, c.y()), QPointF(c.x() + 3.5, c.y()));
+            } else if (sending) {
+                p.setBrush(theme::accent);
+                p.drawEllipse(c, 3.5, 3.5);
+            } else {
+                p.setPen(QPen(theme::text, 1.2));
+                p.setBrush(Qt::NoBrush);
+                p.drawEllipse(c, 3.5, 3.5);
+            }
+            QFont f = font();
+            f.setPixelSize(10);
+            p.setFont(f);
+            QFont v = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+            v.setPixelSize(10);
+            // Only a level the operator set is a number; the dot and the bar
+            // already say "automatic" or "left out" (tooltip spells it out).
+            const QString value = r.state == State::On ? fmtDb(r.db) : QString();
+            const int vw = value.isEmpty() ? 0 : QFontMetrics(v).horizontalAdvance(value) + 5;
+            p.setPen(sending ? theme::textHi : theme::text);
+            p.drawText(rr.adjusted(kDotW + 2, 0, -vw - 2, 0),
+                       Qt::AlignVCenter | Qt::AlignLeft,
+                       p.fontMetrics().elidedText(r.bus, Qt::ElideRight,
+                                                  rr.width() - kDotW - vw - 4));
+            p.setFont(v);
+            p.setPen(r.state == State::On ? theme::textMax : theme::text);
+            p.drawText(rr.adjusted(0, 0, -5, 0), Qt::AlignVCenter | Qt::AlignRight,
+                       value);
+        }
+    }
+    bool event(QEvent* e) override {
+        if (e->type() == QEvent::ToolTip) {
+            auto* he = static_cast<QHelpEvent*>(e);
+            const int i = rowAt(he->pos());
+            if (i >= 0 && rows_[i].state != State::None)
+                QToolTip::showText(he->globalPos(), rows_[i].tip, this);
+            else
+                QToolTip::hideText();
+            return true;
+        }
+        return QWidget::event(e);
+    }
+    void mouseMoveEvent(QMouseEvent* e) override {
+        if (dragRow_ >= 0) {
+            const float perPx = e->modifiers() & Qt::AltModifier ? 0.025f : 0.25f;
+            if (perPx != lastPerPx_) {  // re-anchor when switching fine/coarse
+                grabY_ = e->position().y();
+                grabDb_ = rows_[dragRow_].db;
+                lastPerPx_ = perPx;
+                return;
+            }
+            float db = grabDb_ + float(grabY_ - e->position().y()) * perPx;
+            db = std::clamp(std::round(db * 10.0f) / 10.0f, -60.0f, 10.0f);
+            auto& r = rows_[dragRow_];
+            if (db == r.db && r.state == State::On) return;
+            r.db = db;
+            r.state = State::On;
+            update();
+            if (onLevel) onLevel(dragRow_, db);
+            return;
+        }
+        const int h = rowAt(e->pos());
+        const bool onDot = h >= 0 && e->pos().x() < kDotW + 2;
+        setCursor(h < 0 || rows_[h].state == State::None ? Qt::ArrowCursor
+                  : onDot                                ? Qt::PointingHandCursor
+                                                         : Qt::SizeVerCursor);
+        if (h != hover_) {
+            hover_ = h;
+            update();
+        }
+    }
+    void leaveEvent(QEvent*) override {
+        hover_ = -1;
+        update();
+    }
+    void mousePressEvent(QMouseEvent* e) override {
+        const int i = rowAt(e->pos());
+        if (i < 0 || rows_[i].state == State::None) return;
+        if (e->pos().x() < kDotW + 2) {
+            if (onToggle) onToggle(i);
+            return;
+        }
+        dragRow_ = i;
+        grabY_ = e->position().y();
+        grabDb_ = rows_[i].state == State::On || rows_[i].state == State::Auto
+                      ? rows_[i].db : -20.0f;  // a new send starts low
+        lastPerPx_ = 0.25f;
+    }
+    void mouseReleaseEvent(QMouseEvent*) override {
+        dragRow_ = -1;
+        update();
+    }
+    void mouseDoubleClickEvent(QMouseEvent* e) override {
+        const int i = rowAt(e->pos());
+        if (i >= 0 && rows_[i].state != State::None && e->pos().x() >= kDotW + 2 &&
+            onReset)
+            onReset(i);
+    }
+
+private:
+    QList<Row> rows_;
+    int hover_ = -1, dragRow_ = -1;
+    double grabY_ = 0;
+    float grabDb_ = 0, lastPerPx_ = 0.25f;
+};
+
+// Where this strip goes: "→ Program", "→ Out 3-4". Click for the routing
+// menu. Unassigned is amber: a channel that reaches nothing is almost
+// always a mistake on air.
+class AssignButton : public QWidget {
+public:
+    std::function<void(QPoint globalPos)> onClick;
+    AssignButton() {
+        setFixedHeight(20);
+        setCursor(Qt::PointingHandCursor);
+        setMouseTracking(true);
+    }
+    void setText(const QString& t, const QString& tip) {
+        if (t == text_ && tip == toolTip()) return;
+        text_ = t;
+        setToolTip(tip);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(QPen(underMouse() ? theme::borderHi : theme::border, 1));
+        p.setBrush(QColor("#191c23"));
+        p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+        QFont f = font();
+        f.setPixelSize(10);
+        f.setWeight(QFont::Medium);
+        p.setFont(f);
+        const bool none = text_.isEmpty();
+        p.setPen(none ? theme::warn : underMouse() ? theme::textMax : theme::textHi);
+        p.drawText(rect().adjusted(4, 0, -4, 0), Qt::AlignCenter,
+                   p.fontMetrics().elidedText(none ? "→ nowhere" : "→ " + text_,
+                                              Qt::ElideRight, width() - 8));
+    }
+    void enterEvent(QEnterEvent*) override { update(); }
+    void leaveEvent(QEvent*) override { update(); }
+    void mousePressEvent(QMouseEvent* e) override {
+        if (onClick) onClick(mapToGlobal(QPoint(0, height())));
+        e->accept();
+    }
+
+private:
+    QString text_ = "-";
+};
+
 class StripWidget : public QWidget {
 public:
     std::function<void(float faderDb, bool mute)> onChange;
+    std::function<void(QPoint globalPos)> onContext;  // right-click
 
     StripWidget(const QString& name, int channels, bool master,
                 QWidget* parent = nullptr)
@@ -561,11 +778,18 @@ public:
         name_->setToolTip(name);
         setName(name);
         v->addWidget(name_);
+        caption_ = new QLabel(this);
+        caption_->setAlignment(Qt::AlignCenter);
+        caption_->setStyleSheet("color: #8a92a6; font-size: 9px;");
+        caption_->setFixedHeight(11);
+        v->addWidget(caption_);
 
         gain_ = new GainField;
         v->addWidget(gain_);
         inserts_ = new InsertList;
         v->addWidget(inserts_);
+        sends_ = new SendList;
+        v->addWidget(sends_);
 
         fader_ = new FaderMeter(channels, this);
         v->addWidget(fader_, 1, Qt::AlignHCenter);
@@ -600,6 +824,8 @@ public:
         delays->addWidget(dly_);
         delays->addWidget(cmp_);
         v->addLayout(delays);
+        assign_ = new AssignButton;
+        v->addWidget(assign_);
 
         fader_->onLevel = [this](float d) {
             showDb(d);
@@ -631,6 +857,14 @@ public:
         fader_->setMeter(peak, rms);
     }
     InsertList* inserts() { return inserts_; }
+    SendList* sends() { return sends_; }
+    AssignButton* assign() { return assign_; }
+    // A second line under the name ("minus Remote 1" on a mix-minus).
+    void setCaption(const QString& c, const QString& tip = {}) {
+        caption_->setText(caption_->fontMetrics().elidedText(
+            c, Qt::ElideRight, width() - 16));
+        caption_->setToolTip(tip.isEmpty() ? c : tip);
+    }
     // Strips fed by a source get a gain field; buses do not.
     GainField* gain() { return gain_; }
     void setHasGain(bool on) {
@@ -667,12 +901,20 @@ public:
     }
     void clearMeter() { fader_->clearMeter(); }
 
+protected:
+    void contextMenuEvent(QContextMenuEvent* e) override {
+        if (onContext) onContext(e->globalPos());
+    }
+
 private:
     void showDb(float d) { readout_->setText(fmtDb(d)); }
 
     bool master_;
     bool syncing_ = false;
     QLabel* name_;
+    QLabel* caption_;
+    SendList* sends_;
+    AssignButton* assign_;
     QLabel* readout_;
     DelayCell* dly_;
     DelayCell* cmp_;

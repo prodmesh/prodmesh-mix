@@ -82,6 +82,7 @@ add_executable(mix-tests
     tests/test_main.cpp
     tests/test_core.cpp
     tests/test_engine.cpp
+    tests/test_routing.cpp
     tests/test_record.cpp
     tests/test_plugin.cpp
     tools/bench_graph.cpp

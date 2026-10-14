@@ -179,13 +179,22 @@ QJsonObject graphToJson(const GraphDesc& g) {
                                          {"sineDb", n.generator.sineDb},
                                          {"noiseDb", n.generator.noiseDb},
                                          {"bursts", n.generator.bursts}};
+        if (n.mixMinus.follows) {
+            QJsonArray ex;
+            for (auto id : n.mixMinus.exclude) ex.append(double(id));
+            o["mixMinus"] = QJsonObject{
+                {"follows", double(n.mixMinus.follows)}, {"exclude", ex}};
+        }
         nodes.append(o);
     }
-    for (const auto& e : g.edges)
-        edges.append(QJsonObject{{"from", double(e.from)},
-                                 {"to", double(e.to)},
-                                 {"gainDb", e.gainDb},
-                                 {"pan", e.pan}});
+    for (const auto& e : g.edges) {
+        QJsonObject o{{"from", double(e.from)},
+                      {"to", double(e.to)},
+                      {"gainDb", e.gainDb},
+                      {"pan", e.pan}};
+        if (e.derived) o["derived"] = true;
+        edges.append(o);
+    }
     return QJsonObject{{"nodes", nodes}, {"edges", edges}};
 }
 
@@ -214,6 +223,10 @@ bool graphFromJson(const QJsonObject& o, GraphDesc& g, QString* error) {
         d.generator.sineDb = num(gen, "sineDb", d.generator.sineDb);
         d.generator.noiseDb = num(gen, "noiseDb", d.generator.noiseDb);
         d.generator.bursts = gen["bursts"].toBool(d.generator.bursts);
+        const auto mm = n["mixMinus"].toObject();
+        d.mixMinus.follows = NodeId(mm["follows"].toDouble(0));
+        for (const auto& x : mm["exclude"].toArray())
+            d.mixMinus.exclude.push_back(NodeId(x.toDouble()));
         out.nodes.push_back(std::move(d));
     }
     for (const auto& v : o["edges"].toArray()) {
@@ -222,7 +235,7 @@ bool graphFromJson(const QJsonObject& o, GraphDesc& g, QString* error) {
             return fail("edge without endpoints");
         out.edges.push_back({NodeId(e["from"].toDouble()),
                              NodeId(e["to"].toDouble()), num(e, "gainDb", 0),
-                             num(e, "pan", 0)});
+                             num(e, "pan", 0), e["derived"].toBool(false)});
     }
     g = std::move(out);
     return true;

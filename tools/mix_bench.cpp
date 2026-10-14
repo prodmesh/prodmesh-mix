@@ -217,7 +217,10 @@ int main(int argc, char** argv) {
 
     Histogram hist;
     std::uint64_t seenXruns = 0;
-    std::uint32_t windowMaxNs = 0;  // slowest render since the last check
+    // Slowest render over the last second: the device reports an overload
+    // asynchronously, so the window must reach back past the notification.
+    std::uint32_t windowMaxNs = 0, prevWindowMaxNs = 0;
+    auto windowStart = std::chrono::steady_clock::now();
     bool stalled = false;
     double maxFill = 0;
     std::mt19937 rng(42);
@@ -242,13 +245,18 @@ int main(int argc, char** argv) {
             const auto t = std::time(nullptr);
             char when[32];
             std::strftime(when, sizeof when, "%H:%M:%S", std::localtime(&t));
+            const auto worst = std::max(windowMaxNs, prevWindowMaxNs);
             std::fprintf(stderr, "  XRUN at %s (%.0fs): total %llu, slowest render "
-                                 "in the last ~2 ms window %.0f us (%.0f%% of period)\n",
-                         when, elapsed, (unsigned long long)x, windowMaxNs / 1e3,
-                         100.0 * windowMaxNs / 1e3 / (1e6 * cfg.blockSize / cfg.sampleRate));
+                                 "in the last 1-2 s %.0f us (%.0f%% of period)\n",
+                         when, elapsed, (unsigned long long)x, worst / 1e3,
+                         100.0 * worst / 1e3 / (1e6 * cfg.blockSize / cfg.sampleRate));
             seenXruns = x;
         }
-        windowMaxNs = 0;
+        if (now - windowStart >= std::chrono::seconds(1)) {
+            prevWindowMaxNs = windowMaxNs;
+            windowMaxNs = 0;
+            windowStart = now;
+        }
         if (recorder) {
             if (o.stallMs && !stalled && elapsed >= o.stallAt) {
                 recorder->simulateStall(o.stallMs);

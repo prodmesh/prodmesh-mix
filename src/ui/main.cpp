@@ -408,9 +408,14 @@ private:
             if (proto::graphFromJson(m["graph"].toObject(), g, nullptr)) {
                 // Compare with what the strips were built from: a local edit
                 // already changed graph_.
-                if (!sameLayout(g, pendingGraph_) || strips_.isEmpty()) build(g);
+                const bool rebuilt = !sameLayout(g, pendingGraph_) || strips_.isEmpty();
+                if (rebuilt) build(g);
+                // What is on screen now: the start of a recall's glide.
+                const GraphDesc shown = glide_.active() ? glideFrame() : graph_;
                 // A local edit not sent yet is newer than this snapshot.
                 if (!sendTimer_.isActive()) graph_ = g;
+                const double glideMs = m["glideMs"].toDouble();
+                if (glideMs > 0 && !rebuilt) startGlide(shown, glideMs);
                 const auto delay = m["delay"].toObject();
                 for (const auto& n : graph_.nodes)
                     if (auto* st = strips_.value(n.id)) {
@@ -430,6 +435,7 @@ private:
                     }
             }
             refreshRouting();
+            if (glide_.active()) showGlideFrame();  // not the end values yet
             QStringList w;
             for (const auto& v : m["warnings"].toArray()) w << v.toString();
             warnings_->setText(
@@ -471,6 +477,11 @@ private:
             }
         } else if (type == "level") {
             const auto id = quint32(m["id"].toDouble());
+            touch(id);
+            if (auto* n = graph_.find(id)) {
+                n->faderDb = float(m["faderDb"].toDouble());
+                n->mute = m["mute"].toBool();
+            }
             if (auto* s = strips_.value(id))
                 s->setLevel(float(m["faderDb"].toDouble()), m["mute"].toBool());
         } else if (type == "health") {
@@ -626,6 +637,7 @@ private:
     }
 
     void build(const GraphDesc& g) {
+        stopGlide();
         for (auto* s : strips_) s->deleteLater();
         strips_.clear();
         pendingGraph_ = g;
@@ -685,6 +697,76 @@ private:
 
         if (const auto* p = g.find(program))
             masterHost_->layout()->addWidget(makeStrip(*p, true));
+    }
+
+    // --- Scene glide on screen ---------------------------------------------
+    // A recall with a fade moves faders and connection levels in the engine
+    // over glideMs, linear in gain; mutes switch at once. The strips show
+    // the same movement. A strip the operator touches leaves the animation
+    // (the engine hands it to them the same way).
+
+    struct Glide {
+        GraphDesc from;
+        QElapsedTimer clock;
+        double ms = 0;
+        QSet<NodeId> touched;
+        bool active() const { return ms > 0; }
+    } glide_;
+    QTimer glideTimer_;
+
+    void touch(NodeId id) {
+        if (glide_.active()) glide_.touched.insert(id);
+    }
+    void startGlide(const GraphDesc& from, double ms) {
+        glide_.from = from;
+        glide_.ms = ms;
+        glide_.touched.clear();
+        glide_.clock.start();
+        if (!glideTimer_.isActive()) {
+            glideTimer_.disconnect();
+            connect(&glideTimer_, &QTimer::timeout, this, [this] { showGlideFrame(); });
+            glideTimer_.start(16);
+        }
+    }
+    void stopGlide() {
+        glide_.ms = 0;
+        glideTimer_.stop();
+    }
+    static float lerpDb(float a, float b, float t) {
+        const float ga = a <= kFaderMinDb ? 0 : std::pow(10.0f, a / 20);
+        const float gb = b <= kFaderMinDb ? 0 : std::pow(10.0f, b / 20);
+        const float g = ga + (gb - ga) * t;
+        return g > 1e-6f ? 20 * std::log10(g) : kFaderMinDb;
+    }
+    // graph_ (where the engine is going) with levels where it is now.
+    GraphDesc glideFrame() const {
+        GraphDesc d = graph_;
+        const float t = float(std::clamp(glide_.clock.elapsed() / glide_.ms, 0.0, 1.0));
+        for (auto& n : d.nodes)
+            if (const auto* f = glide_.from.find(n.id); f && !glide_.touched.contains(n.id))
+                n.faderDb = lerpDb(f->faderDb, n.faderDb, t);
+        for (auto& e : d.edges) {
+            if (glide_.touched.contains(e.from) || glide_.touched.contains(e.to)) continue;
+            for (const auto& f : glide_.from.edges)
+                if (f.from == e.from && f.to == e.to && f.derived == e.derived) {
+                    e.gainDb = lerpDb(f.gainDb, e.gainDb, t);
+                    e.pan = f.pan + (e.pan - f.pan) * t;
+                    break;
+                }
+        }
+        return d;
+    }
+    void showGlideFrame() {
+        if (!glide_.active()) return;
+        const bool done = glide_.clock.elapsed() >= glide_.ms;
+        GraphDesc frame = done ? graph_ : glideFrame();
+        for (const auto& n : frame.nodes)
+            if (auto* st = strips_.value(n.id); st && !glide_.touched.contains(n.id))
+                st->setLevel(n.faderDb, n.mute);
+        std::swap(graph_, frame);  // refreshRouting() draws from graph_
+        refreshRouting();
+        std::swap(graph_, frame);
+        if (done) stopGlide();
     }
 
     // --- Routing ---------------------------------------------------------
@@ -980,6 +1062,7 @@ private:
     // Replaces what feeds a channel, keeping its gain. The channel takes
     // the width of its input (a pair or a stereo bus makes it stereo).
     void setInput(NodeId id, const QList<NodeId>& src, int channels) {
+        touch(id);
         GraphDesc g = graph_;
         float gain = 0;
         for (const auto& e : g.edges)
@@ -1009,6 +1092,7 @@ private:
     // Pans the main output and the sends together (mix-minus sends follow
     // by themselves); a stereo channel's pan is a balance.
     void setPan(NodeId id, float p) {
+        touch(id);
         GraphDesc g = graph_;
         for (auto& e : g.edges)
             if (e.from == id && !e.derived) e.pan = p;
@@ -1016,6 +1100,7 @@ private:
     }
 
     void setGain(NodeId id, float dB) {
+        touch(id);
         GraphDesc g = graph_;
         for (auto& e : g.edges)
             if (e.to == id) e.gainDb = dB;
@@ -1025,6 +1110,7 @@ private:
     // --- Sends ---
 
     void toggleSend(NodeId id, NodeId dest) {
+        touch(id);
         GraphDesc g = graph_;
         auto* d = g.find(dest);
         if (!d) return;
@@ -1049,6 +1135,7 @@ private:
     }
 
     void setSendLevel(NodeId id, NodeId dest, float db) {
+        touch(id);
         GraphDesc g = graph_;
         if (auto* e = edgeOf(g, id, dest)) {
             e->gainDb = db;
@@ -1060,6 +1147,7 @@ private:
     }
 
     void resetSend(NodeId id, NodeId dest) {
+        touch(id);
         GraphDesc g = graph_;
         auto* d = g.find(dest);
         if (d && d->mixMinus.follows && g.reaches(id, d->mixMinus.follows)) {
@@ -1498,6 +1586,7 @@ private:
         s->gain()->onGain = [this, id](float dB) { setGain(id, dB); };
         s->input()->onClick = [this, id](QPoint at) { inputMenu(id, at); };
         s->onChange = [this, id](float db, bool mute) {
+            touch(id);  // the operator's hand beats a recall's glide
             client_.setLevel(id, db, mute);
             if (auto* n = graph_.find(id)) {  // so the next edit keeps it
                 n->faderDb = db;

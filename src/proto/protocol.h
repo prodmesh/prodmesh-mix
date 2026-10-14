@@ -19,6 +19,8 @@
 //
 // daemon -> client
 //   {"type":"snapshot","proto":1,"graph":{...},"engine":{...}}
+//       "glideMs": present after a scene recall with a fade: show the
+//       levels moving there over that time (linear in gain, like the engine)
 //   {"type":"level","id":2001,"faderDb":-3.5,"mute":false}
 //   {"type":"meters","m":[[id,peakL,peakR,rmsL,rmsR],...]}   dBFS, ~30 Hz
 //   {"type":"health","xruns":0,"callbacks":N,"meanLoad":0.14,...}  ~2 Hz

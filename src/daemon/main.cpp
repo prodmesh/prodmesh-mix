@@ -272,6 +272,7 @@ private:
             return false;
         }
         snapshotPending_ = true;
+        snapshotGlideMs_ = std::max(snapshotGlideMs_, fadeMs);
         return true;
     }
 
@@ -605,7 +606,11 @@ private:
         }
         if (snapshotPending_ && engine_->settled()) {
             snapshotPending_ = false;
-            broadcast(snapshot(), nullptr);
+            auto snap = snapshot();
+            // Clients animate to the new values over the engine's glide.
+            if (snapshotGlideMs_ > 0) snap["glideMs"] = snapshotGlideMs_;
+            snapshotGlideMs_ = 0;
+            broadcast(snap, nullptr);
         }
         while (auto smp = driver_->stats().samples.pop()) {
             const double us = smp->durationNs / 1e3;
@@ -679,6 +684,7 @@ private:
     std::unique_ptr<rec::Recorder> recorder_;
     QJsonArray catalog_;
     bool snapshotPending_ = false;
+    double snapshotGlideMs_ = 0;
     QProcess* scanner_ = nullptr;
     QList<Scene> scenes_;
     int currentScene_ = 0, nextSceneId_ = 1;

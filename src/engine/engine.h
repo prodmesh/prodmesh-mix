@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "core/rt_guard.h"
 #include "core/rt_thread.h"
@@ -117,9 +118,13 @@ public:
         NodeId node;
         std::string plugin;
         std::uint64_t allocations;
+        std::uint64_t missed;  // sandboxed: blocks passed through dry
     };
     // Live plugins whose own code has allocated on the audio thread.
     std::vector<PluginRtIssue> pluginRtIssues() const;
+
+    // Plugin host events since the last call (crashes, restarts).
+    std::vector<std::string> drainEvents() { return std::exchange(events_, {}); }
 
     // Plugins that failed to load (passed through), oldest first.
     const std::vector<std::string>& warnings() const { return warnings_; }
@@ -182,6 +187,7 @@ private:
     Live live_;
     std::vector<NodeInstance*> publishedNodes_;
     std::vector<std::string> warnings_;
+    std::vector<std::string> events_;
     std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps_;
 
     // Cross-thread.

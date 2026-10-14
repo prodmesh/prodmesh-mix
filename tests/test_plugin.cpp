@@ -1,5 +1,7 @@
 // Plugin hosting against the in-tree pm-test.clap.
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstring>
 #include <vector>
 
@@ -101,7 +103,7 @@ TEST(clap_bundle_describes_its_plugins) {
     std::vector<plugin::PluginInfo> list;
     std::string err;
     CHECK_MSG(plugin::describeBundle(PM_TEST_CLAP, list, &err), err);
-    CHECK(list.size() == 3);
+    CHECK(list.size() == 4);
     CHECK(list[0].id == "com.prodmesh.test.gain" && list[0].format == "clap");
 }
 
@@ -239,4 +241,89 @@ TEST(plugin_allocations_are_attributed_not_counted_as_engine_bugs) {
     CHECK(issues.size() == 1);
     CHECK(issues[0].node == 2 && issues[0].plugin == "PM Test Alloc");
     CHECK(issues[0].allocations >= 20);
+}
+
+// --- sandbox -----------------------------------------------------------------
+
+namespace {
+
+// Rendered at roughly real time: a sandbox host is a separate process, and
+// the engine never waits for it.
+std::vector<float> runPaced(Engine& e, int blocks) {
+    std::vector<float> all, buf(kBlock);
+    float* out[1] = {buf.data()};
+    for (int b = 0; b < blocks; ++b) {
+        e.pump();
+        {
+            rt::ScopedRealtime scope;
+            e.process(nullptr, 0, out, 1, kBlock);
+        }
+        all.insert(all.end(), buf.begin(), buf.end());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return all;
+}
+
+GraphDesc withSandboxed(GraphDesc g, const char* id) {
+    g.find(2)->processing.inserts.push_back(
+        InsertDesc::plugin("clap", PM_TEST_CLAP, id, true));
+    return g;
+}
+
+}  // namespace
+
+TEST(sandboxed_plugin_is_exact_one_block_later) {
+    Engine in(cfg()), out(cfg());
+    CHECK(in.setGraph(withPlugin(sine(), "com.prodmesh.test.gain")));
+    CHECK(out.setGraph(withSandboxed(sine(), "com.prodmesh.test.gain")));
+    CHECK_MSG(out.warnings().empty(), out.warnings().empty() ? "" : out.warnings()[0]);
+    const auto x = runPaced(in, 200), y = runPaced(out, 200);
+    std::size_t bad = 0;
+    for (std::size_t n = kBlock; n < x.size(); ++n) bad += y[n] != x[n - kBlock];
+    CHECK_MSG(bad == 0, std::to_string(bad) + " samples differ");
+    CHECK(out.latencyOf(2) == kBlock);
+    CHECK(rt::violations() == 0);
+}
+
+TEST(sandboxed_latency_includes_the_exchange_block) {
+    Engine e(cfg());
+    CHECK(e.setGraph(withSandboxed(sine(), "com.prodmesh.test.delay")));
+    CHECK(e.latencyOf(2) == 64 + kBlock);
+}
+
+TEST(sandboxed_plugin_crash_keeps_audio_running) {
+    Engine e(cfg());
+    CHECK(e.setGraph(withSandboxed(sine(), "com.prodmesh.test.crash")));
+    // The plugin is unity until it dies on block 50; after that the insert
+    // passes last block's input — so the output stays the signal, one block
+    // late, with no gap or step, through the crash and the restart.
+    Engine ref(cfg());
+    CHECK(ref.setGraph(sine()));
+    const auto x = runPaced(ref, 300), y = runPaced(e, 300);
+    std::size_t bad = 0;
+    for (std::size_t n = kBlock; n < x.size(); ++n) bad += y[n] != x[n - kBlock];
+    CHECK_MSG(bad == 0, std::to_string(bad) + " samples differ across the crash");
+    const auto events = e.drainEvents();
+    CHECK(!events.empty());
+    bool crashed = false;
+    for (const auto& ev : events) crashed = crashed || ev.find("crashed") != std::string::npos;
+    CHECK_MSG(crashed, events.empty() ? "no events" : events[0]);
+    if (std::getenv("PM_TEST_VERBOSE"))
+        for (const auto& ev : events) std::printf("        event: %s\n", ev.c_str());
+    CHECK(rt::violations() == 0);
+}
+
+TEST(isolated_chain_shares_one_host_and_one_block) {
+    Engine in(cfg()), out(cfg());
+    auto twoIn = withPlugin(withPlugin(sine(), "com.prodmesh.test.gain"),
+                            "com.prodmesh.test.gain");
+    auto twoOut = withSandboxed(withSandboxed(sine(), "com.prodmesh.test.gain"),
+                                "com.prodmesh.test.gain");
+    CHECK(in.setGraph(twoIn));
+    CHECK(out.setGraph(twoOut));
+    CHECK(out.latencyOf(2) == kBlock);  // one block for the pair
+    const auto x = runPaced(in, 120), y = runPaced(out, 120);
+    std::size_t bad = 0;
+    for (std::size_t n = kBlock; n < x.size(); ++n) bad += y[n] != x[n - kBlock];
+    CHECK_MSG(bad == 0, std::to_string(bad) + " samples differ");
 }

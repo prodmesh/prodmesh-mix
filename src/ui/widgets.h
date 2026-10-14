@@ -298,8 +298,9 @@ public:
         setMouseTracking(true);
         setCursor(Qt::PointingHandCursor);
     }
-    void setInserts(const QStringList& names) {
+    void setInserts(const QStringList& names, const QList<bool>& inEngine = {}) {
         names_ = names;
+        inEngine_ = inEngine;
         update();
     }
     // Per-slot notes (amber marker + tooltip): a plugin that is not
@@ -330,10 +331,17 @@ protected:
             p.drawRoundedRect(r, 4, 4);
             p.setBrush(notes_.contains(i) ? theme::warn : theme::accent);
             p.drawRoundedRect(QRect(r.left(), r.top(), 3, r.height()), 1.5, 1.5);
+            // In-engine (not isolated) plugins are the exception: a dot.
+            const bool inEngine = inEngine_.value(i, false);
+            if (inEngine) {
+                p.setPen(Qt::NoPen);
+                p.setBrush(theme::text);
+                p.drawEllipse(QPoint(r.right() - 7, r.center().y() + 1), 2, 2);
+            }
             p.setPen(theme::textHi);
-            p.drawText(r.adjusted(8, 0, -4, 0), Qt::AlignVCenter,
+            p.drawText(r.adjusted(8, 0, inEngine ? -14 : -4, 0), Qt::AlignVCenter,
                        p.fontMetrics().elidedText(names_[i], Qt::ElideRight,
-                                                  r.width() - 12));
+                                                  r.width() - (inEngine ? 22 : 12)));
         }
         const QRect add = row(addRow());
         p.setPen(QPen(i_hoverAdd() ? theme::borderHi : theme::border, 1,
@@ -390,6 +398,7 @@ protected:
 
 private:
     QStringList names_;
+    QList<bool> inEngine_;
     QMap<int, QString> notes_;
     int hover_ = -1;
 };

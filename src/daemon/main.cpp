@@ -285,7 +285,8 @@ private:
         for (const auto& i : engine_->pluginRtIssues())
             out.append(QJsonObject{{"node", double(i.node)},
                                    {"plugin", QString::fromStdString(i.plugin)},
-                                   {"allocations", double(i.allocations)}});
+                                   {"allocations", double(i.allocations)},
+                                   {"missed", double(i.missed)}});
         return out;
     }
 
@@ -436,6 +437,13 @@ private:
 
     void pump() {
         engine_->pump();
+        for (const auto& e : engine_->drainEvents()) {
+            qWarning("mixd: %s", e.c_str());
+            broadcast({{"type", "event"},
+                       {"level", "warning"},
+                       {"message", QString::fromStdString(e)}},
+                      nullptr);
+        }
         if (snapshotPending_ && engine_->settled()) {
             snapshotPending_ = false;
             broadcast(snapshot(), nullptr);

@@ -294,6 +294,15 @@ public:
             " padding: 7px 16px; border-bottom: 1px solid #e0c05c;");
         warnings_->hide();
         outer->addWidget(warnings_);
+        events_ = new QLabel;
+        events_->setWordWrap(true);
+        events_->setStyleSheet(
+            "background: #3a1c20; color: #ffd9db; font-size: 12px;"
+            " padding: 7px 16px; border-bottom: 1px solid #e5484d;");
+        events_->hide();
+        outer->addWidget(events_);
+        eventsTimer_.setSingleShot(true);
+        connect(&eventsTimer_, &QTimer::timeout, events_, &QLabel::hide);
 
         auto* body = new QWidget;
         body->setObjectName("root");
@@ -378,7 +387,7 @@ private:
                 for (const auto& n : graph_.nodes)
                     if (auto* st = strips_.value(n.id)) {
                         st->setLevel(n.faderDb, n.mute);
-                        st->inserts()->setInserts(insertNames(n));
+                        st->inserts()->setInserts(insertNames(n), inEngineFlags(n));
                         const auto d = delay[QString::number(n.id)].toObject();
                         QList<QPair<QString, int>> comp;
                         for (const auto& c : d["comp"].toArray()) {
@@ -403,12 +412,18 @@ private:
             loadFailures_ = w;
             refreshNotes();
             setOffline(false);
+        } else if (type == "event") {
+            // Transient: a plugin host crashed and was restarted, etc.
+            events_->setText(m["message"].toString() +
+                             " — audio passed straight through meanwhile.");
+            events_->show();
+            eventsTimer_.start(15000);
         } else if (type == "catalog") {
             catalog_ = m["plugins"].toArray();
             scanning_ = m["scanning"].toBool();
             for (const auto& n : graph_.nodes)  // names may resolve now
                 if (auto* st = strips_.value(n.id))
-                    st->inserts()->setInserts(insertNames(n));
+                    st->inserts()->setInserts(insertNames(n), inEngineFlags(n));
         } else if (type == "meters") {
             for (const auto& v : m["m"].toArray()) {
                 const auto r = v.toArray();
@@ -427,7 +442,7 @@ private:
             for (const auto& v : m["pluginRt"].toArray()) {
                 const auto o = v.toObject();
                 rtIssues_[quint32(o["node"].toDouble())][o["plugin"].toString()] =
-                    qint64(o["allocations"].toDouble());
+                    {qint64(o["allocations"].toDouble()), qint64(o["missed"].toDouble())};
             }
             refreshNotes();
         }
@@ -452,6 +467,13 @@ private:
                 return o["name"].toString();
         }
         return QFileInfo(QString::fromStdString(ins.path)).completeBaseName();
+    }
+
+    QList<bool> inEngineFlags(const NodeDesc& n) const {
+        QList<bool> out;
+        for (const auto& ins : n.processing.inserts)
+            out << (ins.type == InsertDesc::Type::Plugin && !ins.sandboxed);
+        return out;
     }
 
     QStringList insertNames(const NodeDesc& n) const {
@@ -497,13 +519,22 @@ private:
                     if (!path.isEmpty() && f.contains(path))
                         notes[i] = names[i] + " — couldn't load; audio passes "
                                               "straight through";
-                for (auto it = issues.cbegin(); it != issues.cend(); ++it)
-                    if (names[i] == it.key() || names[i].startsWith(it.key()))
-                        notes[i] = QString("%1 — allocated memory on the audio "
-                                           "thread %2× (not real-time safe; "
-                                           "a dropout risk under load)")
-                                       .arg(names[i])
-                                       .arg(it.value());
+                for (auto it = issues.cbegin(); it != issues.cend(); ++it) {
+                    // An isolated chain reports as "A + B": note each member.
+                    if (!it.key().split(" + ").contains(names[i]) &&
+                        !names[i].startsWith(it.key()))
+                        continue;
+                    QStringList why;
+                    if (it.value().first)
+                        why << QString("allocated memory on the audio thread %1× "
+                                       "(not real-time safe; a dropout risk "
+                                       "under load)").arg(it.value().first);
+                    if (it.value().second)
+                        why << QString("its isolated host was late %1× (those "
+                                       "blocks passed through dry)")
+                                   .arg(it.value().second);
+                    notes[i] = names[i] + " — " + why.join("; ");
+                }
             }
             st->inserts()->setNotes(notes);
         }
@@ -512,10 +543,11 @@ private:
     void addInsert(NodeId id, const QJsonObject& entry) {
         GraphDesc g = graph_;
         if (auto* n = g.find(id)) {
+            // Isolated by default: a plugin crash must not stop the show.
             n->processing.inserts.push_back(InsertDesc::plugin(
                 entry["format"].toString().toStdString(),
                 entry["path"].toString().toStdString(),
-                entry["id"].toString().toStdString()));
+                entry["id"].toString().toStdString(), true));
             client_.setGraph(g);
         }
     }
@@ -602,8 +634,24 @@ private:
                 "QMenu::item { padding: 5px 18px; border-radius: 4px; }"
                 "QMenu::item:selected { background: #2a3a37; }");
             const auto names = insertNames(*n);
+            const auto& ins = n->processing.inserts[std::size_t(index)];
+            QAction* isolate = nullptr;
+            if (ins.type == InsertDesc::Type::Plugin) {
+                isolate = menu.addAction("Run isolated (crash-safe, +1 block latency)");
+                isolate->setCheckable(true);
+                isolate->setChecked(ins.sandboxed);
+                menu.addSeparator();
+            }
             auto* remove = menu.addAction("Remove " + names.value(index));
-            if (menu.exec(at) == remove) removeInsert(id, index);
+            QAction* chosen = menu.exec(at);
+            if (chosen == remove) {
+                removeInsert(id, index);
+            } else if (chosen && chosen == isolate) {
+                GraphDesc g = graph_;
+                g.find(id)->processing.inserts[std::size_t(index)].sandboxed =
+                    isolate->isChecked();
+                client_.setGraph(g);
+            }
         };
         strips_[id] = s;
         return s;
@@ -623,11 +671,13 @@ private:
     QLabel* offline_;
     QLabel* banner_;
     QLabel* warnings_;
+    QLabel* events_;
+    QTimer eventsTimer_;
     QMap<quint32, StripWidget*> strips_;
     GraphDesc graph_;
     QJsonArray catalog_;
     bool scanning_ = false;
-    QMap<quint32, QMap<QString, qint64>> rtIssues_;
+    QMap<quint32, QMap<QString, QPair<qint64, qint64>>> rtIssues_;  // allocs, missed
     QStringList loadFailures_;
     QPointer<QWidget> browser_;
     double rate_ = 48000;

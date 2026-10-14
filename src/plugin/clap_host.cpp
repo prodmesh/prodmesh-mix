@@ -293,8 +293,8 @@ bool describeClap(const std::string& path, std::vector<PluginInfo>& out,
         const auto* d = f->get_plugin_descriptor(f, i);
         if (!d) continue;
         bool instrument = false;
-        for (auto f = d->features; f && *f; ++f)
-            instrument = instrument || !std::strcmp(*f, CLAP_PLUGIN_FEATURE_INSTRUMENT);
+        for (auto feat = d->features; feat && *feat; ++feat)
+            instrument = instrument || !std::strcmp(*feat, CLAP_PLUGIN_FEATURE_INSTRUMENT);
         out.push_back({"clap", path, d->id ? d->id : "", d->name ? d->name : "",
                        d->vendor ? d->vendor : "",
                        d->version ? d->version : "", instrument});

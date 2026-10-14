@@ -94,6 +94,9 @@ bool Engine::canPublish() const {
 
 void Engine::pump() {
     while (auto p = retired_.pop()) delete *p;
+    // Sandboxed plugin hosts: restart any that died.
+    for (const auto& [id, inst] : live_.nodes)
+        for (auto& e : inst->maintain()) events_.push_back(std::move(e));
 
     if (resyncLevels_ &&
         activeSerial_.load(std::memory_order_acquire) == publishedSerial_) {
@@ -159,7 +162,7 @@ std::vector<Engine::PluginRtIssue> Engine::pluginRtIssues() const {
     std::vector<PluginRtIssue> out;
     for (const auto& [id, inst] : live_.nodes)
         for (const auto& r : inst->pluginRtReport())
-            out.push_back({id, r.plugin, r.allocations});
+            out.push_back({id, r.plugin, r.allocations, r.missed});
     return out;
 }
 

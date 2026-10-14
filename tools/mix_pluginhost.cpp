@@ -1,0 +1,126 @@
+// mix-pluginhost: runs one plugin outside the engine (see
+// src/plugin/sandbox_shm.h for the exchange). If the plugin crashes, only
+// this process dies; the engine bypasses the insert and starts a new host.
+//
+//   mix-pluginhost --shm NAME --channels N --max-block N --rate HZ
+//                  --plugin FORMAT BUNDLE ID [--plugin ...]
+// Several --plugin run as one chain, in order.
+#include <atomic>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+#include "core/rt_guard.h"
+#include "core/rt_thread.h"
+#include "plugin/plugin.h"
+#include "plugin/sandbox_shm.h"
+
+using namespace pm;
+
+namespace {
+
+std::atomic<bool> gQuit{false};
+void onTerm(int) { gQuit.store(true); }
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::string shm;
+    std::vector<plugin::PluginRef> chain;
+    int channels = 1, maxBlock = 128;
+    double rate = 48000;
+    for (int i = 1; i < argc; ++i) {
+        const std::string k = argv[i];
+        if (k == "--plugin" && i + 3 < argc) {
+            chain.push_back({argv[i + 1], argv[i + 2], argv[i + 3]});
+            i += 3;
+            continue;
+        }
+        if (i + 1 >= argc) break;
+        const std::string v = argv[++i];
+        if (k == "--shm") shm = v;
+        else if (k == "--channels") channels = std::stoi(v);
+        else if (k == "--max-block") maxBlock = std::stoi(v);
+        else if (k == "--rate") rate = std::stod(v);
+    }
+    std::signal(SIGTERM, onTerm);
+    std::signal(SIGINT, onTerm);
+
+    const int fd = shm_open(shm.c_str(), O_RDWR, 0);
+    if (fd < 0) {
+        std::fprintf(stderr, "mix-pluginhost: no shared memory %s\n", shm.c_str());
+        return 2;
+    }
+    const std::size_t size = sandbox::regionSize(channels, maxBlock);
+    void* region = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (region == MAP_FAILED) return 2;
+    auto view = sandbox::View::of(region, channels, maxBlock);
+    auto& h = *view.header;
+    if (h.magic != sandbox::kMagic || h.version != sandbox::kVersion ||
+        h.channels != channels || h.maxBlock != maxBlock)
+        return 2;
+
+    std::vector<std::unique_ptr<Processor>> plugins;
+    std::string names;
+    int latency = 0;
+    for (const auto& r : chain) {
+        std::string err;
+        auto p = plugin::load(r.format, r.path, r.id, rate, maxBlock, channels, &err);
+        if (!p) {
+            std::fprintf(stderr, "mix-pluginhost: %s\n", err.c_str());
+            h.state.store(std::uint32_t(sandbox::HostState::Failed));
+            return 3;
+        }
+        names += (names.empty() ? "" : " + ") + p->name();
+        latency += p->latencySamples();
+        plugins.push_back(std::move(p));
+    }
+    std::strncpy(h.name, names.c_str(), sizeof h.name - 1);
+    h.latency.store(latency);
+    h.state.store(std::uint32_t(sandbox::HostState::Ready), std::memory_order_release);
+
+    // The render loop gets its own real-time thread; the main thread is
+    // free for plugin editors later.
+    std::thread render([&] {
+        const auto period = std::uint64_t(1e9 * maxBlock / rate);
+        rt::promoteCurrentThread(period, period / 2);
+        // Allocate before entering the guarded scope: only the plugins'
+        // own allocations should be counted against them.
+        std::vector<float*> ptr(static_cast<std::size_t>(channels));
+        rt::ScopedRealtime realtime;
+        rt::ScopedThirdParty attribute(&h.hostAllocs);
+        std::uint64_t last = h.done.load();
+        while (!gQuit.load(std::memory_order_relaxed)) {
+            const std::uint32_t bell = h.doorbell.load(std::memory_order_acquire);
+            const std::uint64_t seq = h.request.load(std::memory_order_acquire);
+            if (seq == last) {
+                // 100 ms timeout: notice an engine that went away.
+                sandbox::waitDoorbell(h, bell, 100'000'000);
+                if (getppid() == 1) gQuit.store(true);
+                continue;
+            }
+            const int slot = int(seq & 1);
+            const int frames = int(h.frames[slot]);
+            for (int c = 0; c < channels; ++c) {
+                std::memcpy(view.out(slot, c), view.in(slot, c),
+                            sizeof(float) * std::size_t(frames));
+                ptr[std::size_t(c)] = view.out(slot, c);
+            }
+            for (auto& p : plugins) p->process(ptr.data(), channels, frames);
+            h.done.store(seq, std::memory_order_release);
+            last = seq;
+        }
+        for (auto& p : plugins) p->stopProcessing();
+    });
+    render.join();
+    plugins.clear();
+    munmap(region, size);
+    return 0;
+}

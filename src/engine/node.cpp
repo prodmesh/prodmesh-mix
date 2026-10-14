@@ -97,7 +97,25 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
     }
     comp_.prepare(fs, p.compParams);
     limiter_.prepare(fs, p.limiterCeilingDb, 50);
+    // Consecutive isolated plugins share one host process, so a chain adds
+    // one block of latency, not one per plugin.
+    std::vector<plugin::PluginRef> isolated;
+    auto flushIsolated = [&] {
+        if (isolated.empty()) return;
+        std::string err;
+        if (auto proc = plugin::loadSandboxedChain(isolated, fs, maxBlock,
+                                                   channels_, &err))
+            inserts_.push_back(std::move(proc));
+        else
+            warnings_.push_back(err);  // the chain is passed through
+        isolated.clear();
+    };
     for (const auto& ins : p.inserts) {
+        if (ins.type == InsertDesc::Type::Plugin && ins.sandboxed) {
+            isolated.push_back({ins.format, ins.path, ins.pluginId});
+            continue;
+        }
+        flushIsolated();
         switch (ins.type) {
         case InsertDesc::Type::Gain:
             inserts_.push_back(std::make_unique<GainInsert>(ins.value));
@@ -116,13 +134,22 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
         }
         }
     }
+    flushIsolated();
 }
 
 std::vector<NodeInstance::PluginRt> NodeInstance::pluginRtReport() const {
     std::vector<PluginRt> out;
     for (const auto& ins : inserts_)
-        if (const auto n = ins->rtAllocations()) out.push_back({ins->name(), n});
+        if (ins->rtAllocations() || ins->missedBlocks())
+            out.push_back({ins->name(), ins->rtAllocations(), ins->missedBlocks()});
     return out;
+}
+
+std::vector<std::string> NodeInstance::maintain() {
+    std::vector<std::string> events;
+    for (auto& ins : inserts_)
+        if (auto e = ins->maintain(); !e.empty()) events.push_back(std::move(e));
+    return events;
 }
 
 void NodeInstance::stopProcessing() {

@@ -50,6 +50,8 @@ add_library(mix_engine STATIC
     src/plugin/plugin.cpp
     src/plugin/clap_host.cpp
     src/plugin/vst3_host.cpp
+    src/plugin/sandbox.cpp
+    src/plugin/sandbox_shm.cpp
     third_party/vst3sdk/pluginterfaces/base/funknown.cpp
     third_party/vst3sdk/pluginterfaces/base/coreiids.cpp
     third_party/vst3sdk/public.sdk/source/vst/vstinitiids.cpp
@@ -138,3 +140,7 @@ target_compile_definitions(mix-tests PRIVATE
 
 add_executable(mix-plugin tools/mix_plugin.cpp)
 target_link_libraries(mix-plugin PRIVATE mix_engine)
+
+add_executable(mix-pluginhost tools/mix_pluginhost.cpp)
+target_link_libraries(mix-pluginhost PRIVATE mix_engine)
+add_dependencies(mix-tests mix-pluginhost)

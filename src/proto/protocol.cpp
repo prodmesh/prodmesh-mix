@@ -67,7 +67,8 @@ QJsonObject processingToJson(const ProcessingDesc& p) {
                 {"type", "plugin"},
                 {"format", QString::fromStdString(i.format)},
                 {"path", QString::fromStdString(i.path)},
-                {"id", QString::fromStdString(i.pluginId)}});
+                {"id", QString::fromStdString(i.pluginId)},
+                {"sandboxed", i.sandboxed}});
             break;
         }
     }
@@ -151,6 +152,7 @@ void processingFromJson(const QJsonObject& o, ProcessingDesc& p) {
         d.format = i["format"].toString().toStdString();
         d.path = i["path"].toString().toStdString();
         d.pluginId = i["id"].toString().toStdString();
+        d.sandboxed = i["sandboxed"].toBool(false);
         p.inserts.push_back(std::move(d));
     }
 }

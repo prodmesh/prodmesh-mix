@@ -33,7 +33,15 @@ public:
     // Third-party plugins: display name, and how often the plugin's own
     // code allocated on the audio thread (it is not real-time safe).
     virtual std::string name() const { return {}; }
-    std::uint64_t rtAllocations() const { return rtAllocs_.load(); }
+    virtual std::uint64_t rtAllocations() const { return rtAllocs_.load(); }
+
+    // Control thread, every pump(): housekeeping such as restarting a
+    // crashed sandbox host. Returns a status line when something happened.
+    virtual std::string maintain() { return {}; }
+    // Sandboxed plugins: blocks the host did not deliver in time (each one
+    // passed through dry at the same latency).
+    virtual std::uint64_t missedBlocks() const { return 0; }
+    virtual bool sandboxed() const { return false; }
 
 protected:
     std::atomic<std::uint64_t> rtAllocs_{0};
@@ -58,9 +66,14 @@ public:
     struct PluginRt {
         std::string plugin;
         std::uint64_t allocations = 0;
+        std::uint64_t missed = 0;
     };
-    // Plugins in this chain that allocated on the audio thread.
+    // Plugins in this chain that allocated on the audio thread, or (when
+    // sandboxed) missed blocks.
     std::vector<PluginRt> pluginRtReport() const;
+
+    // Control thread: runs every insert's maintain(); returns event lines.
+    std::vector<std::string> maintain();
 
     // Inserts that failed to load and are passed through, as messages.
     const std::vector<std::string>& warnings() const { return warnings_; }

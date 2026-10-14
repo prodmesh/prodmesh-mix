@@ -38,16 +38,18 @@ struct InsertDesc {
     Type type = Type::Gain;
     float value = 0;  // Gain: dB. CpuLoad: extra multiply-adds per sample.
     std::string format, path, pluginId;  // Plugin only
+    // Plugin only: run in its own process (crash-isolated, +1 block).
+    bool sandboxed = false;
     bool operator==(const InsertDesc&) const = default;
 
-    static InsertDesc gain(float dB) { return {Type::Gain, dB, {}, {}, {}}; }
+    static InsertDesc gain(float dB) { return {Type::Gain, dB, {}, {}, {}, false}; }
     static InsertDesc cpuLoad(float ops) {
-        return {Type::CpuLoad, ops, {}, {}, {}};
+        return {Type::CpuLoad, ops, {}, {}, {}, false};
     }
     static InsertDesc plugin(std::string format, std::string path,
-                             std::string id) {
+                             std::string id, bool sandboxed = false) {
         return {Type::Plugin, 0, std::move(format), std::move(path),
-                std::move(id)};
+                std::move(id), sandboxed};
     }
 };
 

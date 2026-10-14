@@ -150,8 +150,20 @@ plugin (`rt::ScopedThirdParty`, `Engine::pluginRtIssues()`), not counted as
 an engine violation; FabFilter Pro-L 2 does it in its first blocks. `PM_PLUGIN_TRACE=1` logs host->plugin
 calls; `tools/plugin_smoke.py` runs installed real plugins as inserts
 (19/19 on the dev machine) — run it after touching an adapter.
-Not done yet: VST3 edit controller (parameters, state), plugin UIs,
-out-of-process sandbox.
+**Isolation.** `InsertDesc::sandboxed` (default for UI-added plugins)
+runs consecutive isolated plugins of a channel as one chain in a
+`mix-pluginhost` process (`src/plugin/sandbox*.cpp`, `tools/mix_pluginhost.cpp`):
+audio over shared memory + `os_sync_wait_on_address`, one block of added
+latency for the chain (reported to PDC), never a wait on the audio thread.
+A late or dead host -> the previous block's input passes through (same
+latency, no step); `Engine::pump()` restarts it with its last reported
+state, up to 3 times. The host's stdin/stdout is a line protocol
+(`editor N`, `state-save` -> `state N <base64>`); plugin editors live in
+the host's main thread (CLAP cocoa embedding). Plugin state is an opaque
+base64 blob on `InsertDesc::state`, excluded from structural equality;
+`Engine::collectPluginStates()` refreshes it before every session save.
+Not done yet: VST3 edit controller (parameters, VST3 editors), plugin
+parameter automation, sharing one host across channels.
 
 ## UX rules (spec: UX principles)
 

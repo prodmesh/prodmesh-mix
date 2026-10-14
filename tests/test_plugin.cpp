@@ -7,6 +7,7 @@
 
 #include "core/rt_guard.h"
 #include "engine/engine.h"
+#include "core/base64.h"
 #include "plugin/plugin.h"
 #include "test.h"
 
@@ -326,4 +327,65 @@ TEST(isolated_chain_shares_one_host_and_one_block) {
     std::size_t bad = 0;
     for (std::size_t n = kBlock; n < x.size(); ++n) bad += y[n] != x[n - kBlock];
     CHECK_MSG(bad == 0, std::to_string(bad) + " samples differ");
+}
+
+// --- plugin state ------------------------------------------------------------
+
+namespace {
+
+std::string gainState(float g) {
+    return pm::base64Encode(std::string(reinterpret_cast<const char*>(&g), sizeof g));
+}
+
+float stateGain(const std::string& b64) {
+    std::string raw;
+    float g = -1;
+    if (pm::base64Decode(b64, raw) && raw.size() == sizeof g) std::memcpy(&g, raw.data(), sizeof g);
+    return g;
+}
+
+GraphDesc gainWithState(bool isolated, float g, const char* id = "com.prodmesh.test.gain") {
+    auto graph = isolated ? withSandboxed(sine(), id) : withPlugin(sine(), id);
+    graph.find(2)->processing.inserts[0].state = gainState(g);
+    return graph;
+}
+
+}  // namespace
+
+TEST(plugin_state_is_applied_and_collected) {
+    for (bool isolated : {false, true}) {
+        Engine ref(cfg()), e(cfg());
+        CHECK(ref.setGraph(sine()));
+        CHECK(e.setGraph(gainWithState(isolated, 0.25f)));
+        const auto x = runPaced(ref, 60), y = runPaced(e, 60);
+        const std::size_t d = isolated ? kBlock : 0;
+        CHECK_MSG(std::fabs(peak(y, 20 * kBlock + d, 60 * kBlock) /
+                                peak(x, 20 * kBlock, 60 * kBlock - d) - 0.25f) < 0.01f,
+                  isolated ? "isolated state not applied" : "state not applied");
+        e.collectPluginStates(500);
+        CHECK(stateGain(e.graph().find(2)->processing.inserts[0].state) == 0.25f);
+    }
+}
+
+TEST(state_change_does_not_rebuild_the_plugin) {
+    auto a = gainWithState(false, 0.25f), b = gainWithState(false, 0.75f);
+    CHECK(sameStructure(a.find(2)->processing, b.find(2)->processing));
+}
+
+TEST(crashed_host_comes_back_with_its_settings) {
+    Engine e(cfg());
+    CHECK(e.setGraph(gainWithState(true, 0.5f, "com.prodmesh.test.crash")));
+    Engine ref(cfg());
+    CHECK(ref.setGraph(sine()));
+    const auto x = runPaced(ref, 98), y = runPaced(e, 98);
+    // Crash at block 50; restarted with gain 0.5 well before block 70.
+    const float ratio = peak(y, 75 * kBlock, 98 * kBlock) /
+                        peak(x, 74 * kBlock, 97 * kBlock);
+    CHECK_MSG(std::fabs(ratio - 0.5f) < 0.01f,
+              "after restart the gain ratio is " + std::to_string(ratio));
+    bool restartedWithSettings = false;
+    for (const auto& ev : e.drainEvents())
+        restartedWithSettings = restartedWithSettings ||
+                                ev.find("last saved settings") != std::string::npos;
+    CHECK(restartedWithSettings);
 }

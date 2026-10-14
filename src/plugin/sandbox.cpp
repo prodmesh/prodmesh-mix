@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "core/base64.h"
 #include "core/rt_thread.h"
 #include "plugin/plugin.h"
 #include "plugin/sandbox_shm.h"
@@ -38,13 +39,17 @@ public:
     ~SandboxProcessor() override {
         stopHost();
         if (ctlFd_ >= 0) close(ctlFd_);
+        if (outFd_ >= 0) close(outFd_);
         if (region_) munmap(region_, size_);
         if (!shmName_.empty()) shm_unlink(shmName_.c_str());
     }
 
-    bool init(const std::vector<PluginRef>& chain, double fs, int maxBlock,
+    bool init(const std::vector<PluginRef>& chain,
+              const std::vector<std::string>& states, double fs, int maxBlock,
               int channels, std::string* error) {
         chain_ = chain;
+        states_ = states;
+        states_.resize(chain.size());
         id_.clear();
         for (const auto& r : chain) id_ += (id_.empty() ? "" : " + ") + r.id;
         const std::string& id = id_;
@@ -113,8 +118,16 @@ public:
         return view_.header ? view_.header->hostAllocs.load() : 0;
     }
 
-    // Control thread: notice a dead host and bring it back.
+    // Control thread: keep the state cache fresh, notice a dead host and
+    // bring it back (with the last state it reported).
     std::string maintain() override {
+        readReplies();
+        if (pid_ > 0 && std::chrono::steady_clock::now() - lastStateAsk_ >
+                            std::chrono::seconds(2)) {
+            lastStateAsk_ = std::chrono::steady_clock::now();
+            const char cmd[] = "state-save\n";
+            (void)!::write(ctlFd_, cmd, sizeof cmd - 1);
+        }
         if (pid_ <= 0) return {};
         int status = 0;
         if (waitpid(pid_, &status, WNOHANG) != pid_) return {};
@@ -126,11 +139,36 @@ public:
         if (crashes_ > 3)
             return name_ + " " + why + " again; left bypassed";
         std::string err;
+        bool hadState = false;
+        for (const auto& st : states_) hadState = hadState || !st.empty();
         const bool back = startHost(&err);
-        return name_ + " " + why + (back ? "; restarted (fresh state)" : "; restart failed: " + err);
+        return name_ + " " + why +
+               (back ? (hadState ? "; restarted with its last saved settings"
+                                 : "; restarted")
+                     : "; restart failed: " + err);
     }
 
     std::uint64_t missedBlocks() const override { return misses_.load(); }
+
+    std::string stateFor(int index) override {
+        readReplies();
+        return index >= 0 && index < int(states_.size()) ? states_[std::size_t(index)]
+                                                          : std::string();
+    }
+
+    // Ask now and wait briefly (e.g. before saving a session).
+    void refreshState(int timeoutMs) override {
+        if (pid_ <= 0) return;
+        const char cmd[] = "state-save\n";
+        (void)!::write(ctlFd_, cmd, sizeof cmd - 1);
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds(timeoutMs);
+        std::size_t got = 0;
+        while (std::chrono::steady_clock::now() < until && got < chain_.size()) {
+            got += readReplies();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
 
     bool requestEditor(int index, std::string* error) override {
         if (pid_ <= 0 || ctlFd_ < 0) {
@@ -162,26 +200,61 @@ private:
             argv.push_back(r.path.c_str());
             argv.push_back(r.id.c_str());
         }
+        // Saved state goes in a private temp file (it can be large); the
+        // host applies it before reporting Ready.
+        std::string stateFile;
+        bool anyState = false;
+        for (const auto& st : states_) anyState = anyState || !st.empty();
+        if (anyState) {
+            char tmpl[] = "/tmp/pm-state-XXXXXX";
+            const int sfd = mkstemp(tmpl);
+            if (sfd >= 0) {
+                std::string text;
+                for (std::size_t i = 0; i < states_.size(); ++i)
+                    if (!states_[i].empty())
+                        text += std::to_string(i) + " " + base64Encode(states_[i]) + "\n";
+                (void)!::write(sfd, text.data(), text.size());
+                close(sfd);
+                stateFile = tmpl;
+                argv.push_back("--state-file");
+                argv.push_back(stateFile.c_str());
+            }
+        }
         argv.push_back(nullptr);
-        // A control pipe on the host's stdin: line commands such as
-        // "editor 1". Closing it (or our death) tells the host to quit.
-        int pipeFd[2];
-        if (pipe(pipeFd) != 0) {
+        // Control pipe on the host's stdin (line commands: "editor 1",
+        // "state-save"); replies on its stdout. Closing stdin tells the
+        // host its engine is gone.
+        int in[2], out[2];
+        if (pipe(in) != 0 || pipe(out) != 0) {
             if (error) *error = "cannot create control pipe";
             return false;
         }
         posix_spawn_file_actions_t fa;
         posix_spawn_file_actions_init(&fa);
-        posix_spawn_file_actions_adddup2(&fa, pipeFd[0], 0);
-        posix_spawn_file_actions_addclose(&fa, pipeFd[1]);
+        posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+        posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+        posix_spawn_file_actions_addclose(&fa, in[1]);
+        posix_spawn_file_actions_addclose(&fa, out[0]);
         const int rc = posix_spawn(&pid_, exe.c_str(), &fa, nullptr,
                                    const_cast<char* const*>(argv.data()), environ);
         posix_spawn_file_actions_destroy(&fa);
-        close(pipeFd[0]);
+        close(in[0]);
+        close(out[1]);
         if (ctlFd_ >= 0) close(ctlFd_);
-        ctlFd_ = pipeFd[1];
-        fcntl(ctlFd_, F_SETFL, O_NONBLOCK);
-        fcntl(ctlFd_, F_SETFD, FD_CLOEXEC);
+        if (outFd_ >= 0) close(outFd_);
+        ctlFd_ = in[1];
+        outFd_ = out[0];
+        for (int fd : {ctlFd_, outFd_}) {
+            fcntl(fd, F_SETFL, O_NONBLOCK);
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+        replyBuf_.clear();
+        struct Cleanup {
+            std::string path;
+            ~Cleanup() {
+                if (!path.empty()) unlink(path.c_str());
+            }
+        } cleanup{stateFile};
         if (rc != 0) {
             pid_ = -1;
             if (error) *error = exe + ": cannot start plugin host";
@@ -204,6 +277,30 @@ private:
         if (error) *error = id_ + ": plugin host timed out loading it";
         stopHost();
         return false;
+    }
+
+    // "state N <base64>" lines from the host. Returns how many arrived.
+    std::size_t readReplies() {
+        if (outFd_ < 0) return 0;
+        char buf[65536];
+        ssize_t n;
+        while ((n = read(outFd_, buf, sizeof buf)) > 0) replyBuf_.append(buf, std::size_t(n));
+        std::size_t got = 0, nl;
+        while ((nl = replyBuf_.find('\n')) != std::string::npos) {
+            const std::string line = replyBuf_.substr(0, nl);
+            replyBuf_.erase(0, nl + 1);
+            if (line.rfind("state ", 0) != 0) continue;
+            const auto sp = line.find(' ', 6);
+            if (sp == std::string::npos) continue;
+            const int i = std::atoi(line.c_str() + 6);
+            std::string raw;
+            if (i >= 0 && i < int(states_.size()) &&
+                base64Decode(line.substr(sp + 1), raw)) {
+                states_[std::size_t(i)] = std::move(raw);
+                ++got;
+            }
+        }
+        return got;
     }
 
     void stopHost() {
@@ -230,7 +327,10 @@ private:
     std::size_t size_ = 0;
     sandbox::View view_;
     pid_t pid_ = -1;
-    int ctlFd_ = -1;
+    int ctlFd_ = -1, outFd_ = -1;
+    std::string replyBuf_;
+    std::vector<std::string> states_;  // raw, per chain position
+    std::chrono::steady_clock::time_point lastStateAsk_{};
     std::uint64_t seq_ = 0;  // audio thread
     std::atomic<std::uint64_t> misses_{0};
 };
@@ -238,10 +338,11 @@ private:
 }  // namespace
 
 std::unique_ptr<Processor> loadSandboxedChain(const std::vector<PluginRef>& chain,
+                                              const std::vector<std::string>& states,
                                               double fs, int maxBlock,
                                               int channels, std::string* error) {
     auto p = std::make_unique<SandboxProcessor>();
-    if (!p->init(chain, fs, maxBlock, channels, error)) return nullptr;
+    if (!p->init(chain, states, fs, maxBlock, channels, error)) return nullptr;
     return p;
 }
 

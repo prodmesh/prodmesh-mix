@@ -127,6 +127,13 @@ public:
     // plugins only: the engine itself has no screen).
     bool openEditor(NodeId id, int insertIndex, std::string* error);
 
+    // Copies every live plugin's latest state into graph() (and the
+    // published copy) without rebuilding anything — call before saving a
+    // session. Isolated plugins report at most a few seconds late.
+    // `waitMs` > 0 first asks isolated hosts for fresh state (blocking the
+    // control thread up to that long per host).
+    void collectPluginStates(int waitMs = 0);
+
     // Plugin host events since the last call (crashes, restarts).
     std::vector<std::string> drainEvents() { return std::exchange(events_, {}); }
 

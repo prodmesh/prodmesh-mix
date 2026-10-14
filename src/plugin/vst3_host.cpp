@@ -5,6 +5,7 @@
 // Plugins dereference things hosts are allowed to leave null; we always
 // pass an (empty) parameter-change list, event list and a transport
 // context, and a buffer for every bus the plugin declares.
+#include <pluginterfaces/base/ibstream.h>
 #include <pluginterfaces/base/ipluginbase.h>
 #include <pluginterfaces/vst/ivstaudioprocessor.h>
 #include <pluginterfaces/vst/ivstcomponent.h>
@@ -184,6 +185,50 @@ public:
 };
 
 HostApp gHost;
+
+// Growable in-memory IBStream for component state.
+class MemStream final : public IBStream {
+public:
+    std::string data;
+    std::size_t pos = 0;
+    tresult PLUGIN_API read(void* buf, int32 n, int32* got) override {
+        const auto k = std::min<std::size_t>(std::size_t(std::max(n, 0)), data.size() - pos);
+        std::memcpy(buf, data.data() + pos, k);
+        pos += k;
+        if (got) *got = int32(k);
+        return kResultOk;
+    }
+    tresult PLUGIN_API write(void* buf, int32 n, int32* wrote) override {
+        if (n < 0) return kInvalidArgument;
+        if (pos + std::size_t(n) > data.size()) data.resize(pos + std::size_t(n));
+        std::memcpy(&data[pos], buf, std::size_t(n));
+        pos += std::size_t(n);
+        if (wrote) *wrote = n;
+        return kResultOk;
+    }
+    tresult PLUGIN_API seek(int64 off, int32 mode, int64* result) override {
+        int64 base = mode == kIBSeekSet ? 0 : mode == kIBSeekCur ? int64(pos) : int64(data.size());
+        const int64 np = base + off;
+        if (np < 0) return kInvalidArgument;
+        pos = std::size_t(np);
+        if (result) *result = np;
+        return kResultOk;
+    }
+    tresult PLUGIN_API tell(int64* p) override {
+        if (p) *p = int64(pos);
+        return kResultOk;
+    }
+    tresult PLUGIN_API queryInterface(const TUID iid, void** obj) override {
+        if (FUnknownPrivate::iidEqual(iid, IBStream::iid) ||
+            FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+            *obj = this;
+            return kResultOk;
+        }
+        *obj = nullptr;
+        return kNoInterface;
+    }
+    PM_NO_REFCOUNT
+};
 
 // --- module registry (control thread only) ------------------------------
 
@@ -416,6 +461,19 @@ public:
         for (int c = 0; c < nch; ++c)
             std::memcpy(ch[c], out[std::size_t(std::min(c, int(out.size()) - 1))],
                         sizeof(float) * std::size_t(n));
+    }
+
+    bool saveState(std::string& out) override {
+        MemStream ms;
+        if (component_->getState(&ms) != kResultOk) return false;
+        out = std::move(ms.data);
+        return true;
+    }
+
+    bool loadState(const std::string& in) override {
+        MemStream ms;
+        ms.data = in;
+        return component_->setState(&ms) == kResultOk;
     }
 
     void stopProcessing() override {

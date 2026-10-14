@@ -40,16 +40,25 @@ struct InsertDesc {
     std::string format, path, pluginId;  // Plugin only
     // Plugin only: run in its own process (crash-isolated, +1 block).
     bool sandboxed = false;
-    bool operator==(const InsertDesc&) const = default;
+    // Plugin only: the plugin's saved state, base64. Applied when the
+    // instance is created; not part of the structure (a newer state never
+    // rebuilds a running plugin).
+    std::string state;
 
-    static InsertDesc gain(float dB) { return {Type::Gain, dB, {}, {}, {}, false}; }
+    bool operator==(const InsertDesc& o) const {
+        return type == o.type && value == o.value && format == o.format &&
+               path == o.path && pluginId == o.pluginId &&
+               sandboxed == o.sandboxed;
+    }
+
+    static InsertDesc gain(float dB) { return {Type::Gain, dB, {}, {}, {}, false, {}}; }
     static InsertDesc cpuLoad(float ops) {
-        return {Type::CpuLoad, ops, {}, {}, {}, false};
+        return {Type::CpuLoad, ops, {}, {}, {}, false, {}};
     }
     static InsertDesc plugin(std::string format, std::string path,
                              std::string id, bool sandboxed = false) {
         return {Type::Plugin, 0, std::move(format), std::move(path),
-                std::move(id), sandboxed};
+                std::move(id), sandboxed, {}};
     }
 };
 

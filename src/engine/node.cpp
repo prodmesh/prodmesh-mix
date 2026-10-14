@@ -1,5 +1,6 @@
 #include "engine/node.h"
 
+#include "core/base64.h"
 #include "plugin/plugin.h"
 
 #include <algorithm>
@@ -100,13 +101,19 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
     // Consecutive isolated plugins share one host process, so a chain adds
     // one block of latency, not one per plugin.
     std::vector<plugin::PluginRef> isolated;
-    std::vector<std::size_t> isolatedSlots;  // their InsertDesc indices
+    std::vector<std::string> isolatedStates;  // raw, per chain position
+    std::vector<std::size_t> isolatedSlots;   // their InsertDesc indices
+    auto rawState = [](const InsertDesc& ins) {
+        std::string raw;
+        if (!ins.state.empty()) base64Decode(ins.state, raw);
+        return raw;
+    };
     insertMap_.assign(p.inserts.size(), {-1, 0});
     auto flushIsolated = [&] {
         if (isolated.empty()) return;
         std::string err;
-        if (auto proc = plugin::loadSandboxedChain(isolated, fs, maxBlock,
-                                                   channels_, &err)) {
+        if (auto proc = plugin::loadSandboxedChain(isolated, isolatedStates, fs,
+                                                   maxBlock, channels_, &err)) {
             for (std::size_t k = 0; k < isolatedSlots.size(); ++k)
                 insertMap_[isolatedSlots[k]] = {int(inserts_.size()), int(k)};
             inserts_.push_back(std::move(proc));
@@ -114,12 +121,14 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
             warnings_.push_back(err);  // the chain is passed through
         }
         isolated.clear();
+        isolatedStates.clear();
         isolatedSlots.clear();
     };
     for (std::size_t slot = 0; slot < p.inserts.size(); ++slot) {
         const auto& ins = p.inserts[slot];
         if (ins.type == InsertDesc::Type::Plugin && ins.sandboxed) {
             isolated.push_back({ins.format, ins.path, ins.pluginId});
+            isolatedStates.push_back(rawState(ins));
             isolatedSlots.push_back(slot);
             continue;
         }
@@ -136,6 +145,8 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
             std::string err;
             if (auto proc = plugin::load(ins.format, ins.path, ins.pluginId,
                                          fs, maxBlock, channels_, &err)) {
+                if (const auto raw = rawState(ins); !raw.empty())
+                    proc->loadState(raw);
                 inserts_.push_back(std::move(proc));
             } else {
                 insertMap_[slot] = {-1, 0};
@@ -164,6 +175,14 @@ bool NodeInstance::requestEditor(int insertIndex, std::string* error) {
     }
     const auto [proc, pos] = insertMap_[std::size_t(insertIndex)];
     return inserts_[std::size_t(proc)]->requestEditor(pos, error);
+}
+
+std::string NodeInstance::insertState(int insertIndex) {
+    if (insertIndex < 0 || insertIndex >= int(insertMap_.size()) ||
+        insertMap_[std::size_t(insertIndex)].first < 0)
+        return {};
+    const auto [proc, pos] = insertMap_[std::size_t(insertIndex)];
+    return inserts_[std::size_t(proc)]->stateFor(pos);
 }
 
 std::vector<std::string> NodeInstance::maintain() {

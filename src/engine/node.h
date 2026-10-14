@@ -51,6 +51,21 @@ public:
     }
     virtual void destroyEditor() {}
 
+    // Plugin state as raw bytes, in the process that hosts the plugin (its
+    // main/control thread).
+    virtual bool saveState(std::string& /*out*/) { return false; }
+    virtual bool loadState(const std::string& /*in*/) { return false; }
+    // Engine side, control thread: the latest known state of plugin
+    // `index` of this insert. Isolated chains answer from what their host
+    // last reported (refreshed every few seconds); in-engine plugins save
+    // on the spot.
+    // Isolated: ask the host for fresh state and wait up to `ms`.
+    virtual void refreshState(int /*ms*/) {}
+    virtual std::string stateFor(int /*index*/) {
+        std::string s;
+        return saveState(s) ? s : std::string();
+    }
+
     // Engine side, control thread: open the editor of plugin `index` of
     // this insert (a chain when isolated) in the process that hosts it.
     virtual bool requestEditor(int /*index*/, std::string* error) {
@@ -92,6 +107,11 @@ public:
     // Control thread: open the editor of the plugin at `insertIndex` (an
     // index into ProcessingDesc::inserts).
     bool requestEditor(int insertIndex, std::string* error);
+    void refreshStates(int ms) {
+        for (auto& ins : inserts_) ins->refreshState(ms);
+    }
+    // Control thread: latest state of that plugin, raw bytes ("" if none).
+    std::string insertState(int insertIndex);
 
     // Control thread: runs every insert's maintain(); returns event lines.
     std::vector<std::string> maintain();

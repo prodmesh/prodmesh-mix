@@ -4,6 +4,7 @@
 #include <cstring>
 #include <set>
 
+#include "core/base64.h"
 #include "engine/node.h"
 #include "engine/plan.h"
 #include "engine/worker_pool.h"
@@ -174,6 +175,27 @@ Engine::DelayInfo Engine::delayInfo(NodeId id) const {
     if (auto it = live_.comp.find(id); it != live_.comp.end())
         d.compensation = it->second;
     return d;
+}
+
+void Engine::collectPluginStates(int waitMs) {
+    if (waitMs > 0)
+        for (const auto& [id, inst] : live_.nodes) inst->refreshStates(waitMs);
+    for (const auto& [id, inst] : live_.nodes) {
+        const NodeDesc* d = published_.find(id);
+        if (!d) continue;
+        for (int i = 0; i < int(d->processing.inserts.size()); ++i) {
+            if (d->processing.inserts[std::size_t(i)].type != InsertDesc::Type::Plugin)
+                continue;
+            const auto raw = inst->insertState(i);
+            if (raw.empty()) continue;
+            const auto b64 = base64Encode(raw);
+            for (auto* g : {&desired_, &published_})
+                if (auto* n = g->find(id); n && i < int(n->processing.inserts.size()) &&
+                                           n->processing.inserts[std::size_t(i)] ==
+                                               d->processing.inserts[std::size_t(i)])
+                    n->processing.inserts[std::size_t(i)].state = b64;
+        }
+    }
 }
 
 bool Engine::openEditor(NodeId id, int insertIndex, std::string* error) {

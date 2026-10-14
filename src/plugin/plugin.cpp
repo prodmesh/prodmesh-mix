@@ -34,8 +34,8 @@ std::unique_ptr<Processor> load(const std::string& format,
                                 int maxBlock, int channels,
                                 std::string* error, bool sandboxed) {
     if (sandboxed)
-        return loadSandboxedChain({{format, path, id}}, sampleRate, maxBlock,
-                                  channels, error);
+        return loadSandboxedChain({{format, path, id}}, {""}, sampleRate,
+                                  maxBlock, channels, error);
     if (format == "clap")
         return loadClap(path, id, sampleRate, maxBlock, channels, error);
     if (format == "vst3")

@@ -36,7 +36,9 @@ struct PluginRef {
 // Runs consecutive plugins as one chain in a single mix-pluginhost process:
 // one block of extra latency for the whole chain, not per plugin. Any load
 // failure fails the chain (the engine passes it through).
+// `states`: raw saved state per plugin ("" for defaults).
 std::unique_ptr<Processor> loadSandboxedChain(const std::vector<PluginRef>& chain,
+                                              const std::vector<std::string>& states,
                                               double sampleRate, int maxBlock,
                                               int channels, std::string* error);
 

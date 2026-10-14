@@ -24,6 +24,7 @@ struct Plugin {
     const clap_host_t* host = nullptr;
     bool delay = false, alloc = false, crash = false;
     int calls = 0;
+    float gain = 0.5f;  // the plugin's state (clap.state: 4 bytes)
     bool active = false, processing = false;
     std::vector<float> line[2];
     std::size_t pos = 0;
@@ -91,7 +92,7 @@ clap_process_status process(const clap_plugin_t* p, const clap_process_t* pr) {
                 out[i] = s->line[c][(s->pos + i) % kDelay];
                 s->line[c][(s->pos + i) % kDelay] = x;
             } else {
-                out[i] = (s->alloc || s->crash) ? in[i] : in[i] * 0.5f;
+                out[i] = in[i] * s->gain;
             }
         }
     }
@@ -117,9 +118,21 @@ const clap_plugin_audio_ports_t kPorts{portCount, portGet};
 uint32_t latencyGet(const clap_plugin_t* p) { return self(p)->delay ? kDelay : 0; }
 const clap_plugin_latency_t kLatency{latencyGet};
 
+bool stateSave(const clap_plugin_t* p, const clap_ostream_t* os) {
+    return os->write(os, &self(p)->gain, sizeof(float)) == sizeof(float);
+}
+bool stateLoad(const clap_plugin_t* p, const clap_istream_t* is) {
+    float g = 0;
+    if (is->read(is, &g, sizeof g) != sizeof g) return false;
+    self(p)->gain = g;
+    return true;
+}
+const clap_plugin_state_t kState{stateSave, stateLoad};
+
 const void* getExtension(const clap_plugin_t*, const char* id) {
     if (!std::strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &kPorts;
     if (!std::strcmp(id, CLAP_EXT_LATENCY)) return &kLatency;
+    if (!std::strcmp(id, CLAP_EXT_STATE)) return &kState;
     return nullptr;
 }
 void onMainThread(const clap_plugin_t*) {}
@@ -152,6 +165,7 @@ const clap_plugin_t* create(const clap_plugin_factory_t*, const clap_host_t* hos
     s->delay = which == 1;
     s->alloc = which == 2;
     s->crash = which == 3;
+    s->gain = (s->alloc || s->crash) ? 1.0f : 0.5f;
     s->clap = {&kDescs[which], s,       init,           destroy,
                activate,       deactivate, startProcessing, stopProcessing,
                reset,          process, getExtension,  onMainThread};

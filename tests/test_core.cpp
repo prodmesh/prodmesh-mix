@@ -122,3 +122,17 @@ TEST(fast_log_exp_accuracy) {
         CHECK(std::fabs(dsp::fastDbToGain(dB) / exact - 1.0f) < 1e-4f);
     }
 }
+
+#include "core/base64.h"
+
+TEST(base64_round_trips_binary) {
+    for (int len = 0; len < 40; ++len) {
+        std::string x;
+        for (int i = 0; i < len; ++i) x += char((i * 37 + len) & 0xff);
+        std::string y;
+        CHECK(pm::base64Decode(pm::base64Encode(x), y));
+        CHECK(y == x);
+    }
+    CHECK(pm::base64Encode("Man") == "TWFu");
+    CHECK(pm::base64Encode("Ma") == "TWE=");
+}

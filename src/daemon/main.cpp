@@ -348,6 +348,8 @@ private:
     // crash mid-save leaves the previous session intact.
     void saveSession() {
         if (sessionPath_.isEmpty()) return;
+        // Plugins' own settings (what was dialled into their windows).
+        engine_->collectPluginStates(200);
         QDir().mkpath(QFileInfo(sessionPath_).absolutePath());
         QSaveFile f(sessionPath_);
         if (!f.open(QIODevice::WriteOnly)) return;

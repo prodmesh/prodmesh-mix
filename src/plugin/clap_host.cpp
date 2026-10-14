@@ -247,6 +247,41 @@ public:
 #endif
     }
 
+    // --- state (main thread) ---------------------------------------------
+    bool saveState(std::string& out) override {
+        auto* st = static_cast<const clap_plugin_state_t*>(
+            plugin_->get_extension(plugin_, CLAP_EXT_STATE));
+        if (!st) return false;
+        out.clear();
+        clap_ostream_t os{&out, [](const clap_ostream_t* s, const void* buf,
+                                   uint64_t size) -> int64_t {
+                              static_cast<std::string*>(s->ctx)->append(
+                                  static_cast<const char*>(buf), std::size_t(size));
+                              return int64_t(size);
+                          }};
+        return st->save(plugin_, &os);
+    }
+
+    bool loadState(const std::string& in) override {
+        auto* st = static_cast<const clap_plugin_state_t*>(
+            plugin_->get_extension(plugin_, CLAP_EXT_STATE));
+        if (!st) return false;
+        struct Reader {
+            const std::string* data;
+            std::size_t pos;
+        } r{&in, 0};
+        clap_istream_t is{&r, [](const clap_istream_t* s, void* buf,
+                                 uint64_t size) -> int64_t {
+                              auto* rd = static_cast<Reader*>(s->ctx);
+                              const auto n = std::min<std::size_t>(
+                                  std::size_t(size), rd->data->size() - rd->pos);
+                              std::memcpy(buf, rd->data->data() + rd->pos, n);
+                              rd->pos += n;
+                              return int64_t(n);
+                          }};
+        return st->load(plugin_, &is);
+    }
+
     void destroyEditor() override {
         if (!editorOpen_) return;
         gui_->hide(plugin_);

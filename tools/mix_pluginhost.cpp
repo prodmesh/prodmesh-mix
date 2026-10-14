@@ -4,6 +4,7 @@
 //
 //   mix-pluginhost --shm NAME --channels N --max-block N --rate HZ
 //                  --plugin FORMAT BUNDLE ID [--plugin ...]
+//                  [--state-file F]   lines "N base64": state per plugin
 // Several --plugin run as one chain, in order.
 #include <atomic>
 #include <csignal>
@@ -25,6 +26,7 @@
 #include <QWidget>
 #endif
 
+#include "core/base64.h"
 #include "core/rt_guard.h"
 #include "core/rt_thread.h"
 #include "plugin/plugin.h"
@@ -74,7 +76,7 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string shm;
+    std::string shm, stateFile;
     std::vector<plugin::PluginRef> chain;
     int channels = 1, maxBlock = 128;
     double rate = 48000;
@@ -91,6 +93,7 @@ int main(int argc, char** argv) {
         else if (k == "--channels") channels = std::stoi(v);
         else if (k == "--max-block") maxBlock = std::stoi(v);
         else if (k == "--rate") rate = std::stod(v);
+        else if (k == "--state-file") stateFile = v;
     }
     std::signal(SIGTERM, onTerm);
     std::signal(SIGINT, onTerm);
@@ -132,6 +135,24 @@ int main(int argc, char** argv) {
         latency += p->latencySamples();
         plugins.push_back(std::move(p));
     }
+    if (!stateFile.empty())
+        if (FILE* f = std::fopen(stateFile.c_str(), "r")) {
+            std::string line;
+            char buf[65536];
+            while (std::fgets(buf, sizeof buf, f)) {
+                line += buf;
+                if (line.empty() || line.back() != '\n') continue;
+                line.pop_back();
+                const auto sp = line.find(' ');
+                const int i = std::atoi(line.c_str());
+                std::string raw;
+                if (sp != std::string::npos && i >= 0 && i < int(plugins.size()) &&
+                    base64Decode(line.substr(sp + 1), raw))
+                    plugins[std::size_t(i)]->loadState(raw);
+                line.clear();
+            }
+            std::fclose(f);
+        }
     std::strncpy(h.name, names.c_str(), sizeof h.name - 1);
     h.latency.store(latency);
     h.state.store(std::uint32_t(sandbox::HostState::Ready), std::memory_order_release);
@@ -188,6 +209,16 @@ int main(int argc, char** argv) {
         while ((nl = pending.find('\n')) != std::string::npos) {
             const std::string line = pending.substr(0, nl);
             pending.erase(0, nl + 1);
+            if (line == "state-save") {
+                // Main thread, as CLAP requires; one line per plugin.
+                for (std::size_t i = 0; i < plugins.size(); ++i) {
+                    std::string raw;
+                    if (plugins[i]->saveState(raw))
+                        std::printf("state %zu %s\n", i, base64Encode(raw).c_str());
+                }
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("editor ", 0) == 0) {
                 const int i = std::atoi(line.c_str() + 7);
                 if (i < 0 || i >= int(plugins.size())) continue;

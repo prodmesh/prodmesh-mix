@@ -121,8 +121,12 @@ a stereo pair of them, a bus, or a test source), input gain, processing
 and inserts, a fader, a *main output* (buses and/or outputs) and *sends*
 (to buses or outputs, each with a level and on/off). All of it is edges:
 gain on the input edge is the channel's input gain; `EdgeDesc::send`
-separates sends from the main output (presentation only), and
-`EdgeDesc::mute` silences an edge but keeps its level. Device inputs are
+separates sends from the main output (presentation only),
+`EdgeDesc::mute` silences an edge but keeps its level, and
+`EdgeDesc::preFader` taps the source after processing and mute but before
+its fader (the step gets a second buffer; an edge instance is fixed pre or
+post like its delay, so switching crossfades). Pan on a stereo->stereo
+edge is a balance. Device inputs are
 fixed: `shows::normalize()` gives every device channel a mono Input node,
 so every input is always recorded whether a channel uses it or not, and a
 stereo channel takes two of them panned hard L/R. Output nodes exist while
@@ -136,11 +140,21 @@ the excluded ones — new channels join by themselves. Those edges are
 one. Buses never feed a mix-minus automatically (a group may contain the
 voice it must leave out).
 
-UI: input button at the top of each channel; send slots like insert slots
-(dot = on/off, "−" = left out of a mix-minus; drag = level; double-click
-= 0 dB or back to automatic; right-click = menu; last row = + Send); the
-"→ destination" button; "+ Channel" and "+ Bus" tiles; right-click a strip
-to rename, delete, or make a mix-minus for it. `mixd --driver sim
+UI: input button at the top of each channel; insert slots (click = menu,
+drag = reorder); send slots (dot = on/off, "−" = left out of a mix-minus;
+click = menu with pre/post, reset, remove; drag = level; last row = + Send;
+"PRE" tag on pre-fader sends); pan above the fader; the "→ destination"
+button; "+ Channel" and "+ Bus" tiles; click a strip's name (or
+right-click it) to rename, delete, or make a mix-minus for it. Menus
+toggle from the state they showed, not QAction's checked flag
+(accessibility presses do not always flip it).
+
+Plugin settings survive chain edits: a changed chain is a new instance,
+so `Engine::setGraph` first copies each running plugin's current state
+onto the matching insert of the new chain (`carryPluginStates`: same
+plugin, in order, isolated or not). Without it, adding, removing or
+reordering an insert reverted the channel's other plugins to their last
+saved settings. `mixd --driver sim
 --sim-inputs 8` gives silent device inputs to try it without hardware.
 
 ## Recording

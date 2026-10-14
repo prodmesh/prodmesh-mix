@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <numbers>
 
 namespace pm {
@@ -268,24 +269,40 @@ void NodeInstance::process(float* const* ch, int n) {
 }
 
 LevelState::LevelState(float faderDb, bool mute)
-    : gain_(levelGain(faderDb, mute)) {}
+    : fader_(levelGain(faderDb, false)), on_(mute ? 0.0f : 1.0f) {}
 
 void LevelState::set(float faderDb, bool mute, int rampSamples,
                      std::uint64_t seq) {
     if (seq <= seq_) return;
     seq_ = seq;
-    gain_.setTarget(levelGain(faderDb, mute), rampSamples);
+    fader_.setTarget(levelGain(faderDb, false), rampSamples);
+    on_.setTarget(mute ? 0.0f : 1.0f, rampSamples);
 }
 
-void LevelState::apply(float* const* ch, int nch, int n) {
-    if (nch == 1) {
-        gain_.apply(ch[0], n);
+void LevelState::apply(float* const* ch, int nch, int n, float* const* pre) {
+    if (!fader_.ramping() && !on_.ramping()) {  // steady: plain multiplies
+        const float m = on_.current();
+        const float g = fader_.current() * m;
+        for (int c = 0; c < nch; ++c) {
+            float* x = ch[c];
+            if (pre) {
+                if (m == 1.0f) std::memcpy(pre[c], x, sizeof(float) * std::size_t(n));
+                else
+                    for (int i = 0; i < n; ++i) pre[c][i] = x[i] * m;
+            }
+            if (g != 1.0f)
+                for (int i = 0; i < n; ++i) x[i] *= g;
+        }
         return;
     }
-    // The ramp must advance identically on every channel.
+    // The ramps must advance identically on every channel.
     for (int i = 0; i < n; ++i) {
-        const float g = gain_.next();
-        for (int c = 0; c < nch; ++c) ch[c][i] *= g;
+        const float m = on_.next();
+        const float g = fader_.next() * m;
+        for (int c = 0; c < nch; ++c) {
+            if (pre) pre[c][i] = ch[c][i] * m;
+            ch[c][i] *= g;
+        }
     }
 }
 
@@ -320,9 +337,9 @@ MeterState::Reading MeterState::take() {
 }
 
 EdgeInstance::EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh,
-                           int delaySamples, int maxBlock)
+                           int delaySamples, int maxBlock, bool preFader)
     : from_(from), to_(to), srcCh_(srcCh), dstCh_(dstCh),
-      delay_(std::max(0, delaySamples)) {
+      delay_(std::max(0, delaySamples)), pre_(preFader) {
     if (delay_ > 0)
         for (int c = 0; c < srcCh_; ++c) {
             line_[c].assign(std::size_t(delay_), 0.0f);
@@ -344,6 +361,11 @@ void EdgeInstance::targetsFor(const EdgeDesc* e, int srcCh, int dstCh,
         out[1][0] = g * float(std::sin(theta));
     } else if (srcCh == 2 && dstCh == 1) {
         out[0][0] = out[0][1] = g * 0.5f;
+    } else if (srcCh == 2 && dstCh == 2) {
+        // Balance: the far side dips, the near side stays at unity.
+        const float p = std::clamp(e->pan, -1.0f, 1.0f);
+        out[0][0] = g * (p > 0 ? 1 - p : 1.0f);
+        out[1][1] = g * (p < 0 ? 1 + p : 1.0f);
     } else {
         for (int c = 0; c < srcCh; ++c) out[c][c] = g;
     }

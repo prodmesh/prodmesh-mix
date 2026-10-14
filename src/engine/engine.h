@@ -149,6 +149,10 @@ public:
                  int numOut, int frames) PM_NONBLOCKING;
 
 private:
+    // A changed chain gets a new instance: give its plugins the settings
+    // the running ones have now, not the last saved ones.
+    void carryPluginStates(GraphDesc& g);
+
     struct LevelCmd {
         NodeId id = 0;
         float faderDb = 0;

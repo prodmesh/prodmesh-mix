@@ -151,3 +151,40 @@ TEST(muted_send_is_silent_and_keeps_its_level) {
               "send level " + std::to_string(dsp::gainToDb(p)));
     CHECK(rt::violations() == 0);
 }
+
+// A pre-fader send ignores the fader but not the mute, and switching a
+// send between pre and post fades instead of stepping.
+TEST(pre_fader_send) {
+    Offline r;
+    GraphDesc g = show();
+    g.find(31)->mixMinus = {};
+    g.find(21)->mute = true;  // only the host (strip 20) is live
+    g.edges.push_back({20, 31, 0, 0, false, true, false, true});
+    g.find(20)->faderDb = -30;
+    CHECK(r.engine.setGraph(g));
+    r.run(40);
+    const float pre = dsp::gainToDb(peak(r.out[1], 20 * kBlock));
+    const float post = dsp::gainToDb(peak(r.out[0], 20 * kBlock));
+    CHECK_MSG(std::fabs(pre - (-12)) < 0.5f, "pre " + std::to_string(pre));
+    CHECK_MSG(std::fabs(post - (-12 - 30)) < 0.5f, "post " + std::to_string(post));
+
+    // Pre -> post: the send drops by the fader, through a fade.
+    const std::size_t from = r.out[1].size();
+    g.edges.back().preFader = false;
+    CHECK(r.engine.setGraph(g));
+    r.run(40);
+    CHECK(dsp::gainToDb(peak(r.out[1], from + 30 * kBlock)) < post + 0.5f);
+    float step = 0;
+    for (std::size_t i = from + 1; i < r.out[1].size(); ++i)
+        step = std::max(step, std::fabs(r.out[1][i] - r.out[1][i - 1]));
+    // A 200 Hz sine at -12 dBFS moves at most ~0.005 per sample.
+    CHECK_MSG(step < 0.01f, "step " + std::to_string(step));
+
+    // Mute kills a pre-fader send too.
+    g.edges.back().preFader = true;
+    g.find(20)->mute = true;
+    CHECK(r.engine.setGraph(g));
+    r.run(60);
+    CHECK(peak(r.out[1], r.out[1].size() - 20 * kBlock) == 0.0f);
+    CHECK(rt::violations() == 0);
+}

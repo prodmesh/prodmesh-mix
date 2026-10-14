@@ -65,6 +65,7 @@ Engine::~Engine() {
 bool Engine::setGraph(const GraphDesc& in, std::string* error) {
     GraphDesc g = in;
     resolveMixMinus(g);
+    carryPluginStates(g);
     // Validate by compiling against nothing; the result is discarded.
     // A dry run (no Live): structure only, no instances, no plugin loads.
     if (!compile(g, nullptr, nullptr, error, nullptr)) return false;
@@ -177,6 +178,38 @@ Engine::DelayInfo Engine::delayInfo(NodeId id) const {
     if (auto it = live_.comp.find(id); it != live_.comp.end())
         d.compensation = it->second;
     return d;
+}
+
+void Engine::carryPluginStates(GraphDesc& g) {
+    auto same = [](const InsertDesc& a, const InsertDesc& b) {
+        return a.type == InsertDesc::Type::Plugin && b.type == a.type &&
+               a.format == b.format && a.path == b.path &&
+               a.pluginId == b.pluginId;  // isolated or not: same state
+    };
+    for (auto& n : g.nodes) {
+        const NodeDesc* old = published_.find(n.id);
+        auto it = live_.nodes.find(n.id);
+        if (!old || it == live_.nodes.end() ||
+            sameStructure(old->processing, n.processing))
+            continue;
+        const auto& was = old->processing.inserts;
+        bool plugins = false;
+        for (const auto& i : was) plugins |= i.type == InsertDesc::Type::Plugin;
+        if (!plugins) continue;
+        // Isolated hosts report on request; in-engine plugins answer now.
+        it->second->refreshStates(150);
+        // Match each plugin to the first unused one of the same kind:
+        // a reorder or an added neighbour keeps every plugin's settings.
+        std::vector<bool> used(was.size(), false);
+        for (auto& ins : n.processing.inserts)
+            for (std::size_t j = 0; j < was.size(); ++j)
+                if (!used[j] && same(ins, was[j])) {
+                    used[j] = true;
+                    const auto raw = it->second->insertState(int(j));
+                    if (!raw.empty()) ins.state = base64Encode(raw);
+                    break;
+                }
+    }
 }
 
 void Engine::collectPluginStates(int waitMs) {
@@ -476,10 +509,11 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
                 if (it != live_.edges.end() &&
                     it->second->srcChannels() == src.nch &&
                     it->second->dstChannels() == s.nch) {
-                    if (oldSide || it->second->delay() == std::max(0, delay))
+                    if (oldSide || (it->second->delay() == std::max(0, delay) &&
+                                    it->second->preFader() == e.desc->preFader))
                         inst = it->second;
                     else
-                        retiring = it->second;  // compensation changed
+                        retiring = it->second;  // compensation or tap changed
                 }
             }
             if (!inst && oldSide) continue;  // nothing to fade
@@ -494,7 +528,7 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
             if (!inst)
                 inst = std::make_shared<EdgeInstance>(
                     e.fromId, e.toId, src.nch, s.nch, std::max(0, delay),
-                    cfg_.maxBlock);
+                    cfg_.maxBlock, e.desc->preFader);
             EdgeTarget t{inst.get(), {}};
             EdgeInstance::targetsFor(e.desc, src.nch, s.nch, t.m);
             plan->edgeTargets.push_back(t);
@@ -508,13 +542,22 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
         s.numContrib = int(plan->contribs.size()) - s.firstContrib;
     }
 
-    // 6. Buffers: one per channel, plus scratch for each crossfade.
+    // 6. Buffers: one per channel, plus scratch for each crossfade, plus
+    //    a pre-fader copy for sources of pre-fader edges.
+    std::vector<bool> needsPre(plan->steps.size(), false);
+    for (const auto& c : plan->contribs)
+        if (c.edge->preFader()) needsPre[std::size_t(c.srcStep)] = true;
     int nbuf = 0;
-    for (auto& s : plan->steps) {
+    for (std::size_t i = 0; i < plan->steps.size(); ++i) {
+        auto& s = plan->steps[i];
         s.buf = nbuf;
         nbuf += s.nch;
         if (s.fadeOut) {
             s.fadeBuf = nbuf;
+            nbuf += s.nch;
+        }
+        if (needsPre[i]) {
+            s.preBuf = nbuf;
             nbuf += s.nch;
         }
     }
@@ -587,8 +630,10 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
             const auto& con = p.contribs[s.firstContrib + k];
             // A delayed edge keeps its line moving even while silent.
             if (con.edge->silent() && con.edge->delay() == 0) continue;
-            con.edge->mixInto(buf, &p.chan[p.steps[con.srcStep].buf],
-                              frames);
+            const PlanStep& src = p.steps[con.srcStep];
+            con.edge->mixInto(
+                buf, &p.chan[con.edge->preFader() ? src.preBuf : src.buf],
+                frames);
         }
         break;
     }
@@ -611,7 +656,8 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
     }
 
     // Dying steps keep their level; their edges carry the fade.
-    s.level->apply(buf, s.nch, frames);
+    s.level->apply(buf, s.nch, frames,
+                   s.preBuf >= 0 ? &p.chan[s.preBuf] : nullptr);
     if (s.meter && !s.dying) s.meter->accumulate(buf, frames);
     if (s.tap && !s.dying) s.tap->push(buf, frames, sliceTime_);
 }

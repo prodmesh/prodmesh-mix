@@ -121,6 +121,9 @@ struct EdgeDesc {
     // Routing is the same either way; this is how the console presents it.
     bool send = false;
     bool mute = false;  // silent but kept, level and all (ramps like a fader)
+    // Taps the source after its processing and mute but before its fader
+    // (monitor mixes, IFB). Post-fader otherwise.
+    bool preFader = false;
 };
 
 struct GraphDesc {

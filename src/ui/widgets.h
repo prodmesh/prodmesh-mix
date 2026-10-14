@@ -292,6 +292,8 @@ public:
     static constexpr int kRows = 4, kRowH = 20, kGap = 3;
     std::function<void(int index, QPoint globalPos)> onSlot;
     std::function<void(QPoint globalPos)> onAdd;
+    // Drag a slot up or down: `from` ends up at index `to`.
+    std::function<void(int from, int to)> onMove;
 
     InsertList() {
         setStyleSheet("background: transparent;");
@@ -326,7 +328,15 @@ protected:
         p.setFont(f);
         const int shown = std::min(int(names_.size()), kRows - 1);
         for (int i = 0; i < shown; ++i) {
-            const QRect r = row(i);
+            QRect r = row(i);
+            if (i == drag_) {  // the dragged slot follows the hand
+                p.setOpacity(0.35);
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor("#262b38"));
+                p.drawRoundedRect(r, 4, 4);
+                p.setOpacity(1);
+                r.moveTop(std::clamp(dragY_ - grabOffset_, 0, height() - kRowH));
+            }
             p.setPen(Qt::NoPen);
             p.setBrush(i == hover_ ? QColor("#2c3241") : QColor("#262b38"));
             p.drawRoundedRect(r, 4, 4);
@@ -344,6 +354,14 @@ protected:
                        p.fontMetrics().elidedText(names_[i], Qt::ElideRight,
                                                   r.width() - (inEngine ? 22 : 12)));
         }
+        if (drag_ >= 0 && dropIndex() != drag_) {  // where it will land
+            const int at = dropIndex();
+            const QRect t = row(at);
+            const int y = at < drag_ ? t.top() - 1 : t.bottom() + 1;
+            p.setPen(Qt::NoPen);
+            p.setBrush(theme::accent);
+            p.drawRoundedRect(QRect(0, std::max(0, y - 1), width(), 2), 1, 1);
+        }
         const QRect add = row(addRow());
         p.setPen(QPen(i_hoverAdd() ? theme::borderHi : theme::border, 1,
                       Qt::DashLine));
@@ -357,7 +375,24 @@ protected:
     }
     bool i_hoverAdd() const { return hover_ == addRow(); }
 
+    // Where the dragged slot lands: the slot under its centre.
+    int dropIndex() const {
+        const int shown = std::min(int(names_.size()), kRows - 1);
+        const int centre = dragY_ - grabOffset_ + kRowH / 2;
+        return std::clamp(centre / (kRowH + kGap), 0, shown - 1);
+    }
+
     void mouseMoveEvent(QMouseEvent* e) override {
+        if (press_ >= 0 && press_ < addRow() && drag_ < 0 &&
+            std::abs(e->pos().y() - pressPos_.y()) > 4 && onMove) {
+            drag_ = press_;
+            setCursor(Qt::ClosedHandCursor);
+        }
+        if (drag_ >= 0) {
+            dragY_ = e->pos().y();
+            update();
+            return;
+        }
         int h = -1;
         for (int i = 0; i < kRows; ++i)
             if (row(i).contains(e->pos())) h = i;
@@ -377,7 +412,9 @@ protected:
             for (int i = 0; i < std::min(int(names_.size()), kRows - 1); ++i)
                 if (row(i).contains(he->pos())) {
                     QToolTip::showText(he->globalPos(),
-                                       notes_.value(i, names_[i]), this);
+                                       notes_.value(i, names_[i]) +
+                                           "\nClick for options; drag to reorder.",
+                                       this);
                     return true;
                 }
             QToolTip::hideText();
@@ -385,16 +422,32 @@ protected:
         }
         return QWidget::event(e);
     }
+    // A click (press + release without moving) opens; a drag reorders.
     void mousePressEvent(QMouseEvent* e) override {
-        const QPoint g = e->globalPosition().toPoint();
+        press_ = -1;
         for (int i = 0; i <= addRow(); ++i)
-            if (row(i).contains(e->pos())) {
-                if (i == addRow()) {
-                    if (onAdd) onAdd(g);
-                } else if (onSlot) {
-                    onSlot(i, g);
-                }
-            }
+            if (row(i).contains(e->pos())) press_ = i;
+        pressPos_ = e->pos();
+        if (press_ >= 0) grabOffset_ = e->pos().y() - row(press_).top();
+    }
+    void mouseReleaseEvent(QMouseEvent* e) override {
+        const QPoint g = e->globalPosition().toPoint();
+        if (drag_ >= 0) {
+            const int from = drag_, to = dropIndex();
+            drag_ = press_ = -1;
+            setCursor(Qt::PointingHandCursor);
+            update();
+            if (to != from && onMove) onMove(from, to);
+            return;
+        }
+        const int i = press_;
+        press_ = -1;
+        if (i < 0 || !row(i).contains(e->pos())) return;
+        if (i == addRow()) {
+            if (onAdd) onAdd(g);
+        } else if (onSlot) {
+            onSlot(i, g);
+        }
     }
 
 private:
@@ -402,6 +455,8 @@ private:
     QList<bool> inEngine_;
     QMap<int, QString> notes_;
     int hover_ = -1;
+    int press_ = -1, drag_ = -1, dragY_ = 0, grabOffset_ = 0;
+    QPoint pressPos_;
 };
 
 // Input gain (trim) before any processing: a compact drag field.
@@ -538,8 +593,8 @@ private:
 // line up). A send goes to a bus or straight to an output. Each row:
 //   dot    click = on/off ("−" = left out of this mix-minus, click to put
 //          it back)
-//   rest   drag up/down = level (Option = fine), double-click = 0 dB (or
-//          back to automatic on a mix-minus), right-click = menu
+//   rest   click = menu (pre/post, reset, remove), drag up/down = level
+//          (Option = fine)
 // The last row adds a send.
 class SendList : public QWidget {
 public:
@@ -550,6 +605,7 @@ public:
         QString label;
         State state = State::On;
         float db = 0;
+        bool pre = false;  // pre-fader
         QString tip;
     };
     std::function<void(quint32 dest)> onToggle;
@@ -597,9 +653,9 @@ protected:
             const bool sending = r.state == State::On || r.state == State::Auto;
             if (r.state != State::Minus) {  // level bar on the fader law
                 p.setBrush(sending ? QColor(47, 191, 155, 60) : QColor(138, 146, 166, 40));
-                const float f = FaderLaw::toPos(r.db);
+                const float pos = FaderLaw::toPos(r.db);
                 p.drawRoundedRect(QRectF(kDotW, rr.bottom() - 2,
-                                         (rr.width() - kDotW) * f, 3), 1.5, 1.5);
+                                         (rr.width() - kDotW) * pos, 3), 1.5, 1.5);
             }
             const QPointF c(rr.left() + kDotW / 2.0 + 1, rr.center().y() + 0.5);
             if (r.state == State::Minus) {
@@ -615,9 +671,27 @@ protected:
             }
             // Only a level the operator set is a number; the dot and the
             // bar say "automatic" or "left out" (the tooltip spells it out).
-            const QString value = r.state == State::On || r.state == State::Muted
-                                      ? fmtDb(r.db) : QString();
-            const int vw = value.isEmpty() ? 0 : QFontMetrics(v).horizontalAdvance(value) + 5;
+            // A pre-fader send shows its tag instead (the bar still shows the
+            // level; the number comes back while dragging and in the tooltip).
+            const QString value =
+                (r.state == State::On || r.state == State::Muted) &&
+                        (!r.pre || i == dragRow_)
+                    ? fmtDb(r.db) : QString();
+            int vw = value.isEmpty() ? 0 : QFontMetrics(v).horizontalAdvance(value) + 5;
+            if (r.pre) {  // "PRE" tag left of the value
+                QFont t = font();
+                t.setPixelSize(7);
+                t.setWeight(QFont::Bold);
+                const int tw = QFontMetrics(t).horizontalAdvance("PRE") + 6;
+                const QRect tag(rr.right() - vw - tw - 1, rr.top() + 4, tw, rr.height() - 8);
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor("#2c3241"));
+                p.drawRoundedRect(tag, 2, 2);
+                p.setFont(t);
+                p.setPen(theme::textHi);
+                p.drawText(tag, Qt::AlignCenter, "PRE");
+                vw += tw + 3;
+            }
             p.setFont(f);
             p.setPen(sending ? theme::textHi : theme::text);
             p.drawText(rr.adjusted(kDotW + 2, 0, -vw - 2, 0),
@@ -657,7 +731,13 @@ protected:
         return QWidget::event(e);
     }
     void mouseMoveEvent(QMouseEvent* e) override {
+        if (dragRow_ >= 0 && !moved_ && std::abs(e->position().y() - grabY_) < 3)
+            return;  // still a click
         if (dragRow_ >= 0) {
+            if (!moved_) {
+                moved_ = true;
+                grabY_ = e->position().y();
+            }
             const float perPx = e->modifiers() & Qt::AltModifier ? 0.025f : 0.25f;
             if (perPx != lastPerPx_) {  // re-anchor when switching fine/coarse
                 grabY_ = e->position().y();
@@ -705,27 +785,122 @@ protected:
             if (onToggle) onToggle(r.dest);
             return;
         }
-        if (r.state == State::Minus) return;
-        dragRow_ = i;
+        pressRow_ = i;
+        moved_ = false;
         grabY_ = e->position().y();
         grabDb_ = r.db;
         lastPerPx_ = 0.25f;
+        if (r.state != State::Minus) dragRow_ = i;
     }
-    void mouseReleaseEvent(QMouseEvent*) override {
-        dragRow_ = -1;
+    void mouseReleaseEvent(QMouseEvent* e) override {
+        const int i = pressRow_;
+        const bool click = !moved_;
+        dragRow_ = pressRow_ = -1;
         update();
-    }
-    void mouseDoubleClickEvent(QMouseEvent* e) override {
-        const int i = rowAt(e->pos());
-        if (i >= 0 && i < shown() && e->pos().x() >= kDotW + 2 && onReset)
-            onReset(rows_[i].dest);
+        if (click && i >= 0 && i < int(rows_.size()) && onMenu)
+            onMenu(rows_[i].dest, e->globalPosition().toPoint());
     }
 
 private:
     QList<Row> rows_;
-    int hover_ = -1, dragRow_ = -1;
+    int hover_ = -1, dragRow_ = -1, pressRow_ = -1;
+    bool moved_ = false;
     double grabY_ = 0;
     float grabDb_ = 0, lastPerPx_ = 0.25f;
+};
+
+// Pan (mono channels) or balance (stereo): drag left/right (Option =
+// fine), scroll, double-click = centre.
+class PanField : public QWidget {
+public:
+    std::function<void(float)> onPan;  // -1 left .. +1 right
+
+    PanField() {
+        setFixedHeight(18);
+        setCursor(Qt::SizeHorCursor);
+        setToolTip("Pan (balance on a stereo channel).\nDrag left/right (hold "
+                   "Option for fine), double-click to centre.");
+    }
+    void setPan(float p) {
+        if (dragging_ || p == pan_) return;
+        pan_ = p;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setPen(Qt::NoPen);
+        p.setBrush(dragging_ ? QColor("#2c3241") : QColor("#191c23"));
+        p.drawRoundedRect(rect(), 4, 4);
+        // Centre tick and a bar from centre to the position.
+        const float cx = width() / 2.0f;
+        const float x = cx + pan_ * (width() / 2.0f - 3);
+        p.setBrush(QColor(47, 191, 155, 70));
+        p.drawRect(QRectF(std::min(cx, x), height() - 3, std::fabs(x - cx), 3));
+        p.setBrush(theme::border);
+        p.drawRect(QRectF(cx - 0.5, height() - 5, 1, 5));
+        p.setBrush(pan_ == 0 ? theme::text : theme::accent);
+        p.drawRoundedRect(QRectF(x - 1.5, height() - 5, 3, 5), 1, 1);
+        QFont lf = font();
+        lf.setPixelSize(8);
+        lf.setWeight(QFont::DemiBold);
+        lf.setLetterSpacing(QFont::AbsoluteSpacing, 0.6);
+        p.setFont(lf);
+        p.setPen(theme::text);
+        p.drawText(rect().adjusted(5, -2, 0, 0), Qt::AlignVCenter | Qt::AlignLeft, "PAN");
+        QFont v = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+        v.setPixelSize(10);
+        p.setFont(v);
+        p.setPen(pan_ != 0.0f ? theme::textMax : QColor("#5a6172"));
+        p.drawText(rect().adjusted(0, -2, -5, 0), Qt::AlignVCenter | Qt::AlignRight,
+                   text(pan_));
+    }
+    static QString text(float p) {
+        const int pct = int(std::round(std::fabs(p) * 100));
+        if (pct == 0) return "C";
+        return (p < 0 ? "L" : "R") + QString::number(pct);
+    }
+    void mousePressEvent(QMouseEvent* e) override {
+        dragging_ = true;
+        grabX_ = e->position().x();
+        grabPan_ = pan_;
+        update();
+    }
+    void mouseMoveEvent(QMouseEvent* e) override {
+        if (!dragging_) return;
+        const float perPx = e->modifiers() & Qt::AltModifier ? 0.002f : 0.02f;
+        if (perPx != lastPerPx_) {
+            grabX_ = e->position().x();
+            grabPan_ = pan_;
+            lastPerPx_ = perPx;
+            return;
+        }
+        commit(grabPan_ + float(e->position().x() - grabX_) * perPx);
+    }
+    void mouseReleaseEvent(QMouseEvent*) override {
+        dragging_ = false;
+        lastPerPx_ = 0.02f;
+        update();
+    }
+    void mouseDoubleClickEvent(QMouseEvent*) override { commit(0); }
+    void wheelEvent(QWheelEvent* e) override {
+        const int notches = e->angleDelta().y() / 120;
+        if (notches) commit(pan_ + 0.05f * float(notches));
+    }
+
+private:
+    void commit(float p) {
+        p = std::clamp(std::round(p * 100.0f) / 100.0f, -1.0f, 1.0f);
+        if (p == pan_) return;
+        pan_ = p;
+        update();
+        if (onPan) onPan(p);
+    }
+    float pan_ = 0, grabPan_ = 0, lastPerPx_ = 0.02f;
+    double grabX_ = 0;
+    bool dragging_ = false;
 };
 
 // A routing button: "→ Program" (where the strip goes) or "In 3" (what
@@ -805,6 +980,8 @@ public:
         name_->setAlignment(Qt::AlignCenter);
         name_->setStyleSheet(master ? "color: #5ce0bd;" : "color: #e8ecf4;");
         name_->setToolTip(name);
+        name_->setCursor(Qt::PointingHandCursor);
+        name_->installEventFilter(this);
         setName(name);
         v->addWidget(name_);
         caption_ = new QLabel(this);
@@ -821,6 +998,8 @@ public:
         v->addWidget(inserts_);
         sends_ = new SendList;
         v->addWidget(sends_);
+        pan_ = new PanField;
+        v->addWidget(pan_);
 
         fader_ = new FaderMeter(channels, this);
         v->addWidget(fader_, 1, Qt::AlignHCenter);
@@ -872,7 +1051,7 @@ public:
     void setName(const QString& n) {
         name_->setText(name_->fontMetrics().elidedText(n, Qt::ElideRight,
                                                        width() - 16));
-        name_->setToolTip(n);
+        name_->setToolTip(n + "\nClick to rename, delete, or make a mix-minus.");
     }
 
     // From the daemon (snapshot or another client's move).
@@ -891,6 +1070,13 @@ public:
     SendList* sends() { return sends_; }
     AssignButton* assign() { return assign_; }
     AssignButton* input() { return input_; }
+    PanField* pan() { return pan_; }
+    void setHasPan(bool on) {
+        auto sp = pan_->sizePolicy();
+        sp.setRetainSizeWhenHidden(true);
+        pan_->setSizePolicy(sp);
+        pan_->setVisible(on);
+    }
     // A second line under the name ("minus Remote 1" on a mix-minus).
     void setCaption(const QString& c, const QString& tip = {}) {
         caption_->setText(caption_->fontMetrics().elidedText(
@@ -940,6 +1126,14 @@ protected:
     void contextMenuEvent(QContextMenuEvent* e) override {
         if (onContext) onContext(e->globalPos());
     }
+    // Clicking the name opens the same menu (not everyone right-clicks).
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if (o == name_ && e->type() == QEvent::MouseButtonRelease && onContext) {
+            onContext(name_->mapToGlobal(QPoint(0, name_->height())));
+            return true;
+        }
+        return QWidget::eventFilter(o, e);
+    }
 
 private:
     void showDb(float d) { readout_->setText(fmtDb(d)); }
@@ -951,6 +1145,7 @@ private:
     SendList* sends_;
     AssignButton* assign_;
     AssignButton* input_;
+    PanField* pan_;
     QLabel* readout_;
     DelayCell* dly_;
     DelayCell* cmp_;

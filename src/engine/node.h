@@ -162,10 +162,12 @@ public:
 
     // Audio thread. Ignored if `seq` is not newer than the last applied.
     void set(float faderDb, bool mute, int rampSamples, std::uint64_t seq);
-    void apply(float* const* ch, int nch, int n);
+    // ch *= fader * mute. With `pre`, also pre = ch * mute (the pre-fader
+    // tap: mute still applies, the fader does not).
+    void apply(float* const* ch, int nch, int n, float* const* pre = nullptr);
 
 private:
-    LinearRamp gain_;
+    LinearRamp fader_, on_;
     std::uint64_t seq_ = 0;
 };
 
@@ -202,9 +204,11 @@ private:
 class EdgeInstance {
 public:
     EdgeInstance(NodeId from, NodeId to, int srcCh, int dstCh,
-                 int delaySamples = 0, int maxBlock = 0);
+                 int delaySamples = 0, int maxBlock = 0, bool preFader = false);
 
     int delay() const { return delay_; }
+    // Fixed per instance like the delay: switching pre/post crossfades.
+    bool preFader() const { return pre_; }
 
     NodeId from() const { return from_; }
     NodeId to() const { return to_; }
@@ -226,6 +230,7 @@ private:
     int srcCh_, dstCh_;
     LinearRamp m_[kMaxChannels][kMaxChannels];
     int delay_ = 0;
+    bool pre_ = false;
     std::size_t pos_ = 0;
     std::vector<float> line_[kMaxChannels];     // delay_ samples each
     std::vector<float> delayed_[kMaxChannels];  // maxBlock scratch

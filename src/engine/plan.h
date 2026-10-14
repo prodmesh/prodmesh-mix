@@ -31,6 +31,7 @@ struct PlanStep {
     int nch = 1;
     int buf = 0;      // first channel in RenderPlan::chan
     int fadeBuf = 0;  // first scratch channel for fadeOut
+    int preBuf = -1;  // pre-fader copy, when a pre-fader edge reads it
     int firstContrib = 0, numContrib = 0;
     int ioChannel = 0;
     bool dying = false;  // removed / replaced node, rendered while fading

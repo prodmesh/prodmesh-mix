@@ -572,6 +572,22 @@ private:
         }
     }
 
+    // Reorders the chain; the engine crossfades to it and every plugin
+    // keeps its current settings (Engine::carryPluginStates).
+    void moveInsert(NodeId id, int from, int to) {
+        GraphDesc g = graph_;
+        auto* n = g.find(id);
+        if (!n) return;
+        auto& v = n->processing.inserts;
+        if (from < 0 || to < 0 || from >= int(v.size()) || to >= int(v.size()) ||
+            from == to)
+            return;
+        auto ins = std::move(v[std::size_t(from)]);
+        v.erase(v.begin() + from);
+        v.insert(v.begin() + to, std::move(ins));
+        commit(std::move(g));
+    }
+
     void removeInsert(NodeId id, int index) {
         GraphDesc g = graph_;
         if (auto* n = g.find(id); n && index < int(n->processing.inserts.size())) {
@@ -749,6 +765,10 @@ private:
         resolveMixMinus(g);
         graph_ = std::move(g);
         refreshRouting();
+        for (const auto& n : graph_.nodes)  // a reorder shows at once
+            if (auto* st = strips_.value(n.id))
+                st->inserts()->setInserts(insertNames(n), inEngineFlags(n));
+        refreshNotes();
         if (!soon) {
             sendTimer_.stop();
             client_.setGraph(graph_);
@@ -766,6 +786,7 @@ private:
             r.dest = e.to;
             r.label = destName(e.to);
             r.db = e.gainDb;
+            r.pre = e.preFader;
             if (e.derived) {
                 r.state = SendList::State::Auto;
                 const auto* f = graph_.find(graph_.find(e.to)->mixMinus.follows);
@@ -774,11 +795,12 @@ private:
                             .arg(name, r.label, f ? QString::fromStdString(f->name) : "Program");
             } else {
                 r.state = e.mute ? SendList::State::Muted : SendList::State::On;
-                r.tip = QString("Send to %1: %2 dB after the fader%3.\nDot = on/off; "
-                                "drag = level (Option = fine); double-click = %4; "
-                                "right-click for more.")
-                            .arg(r.label, fmtDb(r.db), e.mute ? " (off)" : "",
-                                 isMixMinus(e.to) ? "automatic" : "0 dB");
+                r.tip = QString("Send to %1: %2 dB %3 the fader%4.\nDot = on/off; "
+                                "drag = level (Option = fine); click for "
+                                "pre/post, %5 and remove.")
+                            .arg(r.label, fmtDb(r.db), e.preFader ? "before" : "after",
+                                 e.mute ? " (off)" : "",
+                                 isMixMinus(e.to) ? "back to automatic" : "0 dB");
             }
             rows << r;
         }
@@ -829,6 +851,11 @@ private:
             auto* st = strips_.value(n.id);
             if (!st) continue;
             st->sends()->setRows(sendRows(n));
+            for (const auto& e : graph_.edges)
+                if (e.from == n.id && !isSend(e)) {
+                    st->pan()->setPan(e.pan);
+                    break;
+                }
             const auto [text, tip] = assignText(n);
             st->assign()->setText(text, tip);
             if (n.kind == NodeKind::Strip) {
@@ -940,12 +967,32 @@ private:
                 gain = e.gainDb;
                 break;
             }
+        // A channel still named after its input follows the new one.
+        const QString before = inputText(id);
         std::erase_if(g.edges, [&](const EdgeDesc& e) { return e.to == id; });
         for (int i = 0; i < src.size(); ++i)
             g.edges.push_back({src[i], id, gain,
                                src.size() == 2 ? (i ? 1.0f : -1.0f) : 0.0f});
         if (channels) g.find(id)->channels = std::clamp(channels, 1, 2);
+        auto* n = g.find(id);
+        if (!before.isEmpty() && QString::fromStdString(n->name) == before &&
+            !src.isEmpty()) {
+            std::swap(graph_, g);  // inputText() reads graph_
+            const QString after = inputText(id);
+            std::swap(graph_, g);
+            n = g.find(id);
+            if (!after.isEmpty()) n->name = after.toStdString();
+        }
         commit(std::move(g));
+    }
+
+    // Pans the main output and the sends together (mix-minus sends follow
+    // by themselves); a stereo channel's pan is a balance.
+    void setPan(NodeId id, float p) {
+        GraphDesc g = graph_;
+        for (auto& e : g.edges)
+            if (e.from == id && !e.derived) e.pan = p;
+        commit(std::move(g), true);
     }
 
     void setGain(NodeId id, float dB) {
@@ -1024,6 +1071,27 @@ private:
             connect(menu->addAction("Level 0 dB"), &QAction::triggered, this,
                     [this, id, dest] { resetSend(id, dest); });
         }
+        bool pre = false;
+        for (const auto& e : graph_.edges)
+            if (e.from == id && e.to == dest) pre = e.preFader;
+        auto* preAct = menu->addAction("Pre-fader  (ignores this channel's fader)");
+        preAct->setCheckable(true);
+        preAct->setChecked(pre);
+        // Toggle from the state the menu showed (not the action's own
+        // checked flag, which accessibility presses do not always flip).
+        connect(preAct, &QAction::triggered, this, [this, id, dest, pre] {
+            const bool on = !pre;
+            GraphDesc g = graph_;
+            if (auto* e = edgeOf(g, id, dest)) {
+                e->preFader = on;
+            } else {  // automatic mix-minus send: becomes an explicit one
+                removeEdge(g, id, dest);
+                EdgeDesc ne{id, dest, 0, mainPan(id), false, true};
+                ne.preFader = on;
+                g.edges.push_back(ne);
+            }
+            commit(std::move(g));
+        });
         if (explicitSend && !d->mixMinus.follows) {
             menu->addSeparator();
             connect(menu->addAction("Remove send to " + name), &QAction::triggered,
@@ -1133,13 +1201,15 @@ private:
             if (b.kind != NodeKind::Bus || b.id == id || b.mixMinus.follows) continue;
             auto* act = menu->addAction(QString::fromStdString(b.name));
             act->setCheckable(true);
-            act->setChecked(mainEdge(b.id));
+            const bool was = mainEdge(b.id);
+            act->setChecked(was);
             if (graph_.reaches(b.id, id)) {
                 act->setEnabled(false);  // would feed itself
                 act->setText(act->text() + "  (feeds this)");
             }
             const NodeId to = b.id;
-            connect(act, &QAction::triggered, this, [this, id, to](bool on) {
+            connect(act, &QAction::triggered, this, [this, id, to, was] {
+                const bool on = !was;
                 GraphDesc g = graph_;
                 removeEdge(g, id, to);  // a send to it becomes the main output
                 if (on) g.edges.push_back({id, to, 0, mainPan(id)});
@@ -1155,8 +1225,10 @@ private:
                 outputName(ch, std::min(2, deviceOutputs_ - ch)) +
                 (ch == 0 ? "  (main)" : ""));
             act->setCheckable(true);
-            act->setChecked(outId && mainEdge(outId));
-            connect(act, &QAction::triggered, this, [this, id, ch](bool on) {
+            const bool was = outId && mainEdge(outId);
+            act->setChecked(was);
+            connect(act, &QAction::triggered, this, [this, id, ch, was] {
+                const bool on = !was;
                 GraphDesc g = graph_;
                 const NodeId o = outputNode(g, ch);
                 removeEdge(g, id, o);
@@ -1340,6 +1412,9 @@ private:
             }
         };
         s->inserts()->onAdd = [this, id](QPoint at) { openBrowser(id, {}, at); };
+        s->inserts()->onMove = [this, id](int from, int to) { moveInsert(id, from, to); };
+        s->pan()->onPan = [this, id](float p) { setPan(id, p); };
+        s->setHasPan(!master);
         s->sends()->onToggle = [this, id](quint32 d) { toggleSend(id, d); };
         s->sends()->onLevel = [this, id](quint32 d, float db) {
             setSendLevel(id, d, db);

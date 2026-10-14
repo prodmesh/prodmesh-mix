@@ -435,3 +435,27 @@ TEST(hung_host_is_killed_and_restarted) {
     CHECK_MSG(killed, "hung host never killed");
     CHECK(rt::violations() == 0);
 }
+
+// Editing a chain (here: adding an insert in front) builds a new instance;
+// the plugin must keep the settings it has now, isolated or not.
+TEST(chain_edit_keeps_live_plugin_settings) {
+    for (bool isolated : {false, true}) {
+        Engine e(cfg()), ref(cfg());
+        CHECK(ref.setGraph(sine()));
+        CHECK(e.setGraph(gainWithState(isolated, 0.25f)));
+        runPaced(ref, 40);
+        runPaced(e, 40);
+        auto g = gainWithState(isolated, 0.25f);
+        auto& ins = g.find(2)->processing.inserts;
+        ins[0].state.clear();  // the client never saw the state
+        ins.insert(ins.begin(), InsertDesc::gain(0));
+        CHECK(e.setGraph(g));
+        const auto x = runPaced(ref, 80), y = runPaced(e, 80);
+        const std::size_t d = isolated ? kBlock : 0;
+        const float ratio = peak(y, 50 * kBlock + d, 80 * kBlock) /
+                            peak(x, 50 * kBlock, 80 * kBlock - d);
+        CHECK_MSG(std::fabs(ratio - 0.25f) < 0.01f,
+                  std::string(isolated ? "isolated" : "in-engine") +
+                      ": gain after the edit " + std::to_string(ratio));
+    }
+}

@@ -139,6 +139,7 @@ public:
 
     ~ClapProcessor() override {
         if (!plugin_) return;
+        destroyEditor();
         // The engine stops processing on the audio thread before an
         // instance is retired; this is the backstop.
         if (activated_) plugin_->deactivate(plugin_);
@@ -208,7 +209,49 @@ public:
         if (auto* lat = static_cast<const clap_plugin_latency_t*>(
                 plugin_->get_extension(plugin_, CLAP_EXT_LATENCY)))
             latency_ = int(lat->get(plugin_));
+        gui_ = static_cast<const clap_plugin_gui_t*>(
+            plugin_->get_extension(plugin_, CLAP_EXT_GUI));
         return true;
+    }
+
+    // --- editor (main thread of the hosting process) --------------------
+    bool hasEditor() const override {
+#if defined(__APPLE__)
+        return gui_ && gui_->is_api_supported(plugin_, CLAP_WINDOW_API_COCOA, false);
+#else
+        return false;
+#endif
+    }
+
+    bool createEditor(void* parent, int* w, int* h) override {
+#if defined(__APPLE__)
+        if (!hasEditor() || editorOpen_) return false;
+        PM_TRACE("gui.create(cocoa)");
+        if (!gui_->create(plugin_, CLAP_WINDOW_API_COCOA, false)) return false;
+        std::uint32_t width = 600, height = 400;
+        gui_->get_size(plugin_, &width, &height);
+        clap_window_t win{};
+        win.api = CLAP_WINDOW_API_COCOA;
+        win.cocoa = parent;
+        if (!gui_->set_parent(plugin_, &win)) {
+            gui_->destroy(plugin_);
+            return false;
+        }
+        gui_->show(plugin_);
+        editorOpen_ = true;
+        if (w) *w = int(width);
+        if (h) *h = int(height);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void destroyEditor() override {
+        if (!editorOpen_) return;
+        gui_->hide(plugin_);
+        gui_->destroy(plugin_);
+        editorOpen_ = false;
     }
 
     void process(float* const* ch, int nch, int n) override {
@@ -265,6 +308,8 @@ private:
     std::shared_ptr<Module> module_;
     clap_host_t host_{};
     const clap_plugin_t* plugin_ = nullptr;
+    const clap_plugin_gui_t* gui_ = nullptr;
+    bool editorOpen_ = false;
     bool activated_ = false, processing_ = false, failed_ = false;
     struct Port {
         std::vector<float> data;

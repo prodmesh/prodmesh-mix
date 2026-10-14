@@ -100,22 +100,31 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
     // Consecutive isolated plugins share one host process, so a chain adds
     // one block of latency, not one per plugin.
     std::vector<plugin::PluginRef> isolated;
+    std::vector<std::size_t> isolatedSlots;  // their InsertDesc indices
+    insertMap_.assign(p.inserts.size(), {-1, 0});
     auto flushIsolated = [&] {
         if (isolated.empty()) return;
         std::string err;
         if (auto proc = plugin::loadSandboxedChain(isolated, fs, maxBlock,
-                                                   channels_, &err))
+                                                   channels_, &err)) {
+            for (std::size_t k = 0; k < isolatedSlots.size(); ++k)
+                insertMap_[isolatedSlots[k]] = {int(inserts_.size()), int(k)};
             inserts_.push_back(std::move(proc));
-        else
+        } else {
             warnings_.push_back(err);  // the chain is passed through
+        }
         isolated.clear();
+        isolatedSlots.clear();
     };
-    for (const auto& ins : p.inserts) {
+    for (std::size_t slot = 0; slot < p.inserts.size(); ++slot) {
+        const auto& ins = p.inserts[slot];
         if (ins.type == InsertDesc::Type::Plugin && ins.sandboxed) {
             isolated.push_back({ins.format, ins.path, ins.pluginId});
+            isolatedSlots.push_back(slot);
             continue;
         }
         flushIsolated();
+        insertMap_[slot] = {int(inserts_.size()), 0};
         switch (ins.type) {
         case InsertDesc::Type::Gain:
             inserts_.push_back(std::make_unique<GainInsert>(ins.value));
@@ -126,10 +135,12 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
         case InsertDesc::Type::Plugin: {
             std::string err;
             if (auto proc = plugin::load(ins.format, ins.path, ins.pluginId,
-                                         fs, maxBlock, channels_, &err))
+                                         fs, maxBlock, channels_, &err)) {
                 inserts_.push_back(std::move(proc));
-            else
+            } else {
+                insertMap_[slot] = {-1, 0};
                 warnings_.push_back(err);  // the insert is passed through
+            }
             break;
         }
         }
@@ -143,6 +154,16 @@ std::vector<NodeInstance::PluginRt> NodeInstance::pluginRtReport() const {
         if (ins->rtAllocations() || ins->missedBlocks())
             out.push_back({ins->name(), ins->rtAllocations(), ins->missedBlocks()});
     return out;
+}
+
+bool NodeInstance::requestEditor(int insertIndex, std::string* error) {
+    if (insertIndex < 0 || insertIndex >= int(insertMap_.size()) ||
+        insertMap_[std::size_t(insertIndex)].first < 0) {
+        if (error) *error = "that insert is not running";
+        return false;
+    }
+    const auto [proc, pos] = insertMap_[std::size_t(insertIndex)];
+    return inserts_[std::size_t(proc)]->requestEditor(pos, error);
 }
 
 std::vector<std::string> NodeInstance::maintain() {

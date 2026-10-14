@@ -16,6 +16,15 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(PM_HOST_GUI)
+#include <QApplication>
+#include <QCloseEvent>
+#include <QMap>
+#include <QSocketNotifier>
+#include <QTimer>
+#include <QWidget>
+#endif
+
 #include "core/rt_guard.h"
 #include "core/rt_thread.h"
 #include "plugin/plugin.h"
@@ -27,6 +36,40 @@ namespace {
 
 std::atomic<bool> gQuit{false};
 void onTerm(int) { gQuit.store(true); }
+
+#if defined(PM_HOST_GUI)
+// A plugin's editor in its own window; closing the window destroys the
+// editor (the plugin keeps running).
+class EditorWindow : public QWidget {
+public:
+    explicit EditorWindow(Processor& p) : plugin_(p) {
+        setAttribute(Qt::WA_NativeWindow);
+        setWindowTitle(QString::fromStdString(p.name()));
+    }
+    bool open() {
+        // The native view must exist before the plugin attaches to it.
+        resize(600, 400);
+        show();
+        int w = 0, h = 0;
+        if (!plugin_.createEditor(reinterpret_cast<void*>(winId()), &w, &h))
+            return false;
+        setFixedSize(w, h);
+        raise();
+        activateWindow();
+        return true;
+    }
+
+protected:
+    void closeEvent(QCloseEvent* e) override {
+        plugin_.destroyEditor();
+        e->accept();
+        deleteLater();
+    }
+
+private:
+    Processor& plugin_;
+};
+#endif
 
 }  // namespace
 
@@ -51,6 +94,13 @@ int main(int argc, char** argv) {
     }
     std::signal(SIGTERM, onTerm);
     std::signal(SIGINT, onTerm);
+#if defined(PM_HOST_GUI)
+    // Before any plugin loads: editors need the application object. Qt
+    // gets only argv[0] — it would read our --plugin as its own -plugin.
+    int qtArgc = 1;
+    QApplication app(qtArgc, argv);
+    app.setQuitOnLastWindowClosed(false);
+#endif
 
     const int fd = shm_open(shm.c_str(), O_RDWR, 0);
     if (fd < 0) {
@@ -119,6 +169,56 @@ int main(int argc, char** argv) {
         }
         for (auto& p : plugins) p->stopProcessing();
     });
+#if defined(PM_HOST_GUI)
+    // Main thread: plugin editors, and line commands from the engine on
+    // stdin ("editor N"). EOF means the engine went away.
+    QMap<int, QWidget*> editors;
+    QSocketNotifier commands(0, QSocketNotifier::Read);
+    std::string pending;
+    QObject::connect(&commands, &QSocketNotifier::activated, [&] {
+        char buf[256];
+        const ssize_t n = read(0, buf, sizeof buf);
+        if (n <= 0) {
+            gQuit.store(true);
+            commands.setEnabled(false);
+            return;
+        }
+        pending.append(buf, std::size_t(n));
+        std::size_t nl;
+        while ((nl = pending.find('\n')) != std::string::npos) {
+            const std::string line = pending.substr(0, nl);
+            pending.erase(0, nl + 1);
+            if (line.rfind("editor ", 0) == 0) {
+                const int i = std::atoi(line.c_str() + 7);
+                if (i < 0 || i >= int(plugins.size())) continue;
+                if (auto* w = editors.value(i); w && w->isVisible()) {
+                    w->raise();
+                    w->activateWindow();
+                    continue;
+                }
+                auto* w = new EditorWindow(*plugins[std::size_t(i)]);
+                QObject::connect(w, &QObject::destroyed, [&editors, i] {
+                    editors.remove(i);
+                });
+                if (w->open()) {
+                    editors[i] = w;
+                } else {
+                    std::fprintf(stderr, "mix-pluginhost: %s has no editor\n",
+                                 plugins[std::size_t(i)]->name().c_str());
+                    w->deleteLater();
+                }
+            }
+        }
+    });
+    QTimer quitCheck;
+    QObject::connect(&quitCheck, &QTimer::timeout, [&] {
+        if (gQuit.load()) app.quit();
+    });
+    quitCheck.start(100);
+    app.exec();
+    gQuit.store(true);
+    for (auto* w : editors) w->close();
+#endif
     render.join();
     plugins.clear();
     munmap(region, size);

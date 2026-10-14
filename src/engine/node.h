@@ -43,6 +43,23 @@ public:
     virtual std::uint64_t missedBlocks() const { return 0; }
     virtual bool sandboxed() const { return false; }
 
+    // Plugin editor, in whichever process hosts the plugin (its main
+    // thread): embed into a native parent view (NSView* on macOS).
+    virtual bool hasEditor() const { return false; }
+    virtual bool createEditor(void* /*nativeParent*/, int* /*w*/, int* /*h*/) {
+        return false;
+    }
+    virtual void destroyEditor() {}
+
+    // Engine side, control thread: open the editor of plugin `index` of
+    // this insert (a chain when isolated) in the process that hosts it.
+    virtual bool requestEditor(int /*index*/, std::string* error) {
+        if (error)
+            *error = "this plugin runs inside the engine, which has no "
+                     "screen: run it isolated to open its window";
+        return false;
+    }
+
 protected:
     std::atomic<std::uint64_t> rtAllocs_{0};
 };
@@ -72,6 +89,10 @@ public:
     // sandboxed) missed blocks.
     std::vector<PluginRt> pluginRtReport() const;
 
+    // Control thread: open the editor of the plugin at `insertIndex` (an
+    // index into ProcessingDesc::inserts).
+    bool requestEditor(int insertIndex, std::string* error);
+
     // Control thread: runs every insert's maintain(); returns event lines.
     std::vector<std::string> maintain();
 
@@ -92,6 +113,9 @@ private:
     dsp::Compressor comp_;
     dsp::Limiter limiter_;
     std::vector<std::unique_ptr<Processor>> inserts_;
+    // ProcessingDesc::inserts[i] -> (inserts_ index, position in its
+    // chain), or -1 when it failed to load.
+    std::vector<std::pair<int, int>> insertMap_;
     std::vector<std::string> warnings_;
 };
 

@@ -176,6 +176,15 @@ Engine::DelayInfo Engine::delayInfo(NodeId id) const {
     return d;
 }
 
+bool Engine::openEditor(NodeId id, int insertIndex, std::string* error) {
+    auto it = live_.nodes.find(id);
+    if (it == live_.nodes.end()) {
+        if (error) *error = "no such channel";
+        return false;
+    }
+    return it->second->requestEditor(insertIndex, error);
+}
+
 int Engine::latencyOf(NodeId id) const {
     auto it = live_.latency.find(id);
     return it == live_.latency.end() ? 0 : it->second;

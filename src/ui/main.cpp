@@ -59,6 +59,9 @@ public:
     void setLevel(quint32 id, float db, bool mute) {
         pending_[id] = {db, mute};
     }
+    void openEditor(quint32 id, int insert) {
+        send({{"op", "openEditor"}, {"id", double(id)}, {"insert", insert}});
+    }
     void setGraph(const GraphDesc& g) {
         flushLevels();  // keep fader moves ordered before the edit
         send({{"op", "setGraph"}, {"graph", proto::graphToJson(g)}});
@@ -412,6 +415,10 @@ private:
             loadFailures_ = w;
             refreshNotes();
             setOffline(false);
+        } else if (type == "error") {
+            events_->setText(m["message"].toString());
+            events_->show();
+            eventsTimer_.start(8000);
         } else if (type == "event") {
             // Transient: a plugin host crashed and was restarted, etc.
             events_->setText(m["message"].toString() +
@@ -636,7 +643,13 @@ private:
             const auto names = insertNames(*n);
             const auto& ins = n->processing.inserts[std::size_t(index)];
             QAction* isolate = nullptr;
+            QAction* window = nullptr;
             if (ins.type == InsertDesc::Type::Plugin) {
+                window = menu.addAction("Open plugin window");
+                if (!ins.sandboxed) {
+                    window->setEnabled(false);
+                    window->setText("Open plugin window (run isolated first)");
+                }
                 isolate = menu.addAction("Run isolated (crash-safe, +1 block latency)");
                 isolate->setCheckable(true);
                 isolate->setChecked(ins.sandboxed);
@@ -644,7 +657,9 @@ private:
             }
             auto* remove = menu.addAction("Remove " + names.value(index));
             QAction* chosen = menu.exec(at);
-            if (chosen == remove) {
+            if (chosen && chosen == window) {
+                client_.openEditor(id, index);
+            } else if (chosen == remove) {
                 removeInsert(id, index);
             } else if (chosen && chosen == isolate) {
                 GraphDesc g = graph_;

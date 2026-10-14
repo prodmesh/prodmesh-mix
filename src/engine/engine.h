@@ -123,6 +123,10 @@ public:
     // Live plugins whose own code has allocated on the audio thread.
     std::vector<PluginRtIssue> pluginRtIssues() const;
 
+    // Opens the window of plugin `insertIndex` on node `id` (isolated
+    // plugins only: the engine itself has no screen).
+    bool openEditor(NodeId id, int insertIndex, std::string* error);
+
     // Plugin host events since the last call (crashes, restarts).
     std::vector<std::string> drainEvents() { return std::exchange(events_, {}); }
 

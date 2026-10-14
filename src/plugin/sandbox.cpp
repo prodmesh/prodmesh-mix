@@ -37,6 +37,7 @@ class SandboxProcessor final : public Processor {
 public:
     ~SandboxProcessor() override {
         stopHost();
+        if (ctlFd_ >= 0) close(ctlFd_);
         if (region_) munmap(region_, size_);
         if (!shmName_.empty()) shm_unlink(shmName_.c_str());
     }
@@ -130,6 +131,19 @@ public:
     }
 
     std::uint64_t missedBlocks() const override { return misses_.load(); }
+
+    bool requestEditor(int index, std::string* error) override {
+        if (pid_ <= 0 || ctlFd_ < 0) {
+            if (error) *error = name_ + " is not running";
+            return false;
+        }
+        const std::string cmd = "editor " + std::to_string(index) + "\n";
+        if (write(ctlFd_, cmd.data(), cmd.size()) != ssize_t(cmd.size())) {
+            if (error) *error = "plugin host did not take the command";
+            return false;
+        }
+        return true;
+    }
     bool sandboxed() const override { return true; }
 
 private:
@@ -149,8 +163,26 @@ private:
             argv.push_back(r.id.c_str());
         }
         argv.push_back(nullptr);
-        if (posix_spawn(&pid_, exe.c_str(), nullptr, nullptr,
-                        const_cast<char* const*>(argv.data()), environ) != 0) {
+        // A control pipe on the host's stdin: line commands such as
+        // "editor 1". Closing it (or our death) tells the host to quit.
+        int pipeFd[2];
+        if (pipe(pipeFd) != 0) {
+            if (error) *error = "cannot create control pipe";
+            return false;
+        }
+        posix_spawn_file_actions_t fa;
+        posix_spawn_file_actions_init(&fa);
+        posix_spawn_file_actions_adddup2(&fa, pipeFd[0], 0);
+        posix_spawn_file_actions_addclose(&fa, pipeFd[1]);
+        const int rc = posix_spawn(&pid_, exe.c_str(), &fa, nullptr,
+                                   const_cast<char* const*>(argv.data()), environ);
+        posix_spawn_file_actions_destroy(&fa);
+        close(pipeFd[0]);
+        if (ctlFd_ >= 0) close(ctlFd_);
+        ctlFd_ = pipeFd[1];
+        fcntl(ctlFd_, F_SETFL, O_NONBLOCK);
+        fcntl(ctlFd_, F_SETFD, FD_CLOEXEC);
+        if (rc != 0) {
             pid_ = -1;
             if (error) *error = exe + ": cannot start plugin host";
             return false;
@@ -198,6 +230,7 @@ private:
     std::size_t size_ = 0;
     sandbox::View view_;
     pid_t pid_ = -1;
+    int ctlFd_ = -1;
     std::uint64_t seq_ = 0;  // audio thread
     std::atomic<std::uint64_t> misses_{0};
 };

@@ -143,4 +143,9 @@ target_link_libraries(mix-plugin PRIVATE mix_engine)
 
 add_executable(mix-pluginhost tools/mix_pluginhost.cpp)
 target_link_libraries(mix-pluginhost PRIVATE mix_engine)
+if(Qt6_FOUND)
+    # Plugin editors live in the host process.
+    target_link_libraries(mix-pluginhost PRIVATE Qt6::Widgets)
+    target_compile_definitions(mix-pluginhost PRIVATE PM_HOST_GUI)
+endif()
 add_dependencies(mix-tests mix-pluginhost)

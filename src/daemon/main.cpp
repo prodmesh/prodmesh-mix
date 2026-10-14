@@ -186,6 +186,13 @@ private:
                        {"faderDb", db},
                        {"mute", mute}},
                       s);
+        } else if (op == "openEditor") {
+            std::string err;
+            if (!engine_->openEditor(NodeId(m["id"].toDouble()),
+                                     m["insert"].toInt(), &err))
+                send(s, {{"type", "error"},
+                         {"op", op},
+                         {"message", QString::fromStdString(err)}});
         } else if (op == "setGraph") {
             GraphDesc g;
             QString err;

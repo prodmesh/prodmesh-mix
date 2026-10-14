@@ -8,6 +8,7 @@
 //   {"op":"hello","client":"mix-ui","proto":1}
 //   {"op":"setLevel","id":2001,"faderDb":-3.5,"mute":false}
 //   {"op":"setGraph","graph":{...}}
+//   {"op":"openEditor","id":2000,"insert":0}   isolated plugins only
 //   {"op":"ping","t":123}
 //
 // daemon -> client

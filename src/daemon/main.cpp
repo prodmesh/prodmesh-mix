@@ -3,11 +3,20 @@
 // crash, hang or restart without touching program audio.
 //
 //   mixd [--driver coreaudio|sim] [--rate HZ] [--block N] [--workers N]
-//        [--socket NAME] [--audible]
+//        [--socket NAME] [--session FILE] [--fresh] [--audible]
+//
+// The show is saved to --session (default: the app data dir) within half a
+// second of any change, atomically, and reloaded on start — restarting the
+// engine never loses the mix.
 #include <QCommandLineParser>
 #include <QCoreApplication>
 #include <QJsonArray>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
+#include <QSaveFile>
+#include <QStandardPaths>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QSocketNotifier>
@@ -69,11 +78,17 @@ public:
 
     ~Daemon() override {
         if (driver_) driver_->stop();  // before the engine goes away
+        if (saveTimer_.isActive()) saveSession();
     }
 
-    bool start(const QString& socketName, QString* error) {
+    bool start(const QString& socketName, const QString& session, bool fresh,
+               QString* error) {
+        sessionPath_ = session;
         std::string err;
-        if (!engine_->setGraph(shows::livestream(), &err)) {
+        GraphDesc show = shows::livestream();
+        if (!fresh && loadSession(show))
+            qInfo("mixd: restored session %s", qPrintable(sessionPath_));
+        if (!engine_->setGraph(show, &err)) {
             *error = QString::fromStdString(err);
             return false;
         }
@@ -96,6 +111,9 @@ public:
         meterTimer_.start(33);
         connect(&healthTimer_, &QTimer::timeout, this, &Daemon::sendHealth);
         healthTimer_.start(500);
+        saveTimer_.setSingleShot(true);
+        saveTimer_.setInterval(500);
+        connect(&saveTimer_, &QTimer::timeout, this, &Daemon::saveSession);
 
         qInfo("mixd: %s %.0f Hz, block %d, socket %s",
               driver_->config().numOutputs ? "running" : "running (no outputs)",
@@ -140,6 +158,7 @@ private:
             const float db = float(m["faderDb"].toDouble());
             const bool mute = m["mute"].toBool();
             engine_->setLevel(id, db, mute);
+            saveTimer_.start();
             broadcast({{"type", "level"},
                        {"id", double(id)},
                        {"faderDb", db},
@@ -157,10 +176,44 @@ private:
                          {"message", QString::fromStdString(engineErr)}});
             } else {
                 broadcast(snapshot(), nullptr);
+                saveTimer_.start();
             }
         } else {
             send(s, {{"type", "error"}, {"op", op}, {"message", "unknown op"}});
         }
+    }
+
+    bool loadSession(GraphDesc& out) {
+        QFile f(sessionPath_);
+        if (!f.open(QIODevice::ReadOnly)) return false;
+        const auto doc = QJsonDocument::fromJson(f.readAll());
+        GraphDesc g;
+        QString err;
+        std::string engineErr;
+        if (doc["format"].toString() != "prodmesh-mix-session" ||
+            !proto::graphFromJson(doc["graph"].toObject(), g, &err)) {
+            qWarning("mixd: ignoring unreadable session %s",
+                     qPrintable(sessionPath_));
+            return false;
+        }
+        out = std::move(g);
+        return true;
+    }
+
+    // QSaveFile writes a temp file and renames it over the old one, so a
+    // crash mid-save leaves the previous session intact.
+    void saveSession() {
+        if (sessionPath_.isEmpty()) return;
+        QDir().mkpath(QFileInfo(sessionPath_).absolutePath());
+        QSaveFile f(sessionPath_);
+        if (!f.open(QIODevice::WriteOnly)) return;
+        f.write(QJsonDocument(QJsonObject{
+                                  {"format", "prodmesh-mix-session"},
+                                  {"version", 1},
+                                  {"graph", proto::graphToJson(engine_->graph())}})
+                    .toJson(QJsonDocument::Indented));
+        if (!f.commit())
+            qWarning("mixd: could not save session %s", qPrintable(sessionPath_));
     }
 
     QJsonObject snapshot() const {
@@ -238,7 +291,8 @@ private:
     RenderCtx ctx_;
     QLocalServer server_;
     QList<QLocalSocket*> clients_;
-    QTimer pumpTimer_, meterTimer_, healthTimer_;
+    QTimer pumpTimer_, meterTimer_, healthTimer_, saveTimer_;
+    QString sessionPath_;
     double periodUs_ = 0;
     double windowSum_ = 0, windowMax_ = 0;
     std::uint64_t windowCount_ = 0;
@@ -248,7 +302,8 @@ private:
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
-    app.setApplicationName("mixd");
+    app.setOrganizationName("ProdMesh");
+    app.setApplicationName("Mix");
 
     QCommandLineParser p;
     p.addHelpOption();
@@ -258,6 +313,8 @@ int main(int argc, char** argv) {
         {"block", "Block size", "frames", "128"},
         {"workers", "Extra render threads", "n", "0"},
         {"socket", "Local socket name", "name", proto::kDefaultSocket},
+        {"session", "Session file", "path"},
+        {"fresh", "Start from the template, ignoring the saved session"},
         {"audible", "Send program to the device (default: silence)"},
     });
     p.process(app);
@@ -291,7 +348,12 @@ int main(int argc, char** argv) {
                                            p.value("workers").toInt(),
                                            p.isSet("audible"));
     QString why;
-    if (!daemon->start(p.value("socket"), &why)) {
+    const QString session =
+        p.isSet("session")
+            ? p.value("session")
+            : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
+                  "/session.json";
+    if (!daemon->start(p.value("socket"), session, p.isSet("fresh"), &why)) {
         qCritical("mixd: %s", qPrintable(why));
         return 1;
     }

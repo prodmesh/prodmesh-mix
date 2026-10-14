@@ -73,7 +73,7 @@ GraphDesc makeReferenceGraph(const RefParams& rp) {
         strip.faderDb = -6;
         if (i < rp.heavyInserts)
             strip.processing.inserts.push_back(
-                {InsertDesc::Type::CpuLoad, rp.heavyOpsPerSample});
+                InsertDesc::cpuLoad(rp.heavyOpsPerSample));
         g.nodes.push_back(strip);
 
         const float pan = lay.strips > 1

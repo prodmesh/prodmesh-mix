@@ -49,6 +49,11 @@ Engine::Engine(const EngineConfig& cfg) : cfg_(cfg) {
 
 Engine::~Engine() {
     pool_.reset();
+    // The driver has stopped (a documented precondition), so this thread
+    // stands in for the audio thread: stop plugins before they are
+    // deactivated and destroyed.
+    if (active_)
+        for (const auto& n : active_->nodes) n->stopProcessing();
     while (auto p = retired_.pop()) delete *p;
     while (auto p = pending_.pop()) delete *p;
     delete active_;
@@ -58,6 +63,7 @@ Engine::~Engine() {
 
 bool Engine::setGraph(const GraphDesc& g, std::string* error) {
     // Validate by compiling against nothing; the result is discarded.
+    // A dry run (no Live): structure only, no instances, no plugin loads.
     if (!compile(g, nullptr, nullptr, error, nullptr)) return false;
     desired_ = g;
     dirty_ = true;
@@ -174,6 +180,8 @@ void Engine::publish(std::unique_ptr<RenderPlan> plan, Live live,
     publishedNeedsCleanup_ = plan->needsCleanup;
     published_ = g;
     live_ = std::move(live);
+    publishedNodes_.clear();
+    for (const auto& n : plan->nodes) publishedNodes_.push_back(n.get());
     pending_.push(plan.release());  // gated by canPublish(); never full
 }
 
@@ -190,6 +198,7 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
     auto plan = std::make_unique<RenderPlan>();
     const bool first = !prev || publishedSerial_ == 0;
     plan->xfadeLen = first ? 0 : transitionSamples_;
+    const bool dry = !live;
     Live scratch;
     if (!live) live = &scratch;
 
@@ -257,8 +266,12 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
         } else if (old && inst) {
             if (addDying(*old, Key(d.id) | kShadow)) shadowed.insert(d.id);
         }
-        if (!s.node) {
+        if (!s.node && !dry) {
             auto fresh = std::make_shared<NodeInstance>(d, fs, cfg_.maxBlock);
+            for (const auto& w : fresh->warnings())
+                warnings_.push_back(
+                    (d.name.empty() ? "node " + std::to_string(d.id) : d.name) +
+                    ": " + w);
             s.node = fresh.get();
             plan->nodes.push_back(std::move(fresh));
         }
@@ -277,7 +290,7 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
                 plan->taps.push_back(tap);
             }
         // The instance that renders is always the last one pushed.
-        live->nodes[d.id] = plan->nodes.back();
+        if (!dry) live->nodes[d.id] = plan->nodes.back();
         live->levels[d.id] = lvl;
         protos.push_back(s);
         keys.push_back(Key(d.id));
@@ -422,6 +435,15 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
         if (!plan->steps[i].dying)
             plan->index.push_back({plan->steps[i].id, i});
     std::sort(plan->index.begin(), plan->index.end());
+
+    // Instances the running plan has and this one drops: the audio thread
+    // stops them (CLAP stop_processing) when it switches plans.
+    if (!dry)
+        for (NodeInstance* n : publishedNodes_) {
+            bool kept = false;
+            for (const auto& m : plan->nodes) kept = kept || m.get() == n;
+            if (!kept) plan->stopping.push_back(n);
+        }
     return plan;
 }
 
@@ -432,6 +454,7 @@ void Engine::activate(RenderPlan* plan) {
         // Unreachable while publication is gated; leaking beats freeing
         // on the audio thread.
     }
+    for (NodeInstance* n : plan->stopping) n->stopProcessing();
     active_ = plan;
     for (const auto& t : plan->edgeTargets)
         t.edge->setTargets(t.m, plan->xfadeLen);

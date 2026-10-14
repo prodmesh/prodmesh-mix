@@ -98,6 +98,9 @@ public:
     // Reads reset the accumulators, so one reader (the daemon) owns them.
     bool takeMeter(NodeId id, MeterReading& out);
 
+    // Plugins that failed to load (passed through), oldest first.
+    const std::vector<std::string>& warnings() const { return warnings_; }
+
     // Why the last publish attempt failed; empty when it did not.
     const std::string& lastError() const { return lastError_; }
 
@@ -150,6 +153,8 @@ private:
     std::uint64_t levelSeq_ = 0;
     std::string lastError_;
     Live live_;
+    std::vector<NodeInstance*> publishedNodes_;
+    std::vector<std::string> warnings_;
     std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps_;
 
     // Cross-thread.

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/ramp.h"
@@ -25,6 +26,9 @@ public:
     virtual ~Processor() = default;
     virtual void process(float* const* ch, int nch, int n) = 0;
     virtual int latencySamples() const { return 0; }
+    // Audio thread, once, before the instance leaves the graph (CLAP's
+    // stop_processing). Processing starts lazily on the first process().
+    virtual void stopProcessing() {}
 };
 
 class NodeInstance {
@@ -40,6 +44,13 @@ public:
     // the node's LevelState, after any crossfade.
     void process(float* const* ch, int n);
 
+    // Audio thread: the instance is about to leave the graph.
+    void stopProcessing();
+
+    // Inserts that failed to load and are passed through, as messages.
+    const std::vector<std::string>& warnings() const { return warnings_; }
+    int latencySamples() const;
+
 private:
     NodeId id_;
     NodeKind kind_;
@@ -53,6 +64,7 @@ private:
     dsp::Compressor comp_;
     dsp::Limiter limiter_;
     std::vector<std::unique_ptr<Processor>> inserts_;
+    std::vector<std::string> warnings_;
 };
 
 // Fader + mute for one node id. It outlives instance swaps (a crossfade

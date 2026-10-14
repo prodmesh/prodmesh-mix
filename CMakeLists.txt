@@ -47,8 +47,11 @@ add_library(mix_engine STATIC
     src/driver/sim_driver.cpp
     src/record/wav_writer.cpp
     src/record/recorder.cpp
+    src/plugin/plugin.cpp
+    src/plugin/clap_host.cpp
 )
 target_include_directories(mix_engine PUBLIC src)
+target_include_directories(mix_engine SYSTEM PRIVATE third_party/clap/include)
 if(APPLE)
     target_sources(mix_engine PRIVATE src/driver/coreaudio_driver.cpp)
     target_link_libraries(mix_engine PUBLIC
@@ -67,6 +70,7 @@ add_executable(mix-tests
     tests/test_core.cpp
     tests/test_engine.cpp
     tests/test_record.cpp
+    tests/test_plugin.cpp
     tools/bench_graph.cpp
 )
 target_include_directories(mix-tests PRIVATE tests tools)
@@ -104,3 +108,20 @@ if(Qt6_FOUND)
             MACOSX_BUNDLE_BUNDLE_NAME "ProdMesh Mix")
     endif()
 endif()
+
+# --- test plugin (CLAP) -----------------------------------------------------
+add_library(pm-test-clap MODULE tests/plugins/test_clap.cpp)
+target_include_directories(pm-test-clap SYSTEM PRIVATE third_party/clap/include)
+set_target_properties(pm-test-clap PROPERTIES OUTPUT_NAME "pm-test" PREFIX "")
+if(APPLE)
+    set_target_properties(pm-test-clap PROPERTIES BUNDLE TRUE
+        BUNDLE_EXTENSION clap)
+else()
+    set_target_properties(pm-test-clap PROPERTIES SUFFIX ".clap")
+endif()
+add_dependencies(mix-tests pm-test-clap)
+target_compile_definitions(mix-tests PRIVATE
+    PM_TEST_CLAP="$<TARGET_BUNDLE_DIR:pm-test-clap>")
+
+add_executable(mix-plugin tools/mix_plugin.cpp)
+target_link_libraries(mix-plugin PRIVATE mix_engine)

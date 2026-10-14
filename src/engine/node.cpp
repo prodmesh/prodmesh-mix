@@ -1,5 +1,7 @@
 #include "engine/node.h"
 
+#include "plugin/plugin.h"
+
 #include <algorithm>
 #include <cmath>
 #include <numbers>
@@ -80,7 +82,7 @@ NodeDesc* GraphDesc::find(NodeId id) {
     return nullptr;
 }
 
-NodeInstance::NodeInstance(const NodeDesc& d, double fs, int /*maxBlock*/)
+NodeInstance::NodeInstance(const NodeDesc& d, double fs, int maxBlock)
     : id_(d.id),
       kind_(d.kind),
       channels_(d.channels < 1 ? 1 : d.channels > 2 ? 2 : d.channels),
@@ -103,8 +105,27 @@ NodeInstance::NodeInstance(const NodeDesc& d, double fs, int /*maxBlock*/)
         case InsertDesc::Type::CpuLoad:
             inserts_.push_back(std::make_unique<CpuLoadInsert>(ins.value));
             break;
+        case InsertDesc::Type::Plugin: {
+            std::string err;
+            if (auto proc = plugin::load(ins.format, ins.path, ins.pluginId,
+                                         fs, maxBlock, channels_, &err))
+                inserts_.push_back(std::move(proc));
+            else
+                warnings_.push_back(err);  // the insert is passed through
+            break;
+        }
         }
     }
+}
+
+void NodeInstance::stopProcessing() {
+    for (auto& ins : inserts_) ins->stopProcessing();
+}
+
+int NodeInstance::latencySamples() const {
+    int total = 0;
+    for (const auto& ins : inserts_) total += ins->latencySamples();
+    return total;
 }
 
 void NodeInstance::process(float* const* ch, int n) {

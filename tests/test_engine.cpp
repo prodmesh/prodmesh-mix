@@ -96,7 +96,7 @@ bool identical(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 GraphDesc withInsert(GraphDesc g, NodeId id, float dB) {
-    g.find(id)->processing.inserts.push_back({InsertDesc::Type::Gain, dB});
+    g.find(id)->processing.inserts.push_back(InsertDesc::gain(dB));
     return g;
 }
 

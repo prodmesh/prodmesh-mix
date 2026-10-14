@@ -123,7 +123,7 @@ void randomEdit(Engine& e, std::mt19937& rng, int strips) {
         auto* n = g.find(id);
         if (!n) return;
         auto& ins = n->processing.inserts;
-        if (ins.empty()) ins.push_back({InsertDesc::Type::Gain, -3});
+        if (ins.empty()) ins.push_back(InsertDesc::gain(-3));
         else ins.clear();
     } else {
         auto it = std::find_if(g.edges.begin(), g.edges.end(), [&](auto& d) {

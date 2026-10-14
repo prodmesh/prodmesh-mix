@@ -30,13 +30,25 @@ struct EqBand {
     bool operator==(const EqBand&) const = default;
 };
 
-// Stand-ins for third-party plugins until hosting lands: a gain stage, and a
-// CPU burner that lets benches model heavy plugin loads.
+// An insert: a built-in test processor or a third-party plugin.
+// Gain and CpuLoad exist for tests and benches (CpuLoad models a heavy
+// plugin); Plugin names a CLAP/VST3 plugin by bundle path and id.
 struct InsertDesc {
-    enum class Type : std::uint8_t { Gain, CpuLoad };
+    enum class Type : std::uint8_t { Gain, CpuLoad, Plugin };
     Type type = Type::Gain;
     float value = 0;  // Gain: dB. CpuLoad: extra multiply-adds per sample.
+    std::string format, path, pluginId;  // Plugin only
     bool operator==(const InsertDesc&) const = default;
+
+    static InsertDesc gain(float dB) { return {Type::Gain, dB, {}, {}, {}}; }
+    static InsertDesc cpuLoad(float ops) {
+        return {Type::CpuLoad, ops, {}, {}, {}};
+    }
+    static InsertDesc plugin(std::string format, std::string path,
+                             std::string id) {
+        return {Type::Plugin, 0, std::move(format), std::move(path),
+                std::move(id)};
+    }
 };
 
 // The processing chain. Any change here is structural: the engine builds a

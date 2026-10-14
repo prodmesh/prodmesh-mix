@@ -58,6 +58,8 @@ struct RenderPlan {
     std::vector<std::shared_ptr<LevelState>> levelStates;
     std::vector<std::shared_ptr<MeterState>> meters;
     std::vector<std::shared_ptr<RecordTap>> taps;
+    // Instances of the previous plan this one drops (owned by that plan).
+    std::vector<NodeInstance*> stopping;
 
     std::unique_ptr<float[]> storage;
     std::vector<float*> chan;

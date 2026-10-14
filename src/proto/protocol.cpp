@@ -54,10 +54,23 @@ QJsonObject processingToJson(const ProcessingDesc& p) {
                                  {"q", b.q},
                                  {"gainDb", b.gainDb}});
     QJsonArray inserts;
-    for (const auto& i : p.inserts)
-        inserts.append(QJsonObject{
-            {"type", i.type == InsertDesc::Type::Gain ? "gain" : "cpuLoad"},
-            {"value", i.value}});
+    for (const auto& i : p.inserts) {
+        switch (i.type) {
+        case InsertDesc::Type::Gain:
+            inserts.append(QJsonObject{{"type", "gain"}, {"value", i.value}});
+            break;
+        case InsertDesc::Type::CpuLoad:
+            inserts.append(QJsonObject{{"type", "cpuLoad"}, {"value", i.value}});
+            break;
+        case InsertDesc::Type::Plugin:
+            inserts.append(QJsonObject{
+                {"type", "plugin"},
+                {"format", QString::fromStdString(i.format)},
+                {"path", QString::fromStdString(i.path)},
+                {"id", QString::fromStdString(i.pluginId)}});
+            break;
+        }
+    }
     const auto& g = p.gateParams;
     const auto& c = p.compParams;
     return QJsonObject{
@@ -129,10 +142,16 @@ void processingFromJson(const QJsonObject& o, ProcessingDesc& p) {
     p.inserts.clear();
     for (const auto& v : o["inserts"].toArray()) {
         const auto i = v.toObject();
-        p.inserts.push_back({i["type"].toString() == "cpuLoad"
-                                 ? InsertDesc::Type::CpuLoad
-                                 : InsertDesc::Type::Gain,
-                             num(i, "value", 0)});
+        const auto type = i["type"].toString();
+        InsertDesc d;
+        d.type = type == "cpuLoad"  ? InsertDesc::Type::CpuLoad
+                 : type == "plugin" ? InsertDesc::Type::Plugin
+                                    : InsertDesc::Type::Gain;
+        d.value = num(i, "value", 0);
+        d.format = i["format"].toString().toStdString();
+        d.path = i["path"].toString().toStdString();
+        d.pluginId = i["id"].toString().toStdString();
+        p.inserts.push_back(std::move(d));
     }
 }
 

@@ -3,7 +3,7 @@
 // Interaction rules (console conventions, not DAW quirks):
 //   - dragging moves the fader relative to where you grabbed it; clicking
 //     the track never jumps it (no accidental level changes on air)
-//   - Option/Alt while dragging or scrolling = fine (x0.1)
+//   - Option or Cmd while dragging or scrolling = fine (x0.1)
 //   - Option-click resets any control to its zero (fader/gain/send 0 dB,
 //     pan centre); an Option-press that moves is a fine drag instead.
 //     Double-click does the same. Scroll = 0.5 dB per notch
@@ -59,6 +59,12 @@ struct FaderLaw {
         return kFaderMinDb;
     }
 };
+
+// Fine adjustment: Option (Logic, Ableton) or Cmd (Pro Tools) while
+// dragging or scrolling. Qt reports Cmd as ControlModifier on macOS.
+inline bool fine(Qt::KeyboardModifiers m) {
+    return m & (Qt::AltModifier | Qt::ControlModifier);
+}
 
 // Option-click = reset. Armed on an Option-press, disarmed once the
 // pointer moves (then it is a fine drag), fired on release.
@@ -247,7 +253,7 @@ protected:
     }
     void mouseMoveEvent(QMouseEvent* e) override {
         if (alt_.holding(e) || !dragging_) return;
-        const float scale = e->modifiers() & Qt::AltModifier ? 0.1f : 1.0f;
+        const float scale = fine(e->modifiers()) ? 0.1f : 1.0f;
         const float dp = float(grabY_ - e->position().y()) /
                          float(travel().height()) * scale;
         if (scale != lastScale_) {  // re-anchor so switching modes never jumps
@@ -268,7 +274,7 @@ protected:
         if (capRect().adjusted(-6, -4, 6, 4).contains(e->pos())) commit(0);
     }
     void wheelEvent(QWheelEvent* e) override {
-        const float step = e->modifiers() & Qt::AltModifier ? 0.1f : 0.5f;
+        const float step = fine(e->modifiers()) ? 0.1f : 0.5f;
         const int notches = e->angleDelta().y() / 120;
         if (!notches) return;
         float d = db_ <= -89.95f ? -90.0f : db_;
@@ -498,7 +504,7 @@ public:
         setFixedHeight(20);
         setCursor(Qt::SizeVerCursor);
         setToolTip("Input gain — before EQ, dynamics and inserts.\n"
-                   "Drag up/down (hold Option for fine); Option-click for 0 dB.");
+                   "Drag up/down (hold Option or Cmd for fine); Option-click for 0 dB.");
     }
     void setGain(float dB) {
         if (dragging_) return;
@@ -540,7 +546,7 @@ protected:
     }
     void mouseMoveEvent(QMouseEvent* e) override {
         if (alt_.holding(e) || !dragging_) return;
-        const float perPx = e->modifiers() & Qt::AltModifier ? 0.02f : 0.2f;
+        const float perPx = fine(e->modifiers()) ? 0.02f : 0.2f;
         if (perPx != lastPerPx_) {  // re-anchor when switching fine/coarse
             grabY_ = e->position().y();
             grabGain_ = gain_;
@@ -771,7 +777,7 @@ protected:
                 moved_ = true;
                 grabY_ = e->position().y();
             }
-            const float perPx = e->modifiers() & Qt::AltModifier ? 0.025f : 0.25f;
+            const float perPx = fine(e->modifiers()) ? 0.025f : 0.25f;
             if (perPx != lastPerPx_) {  // re-anchor when switching fine/coarse
                 grabY_ = e->position().y();
                 grabDb_ = rows_[dragRow_].db;
@@ -859,7 +865,7 @@ public:
         setFixedHeight(18);
         setCursor(Qt::SizeHorCursor);
         setToolTip("Pan (balance on a stereo channel).\nDrag left/right (hold "
-                   "Option for fine); Option-click to centre.");
+                   "Option or Cmd for fine); Option-click to centre.");
     }
     void setPan(float p) {
         if (dragging_ || p == pan_) return;
@@ -911,7 +917,7 @@ protected:
     }
     void mouseMoveEvent(QMouseEvent* e) override {
         if (alt_.holding(e) || !dragging_) return;
-        const float perPx = e->modifiers() & Qt::AltModifier ? 0.002f : 0.02f;
+        const float perPx = fine(e->modifiers()) ? 0.002f : 0.02f;
         if (perPx != lastPerPx_) {
             grabX_ = e->position().x();
             grabPan_ = pan_;

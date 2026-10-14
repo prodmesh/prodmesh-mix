@@ -215,7 +215,7 @@ parameter automation, sharing one host across channels.
   no program audio).
 - Faders never jump on a click; drags are relative; Option-click (or
   double-click) resets any control to its zero: 0 dB, pan centre, a
-  mix-minus send back to automatic. Option-drag = fine.
+  mix-minus send back to automatic. Option- or Cmd-drag = fine.
 - Colour only for meaning: accent = signal/OK, amber = hot, red =
   clip/mute/fault. Theme tokens live in `src/ui/theme.h` (from RTA).
 - Look at a `--screenshot` of every UI change before calling it done.

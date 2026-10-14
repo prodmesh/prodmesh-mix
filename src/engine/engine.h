@@ -38,6 +38,7 @@ class NodeInstance;
 class EdgeInstance;
 class LevelState;
 class MeterState;
+class RecordTap;
 class WorkerPool;
 struct RenderPlan;
 
@@ -86,6 +87,12 @@ public:
     bool settled() const;
 
     const GraphDesc& graph() const { return desired_; }
+
+    // Recording taps by node: each node's post-fader output is pushed into
+    // its tap every block. Replaces the previous set; takes effect with the
+    // next plan (no change to the audio itself).
+    void setRecordTaps(
+        std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps);
 
     // Post-fader meters since the last read; false for an unknown node.
     // Reads reset the accumulators, so one reader (the daemon) owns them.
@@ -143,6 +150,7 @@ private:
     std::uint64_t levelSeq_ = 0;
     std::string lastError_;
     Live live_;
+    std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps_;
 
     // Cross-thread.
     SpscQueue<RenderPlan*> pending_{8};
@@ -153,6 +161,8 @@ private:
 
     // Audio-thread state.
     RenderPlan* active_ = nullptr;
+    std::uint64_t sampleTime_ = 0;  // frames rendered since start
+    std::uint64_t sliceTime_ = 0;   // sampleTime_ at the current slice
     std::unique_ptr<WorkerPool> pool_;
 
     friend class WorkerPool;

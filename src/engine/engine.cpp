@@ -142,6 +142,13 @@ void Engine::pump() {
     }
 }
 
+void Engine::setRecordTaps(
+    std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps) {
+    taps_ = std::move(taps);
+    dirty_ = true;
+    pump();
+}
+
 bool Engine::takeMeter(NodeId id, MeterReading& out) {
     auto it = live_.meters.find(id);
     if (it == live_.meters.end()) return false;
@@ -264,6 +271,11 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
         s.meter = meter.get();
         plan->meters.push_back(meter);
         live->meters[d.id] = meter;
+        for (const auto& [id, tap] : taps_)
+            if (id == d.id && tap->channels() == d.channels) {
+                s.tap = tap.get();
+                plan->taps.push_back(tap);
+            }
         // The instance that renders is always the last one pushed.
         live->nodes[d.id] = plan->nodes.back();
         live->levels[d.id] = lvl;
@@ -483,6 +495,7 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
     // Dying steps keep their level; their edges carry the fade.
     s.level->apply(buf, s.nch, frames);
     if (s.meter && !s.dying) s.meter->accumulate(buf, frames);
+    if (s.tap && !s.dying) s.tap->push(buf, frames, sliceTime_);
 }
 
 void Engine::process(const float* const* in, int numIn, float* const* out,
@@ -508,6 +521,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out,
         for (int c = 0; c < ins; ++c)
             slice[c] = in && in[c] ? in[c] + off : nullptr;
 
+        sliceTime_ = sampleTime_;  // read by workers after the gen bump
         if (pool_)
             pool_->run(p, slice, ins, n);
         else
@@ -528,6 +542,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out,
             }
         }
 
+        sampleTime_ += std::uint64_t(n);
         if (p.fading()) {
             p.xfadePos += n;
             if (!p.fading())

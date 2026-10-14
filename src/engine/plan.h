@@ -11,6 +11,7 @@
 
 #include "engine/graph.h"
 #include "engine/node.h"
+#include "record/record_tap.h"
 
 namespace pm {
 
@@ -26,6 +27,7 @@ struct PlanStep {
     NodeInstance* fadeOut = nullptr;  // old instance during a crossfade
     LevelState* level = nullptr;
     MeterState* meter = nullptr;
+    RecordTap* tap = nullptr;
     int nch = 1;
     int buf = 0;      // first channel in RenderPlan::chan
     int fadeBuf = 0;  // first scratch channel for fadeOut
@@ -55,6 +57,7 @@ struct RenderPlan {
     std::vector<std::shared_ptr<EdgeInstance>> edges;
     std::vector<std::shared_ptr<LevelState>> levelStates;
     std::vector<std::shared_ptr<MeterState>> meters;
+    std::vector<std::shared_ptr<RecordTap>> taps;
 
     std::unique_ptr<float[]> storage;
     std::vector<float*> chan;

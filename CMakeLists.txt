@@ -45,6 +45,8 @@ add_library(mix_engine STATIC
     src/engine/engine.cpp
     src/engine/worker_pool.cpp
     src/driver/sim_driver.cpp
+    src/record/wav_writer.cpp
+    src/record/recorder.cpp
 )
 target_include_directories(mix_engine PUBLIC src)
 if(APPLE)
@@ -64,6 +66,7 @@ add_executable(mix-tests
     tests/test_main.cpp
     tests/test_core.cpp
     tests/test_engine.cpp
+    tests/test_record.cpp
     tools/bench_graph.cpp
 )
 target_include_directories(mix-tests PRIVATE tests tools)

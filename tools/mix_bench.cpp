@@ -19,6 +19,7 @@
 #include "core/rt_guard.h"
 #include "driver/driver.h"
 #include "engine/engine.h"
+#include "record/recorder.h"
 
 using namespace pm;
 
@@ -36,6 +37,10 @@ struct Options {
     double editsPerSecond = 0;
     bool json = false;
     bool audible = false;  // coreaudio: send the render to the speakers
+    std::string recordDir;  // record every source + program (T0-8)
+    int stallMs = 0;        // stall the disk writer this long ...
+    double stallAt = 5;     // ... this many seconds in
+    double ringSeconds = 30;
 };
 
 void usage() {
@@ -43,7 +48,8 @@ void usage() {
         "mix-bench [--paths N] [--rate HZ] [--block N] [--seconds S]\n"
         "          [--driver sim|free|coreaudio] [--workers N]\n"
         "          [--heavy N] [--heavy-ops N] [--edits PER_SEC] [--json]\n"
-        "          [--audible]   (coreaudio renders silence unless set)");
+        "          [--audible]   (coreaudio renders silence unless set)\n"
+        "          [--record DIR [--stall-ms MS] [--stall-at S] [--ring-seconds S]]");
 }
 
 bool parse(int argc, char** argv, Options& o) {
@@ -63,6 +69,10 @@ bool parse(int argc, char** argv, Options& o) {
         else if (is("--edits")) o.editsPerSecond = std::atof(val());
         else if (is("--json")) o.json = true;
         else if (is("--audible")) o.audible = true;
+        else if (is("--record")) o.recordDir = val();
+        else if (is("--stall-ms")) o.stallMs = std::atoi(val());
+        else if (is("--stall-at")) o.stallAt = std::atof(val());
+        else if (is("--ring-seconds")) o.ringSeconds = std::atof(val());
         else return false;
     }
     return true;
@@ -173,6 +183,30 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    std::unique_ptr<rec::Recorder> recorder;
+    std::vector<std::shared_ptr<RecordTap>> allTaps;
+    if (!o.recordDir.empty()) {
+        const auto& g = engine.graph();
+        std::vector<rec::TrackSpec> tracks;
+        std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps;
+        const auto ring = std::size_t(o.ringSeconds * cfg.sampleRate);
+        for (const auto& n : g.nodes)
+            if (n.kind == NodeKind::Generator || n.id == bench::kProgram) {
+                auto tap = std::make_shared<RecordTap>(n.channels, ring);
+                tracks.push_back({n.id, n.name, tap});
+                taps.push_back({n.id, tap});
+                allTaps.push_back(tap);
+            }
+        rec::RecorderOptions ro;
+        ro.sampleRate = std::uint32_t(cfg.sampleRate);
+        recorder = std::make_unique<rec::Recorder>(ro);
+        if (!recorder->start(o.recordDir, std::move(tracks), &err)) {
+            std::fprintf(stderr, "record: %s\n", err.c_str());
+            return 1;
+        }
+        engine.setRecordTaps(std::move(taps));
+    }
+
     rt::resetViolations();
     RenderCtx rctx{&engine, o.driver == "coreaudio" && !o.audible};
     if (!driver->start(&render, &rctx, &err)) {
@@ -181,6 +215,8 @@ int main(int argc, char** argv) {
     }
 
     Histogram hist;
+    bool stalled = false;
+    double maxFill = 0;
     std::mt19937 rng(42);
     std::uint64_t edits = 0;
     const auto strips = bench::layoutFor(o.paths).strips;
@@ -193,6 +229,16 @@ int main(int argc, char** argv) {
         if (elapsed >= o.seconds) break;
         engine.pump();
         while (auto s = driver->stats().samples.pop()) hist.add(s->durationNs);
+        if (recorder) {
+            if (o.stallMs && !stalled && elapsed >= o.stallAt) {
+                recorder->simulateStall(o.stallMs);
+                stalled = true;
+            }
+            // Straight from the rings: the writer's own stats freeze while
+            // it is stalled.
+            for (const auto& t : allTaps)
+                maxFill = std::max(maxFill, double(t->fill()));
+        }
         if (o.editsPerSecond > 0 && now >= nextEdit) {
             randomEdit(engine, rng, strips);
             ++edits;
@@ -210,6 +256,16 @@ int main(int argc, char** argv) {
     }
     driver->stop();
     while (auto s = driver->stats().samples.pop()) hist.add(s->durationNs);
+    std::uint64_t recDropped = 0, recFrames = 0;
+    std::size_t recTracks = 0;
+    if (recorder) {
+        recorder->stop();
+        for (const auto& t : recorder->stats()) {
+            recDropped += t.droppedFrames;
+            recFrames = std::max(recFrames, t.framesWritten);
+            ++recTracks;
+        }
+    }
 
     const double periodUs = 1e6 * cfg.blockSize / cfg.sampleRate;
     const double meanUs = hist.count ? double(hist.sumNs / hist.count) / 1e3 : 0;
@@ -253,6 +309,11 @@ int main(int argc, char** argv) {
                     "(T0-2 target < 70%%)\n",
                     100 * meanUs / periodUs, 100 * maxUs / periodUs);
     }
+    if (recorder && !o.json)
+        std::printf("recording: %zu tracks, %.1f s each, dropped %llu frames, "
+                    "ring peak %.0f%% (stall %d ms)\n",
+                    recTracks, double(recFrames) / cfg.sampleRate,
+                    (unsigned long long)recDropped, 100 * maxFill, o.stallMs);
     const bool freeRun = o.driver == "free";
-    return (!freeRun && xruns) || viol ? 1 : 0;
+    return (!freeRun && xruns) || viol || recDropped ? 1 : 0;
 }

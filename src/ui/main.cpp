@@ -99,6 +99,15 @@ public:
         worstLoad_ = std::max(worstLoad_ * 0.9, h["worstLoad"].toDouble());
         xruns_ = qint64(h["xruns"].toDouble());
         rtViolations_ = qint64(h["rtViolations"].toDouble());
+        const auto r = h["recording"].toObject();
+        recOn_ = r["on"].toBool();
+        recSeconds_ = r["seconds"].toDouble();
+        recTracks_ = r["tracks"].toInt();
+        recDropped_ = qint64(r["droppedFrames"].toDouble());
+        recDroppedSeconds_ = r["droppedSeconds"].toDouble();
+        recRingFill_ = r["ringFill"].toDouble();
+        recDiskSeconds_ = r["diskSecondsLeft"].toDouble();
+        recError_ = r["error"].toString();
         update();
     }
 
@@ -134,11 +143,14 @@ protected:
         p.drawEllipse(QPoint(pill.left() + 11, pill.center().y() + 1), 4, 4);
         p.setPen(col);
         p.drawText(pill.adjusted(20, 0, 0, 0), Qt::AlignVCenter, state);
+        int left = pill.right() + 12;
         if (connected_) {
             p.setPen(theme::text);
-            p.drawText(QRect(pill.right() + 12, 0, 200, height()),
-                       Qt::AlignVCenter, format_);
+            const int fw = p.fontMetrics().horizontalAdvance(format_);
+            p.drawText(QRect(left, 0, fw, height()), Qt::AlignVCenter, format_);
+            left += fw + 18;
         }
+        if (connected_ && recOn_) paintRecording(p, left);
 
         // Right side: DSP load bar, xruns — only while they are live.
         if (!connected_) return;
@@ -179,7 +191,57 @@ protected:
     }
 
 private:
+    // "● REC 01:23:45 · 9 tracks · 41 h disk" — red while healthy (red is
+    // the universal record colour); amber text when the disk or the
+    // writer needs attention.
+    void paintRecording(QPainter& p, int x) {
+        const int s = int(recSeconds_);
+        const QString clock = QString("%1:%2:%3")
+                                  .arg(s / 3600, 2, 10, QChar('0'))
+                                  .arg(s / 60 % 60, 2, 10, QChar('0'))
+                                  .arg(s % 60, 2, 10, QChar('0'));
+        const QRect pill(x, 12, 98, 20);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(229, 72, 77, 40));
+        p.drawRoundedRect(pill, 10, 10);
+        p.setBrush(theme::clip);
+        p.drawEllipse(QPoint(pill.left() + 11, pill.center().y() + 1), 4, 4);
+        p.setPen(QColor("#ffd9db"));
+        p.drawText(pill.adjusted(20, 0, 0, 0), Qt::AlignVCenter,
+                   "REC " + clock);
+
+        const double hours = recDiskSeconds_ / 3600.0;
+        QString detail = QString("%1 tracks · %2 disk")
+                             .arg(recTracks_)
+                             .arg(hours >= 1 ? QString("%1 h").arg(int(hours))
+                                             : QString("%1 min").arg(
+                                                   int(recDiskSeconds_ / 60)));
+        bool attention = hours < 2;
+        if (recDropped_ > 0) {
+            detail += QString(" · %1 s of gaps").arg(recDroppedSeconds_, 0, 'f', 1);
+            attention = true;
+        }
+        if (recRingFill_ > 0.5) {
+            detail += QString(" · disk slow (%1% buffered)")
+                          .arg(int(recRingFill_ * 100));
+            attention = true;
+        }
+        if (!recError_.isEmpty()) {
+            detail += " · " + recError_;
+            attention = true;
+        }
+        p.setPen(attention ? theme::warn : theme::text);
+        p.drawText(QRect(pill.right() + 10, 0, 520, height()),
+                   Qt::AlignVCenter, detail);
+    }
+
     bool connected_ = false;
+    bool recOn_ = false;
+    double recSeconds_ = 0, recRingFill_ = 0, recDiskSeconds_ = 0;
+    double recDroppedSeconds_ = 0;
+    int recTracks_ = 0;
+    qint64 recDropped_ = 0;
+    QString recError_;
     QString format_;
     double meanLoad_ = 0, worstLoad_ = 0;
     qint64 xruns_ = 0, rtViolations_ = 0;

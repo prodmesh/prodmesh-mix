@@ -23,6 +23,8 @@ an allocation/lock on the audio thread.
 | `src/proto/` | Control protocol (JSON lines over a local socket), graph <-> JSON; Qt Core |
 | `src/daemon/` | `mixd`, the engine daemon (Tier 0 process), and built-in show templates |
 | `src/ui/` | `ProdMeshMix.app`, the mixer client: theme tokens (mirrors RTA), strip/fader/meter widgets |
+| `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread) |
+| `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
 | `tools/t05_ui_isolation.py` | T0-5 gate: SIGKILL the UI repeatedly under load, check 0 xruns and < 2 s reconnect |
 | `tools/mix_bench.cpp` | Tier 0 bench: reference graph on a driver, timing histogram, live edits |
 | `tools/bench_graph.*` | The reference graph shared by bench and tests |
@@ -111,6 +113,19 @@ cmake -S . -B build -G Ninja && cmake --build build
   on this machine: worst callback 40% -> 19% of the period.
 - clangd may show false errors until `build/compile_commands.json` exists
   (it is symlinked to the repo root by the first configure).
+
+## Recording
+
+`mixd --record DIR` records every source (raw) and the program bus from
+engine start, one take folder per run, files named after their strips.
+Taps hang off plan steps like meters; the audio thread only copies into a
+ring. Rules: the disk writer may block, the audio thread may not; a full
+ring drops the block and queues a gap, which the writer fills with
+silence so all files of a take stay sample-aligned. T0-8 check:
+`mix-bench --record DIR --stall-ms 10000` (must drop 0 frames with the
+default 30 s rings; a 5 s ring must report drops but keep 0 xruns).
+Power-loss durability (F_FULLFSYNC) is not done yet — fsync covers process
+and OS crashes only.
 
 ## UX rules (spec: UX principles)
 

@@ -4,10 +4,15 @@
 //
 //   mixd [--driver coreaudio|sim] [--rate HZ] [--block N] [--workers N]
 //        [--socket NAME] [--session FILE] [--fresh] [--audible]
+//        [--record DIR] [--ring-seconds S]
 //
 // The show is saved to --session (default: the app data dir) within half a
 // second of any change, atomically, and reloaded on start — restarting the
 // engine never loses the mix.
+//
+// With --record, every source (raw) and the program bus are recorded from
+// the moment the engine starts, one take folder per run. Files a crash
+// left unfinished are repaired on the next start.
 #include <QCommandLineParser>
 #include <QCoreApplication>
 #include <QJsonArray>
@@ -31,6 +36,12 @@
 #include "driver/driver.h"
 #include "engine/engine.h"
 #include "proto/protocol.h"
+#include "record/recorder.h"
+#include "record/wav_writer.h"
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QDirIterator>
+#include <QStorageInfo>
 
 using namespace pm;
 
@@ -78,7 +89,13 @@ public:
 
     ~Daemon() override {
         if (driver_) driver_->stop();  // before the engine goes away
+        if (recorder_) recorder_->stop();  // drains what the taps hold
         if (saveTimer_.isActive()) saveSession();
+    }
+
+    void setRecording(const QString& dir, double ringSeconds) {
+        recordDir_ = dir;
+        ringSeconds_ = ringSeconds;
     }
 
     bool start(const QString& socketName, const QString& session, bool fresh,
@@ -92,6 +109,7 @@ public:
             *error = QString::fromStdString(err);
             return false;
         }
+        if (!recordDir_.isEmpty() && !startTake(error)) return false;
         if (!driver_->start(&render, &ctx_, &err)) {
             *error = QString::fromStdString(err);
             return false;
@@ -183,6 +201,107 @@ private:
         }
     }
 
+    // Repairs WAVs whose header lags their data (the engine died mid-take).
+    void recoverUnfinished() {
+        QDirIterator it(recordDir_, {"*.wav"}, QDir::Files,
+                        QDirIterator::Subdirectories);
+        int fixed = 0;
+        while (it.hasNext()) {
+            const auto path = it.next().toStdString();
+            rec::WavInfo info;
+            if (!rec::WavWriter::readInfo(path, info) || !info.channels)
+                continue;
+            const auto bytes = std::uint64_t(QFileInfo(it.filePath()).size()) -
+                               info.dataOffset;
+            if (bytes / (std::uint64_t(info.channels) * 4) > info.frames &&
+                rec::WavWriter::recover(path, nullptr))
+                ++fixed;
+        }
+        if (fixed)
+            qInfo("mixd: repaired %d recording(s) left unfinished by a crash",
+                  fixed);
+    }
+
+    // Sources are named after the strip they feed ("Host", not "Host
+    // source"); the program bus records post-limiter.
+    bool startTake(QString* error) {
+        recoverUnfinished();
+        const auto& g = engine_->graph();
+        std::vector<rec::TrackSpec> tracks;
+        std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps;
+        const auto ring = std::size_t(ringSeconds_ * driver_->config().sampleRate);
+        auto add = [&](const NodeDesc& n, std::string name) {
+            auto tap = std::make_shared<RecordTap>(n.channels, ring);
+            tracks.push_back({n.id, std::move(name), tap});
+            taps.push_back({n.id, tap});
+        };
+        for (const auto& n : g.nodes) {
+            if (n.kind != NodeKind::Input && n.kind != NodeKind::Generator)
+                continue;
+            std::string name = n.name;
+            for (const auto& e : g.edges)
+                if (e.from == n.id)
+                    if (const auto* to = g.find(e.to);
+                        to && to->kind == NodeKind::Strip) {
+                        name = to->name;
+                        break;
+                    }
+            add(n, name);
+        }
+        for (const auto& e : g.edges) {
+            const auto* to = g.find(e.to);
+            const auto* from = g.find(e.from);
+            if (to && from && to->kind == NodeKind::Output &&
+                to->ioChannel == 0 && from->kind == NodeKind::Bus)
+                add(*from, from->name.empty() ? "Program" : from->name);
+        }
+        takeName_ = QDateTime::currentDateTime().toString("yyyy-MM-dd HHmmss");
+        rec::RecorderOptions ro;
+        ro.sampleRate = std::uint32_t(driver_->config().sampleRate);
+        recorder_ = std::make_unique<rec::Recorder>(ro);
+        std::string err;
+        if (!recorder_->start((recordDir_ + "/" + takeName_).toStdString(),
+                              std::move(tracks), &err)) {
+            *error = QString::fromStdString(err);
+            return false;
+        }
+        engine_->setRecordTaps(std::move(taps));
+        takeClock_.start();
+        qInfo("mixd: recording take \"%s\" to %s", qPrintable(takeName_),
+              qPrintable(recordDir_));
+        return true;
+    }
+
+    QJsonObject recordingHealth() const {
+        if (!recorder_) return {{"on", false}};
+        std::uint64_t dropped = 0;
+        double fill = 0;
+        const auto stats = recorder_->stats();
+        for (const auto& t : stats) {
+            dropped += t.droppedFrames;
+            fill = std::max(fill, double(t.ringFill));
+        }
+        const QStorageInfo disk(recordDir_);
+        const double bytesPerSec =
+            double(stats.size()) * 2 * 4 * driver_->config().sampleRate;
+        return {{"on", true},
+                {"take", takeName_},
+                {"seconds", takeClock_.elapsed() / 1000.0},
+                {"tracks", int(stats.size())},
+                {"droppedFrames", double(dropped)},
+                {"droppedSeconds",
+                 stats.empty() ? 0.0
+                               : double(dropped) / double(stats.size()) /
+                                     driver_->config().sampleRate},
+                {"ringFill", fill},
+                {"diskFreeBytes", double(disk.bytesAvailable())},
+                // Upper bound (stereo for every track) — errs on the safe side.
+                {"diskSecondsLeft",
+                 bytesPerSec > 0 ? double(disk.bytesAvailable()) / bytesPerSec
+                                 : 0.0},
+                {"error", QString::fromStdString(recorder_->lastError())}};
+    }
+
     bool loadSession(GraphDesc& out) {
         QFile f(sessionPath_);
         if (!f.open(QIODevice::ReadOnly)) return false;
@@ -262,7 +381,8 @@ private:
                    {"worstLoad", windowMax_ / periodUs_},
                    {"rtViolations", double(rt::violations())},
                    {"settled", engine_->settled()},
-                   {"lastError", QString::fromStdString(engine_->lastError())}},
+                   {"lastError", QString::fromStdString(engine_->lastError())},
+                   {"recording", recordingHealth()}},
                   nullptr);
         windowSum_ = windowMax_ = 0;
         windowCount_ = 0;
@@ -293,6 +413,10 @@ private:
     QList<QLocalSocket*> clients_;
     QTimer pumpTimer_, meterTimer_, healthTimer_, saveTimer_;
     QString sessionPath_;
+    QString recordDir_, takeName_;
+    double ringSeconds_ = 30;
+    QElapsedTimer takeClock_;
+    std::unique_ptr<rec::Recorder> recorder_;
     double periodUs_ = 0;
     double windowSum_ = 0, windowMax_ = 0;
     std::uint64_t windowCount_ = 0;
@@ -316,6 +440,8 @@ int main(int argc, char** argv) {
         {"session", "Session file", "path"},
         {"fresh", "Start from the template, ignoring the saved session"},
         {"audible", "Send program to the device (default: silence)"},
+        {"record", "Record every source and the program bus here", "dir"},
+        {"ring-seconds", "Per-track disk buffer (T0-8 headroom)", "s", "30"},
     });
     p.process(app);
 
@@ -348,6 +474,9 @@ int main(int argc, char** argv) {
                                            p.value("workers").toInt(),
                                            p.isSet("audible"));
     QString why;
+    if (p.isSet("record"))
+        daemon->setRecording(p.value("record"),
+                             p.value("ring-seconds").toDouble());
     const QString session =
         p.isSet("session")
             ? p.value("session")

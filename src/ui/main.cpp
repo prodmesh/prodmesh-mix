@@ -796,8 +796,8 @@ private:
             } else {
                 r.state = e.mute ? SendList::State::Muted : SendList::State::On;
                 r.tip = QString("Send to %1: %2 dB %3 the fader%4.\nDot = on/off; "
-                                "drag = level (Option = fine); click for "
-                                "pre/post, %5 and remove.")
+                                "drag = level (Option = fine); Option-click = %5; "
+                                "click for pre/post and remove.")
                             .arg(r.label, fmtDb(r.db), e.preFader ? "before" : "after",
                                  e.mute ? " (off)" : "",
                                  isMixMinus(e.to) ? "back to automatic" : "0 dB");

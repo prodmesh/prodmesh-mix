@@ -213,7 +213,9 @@ parameter automation, sharing one host across channels.
 - Never show stale data as if it were live: on disconnect, meters empty
   and health numbers disappear; a banner says what it means (no engine =
   no program audio).
-- Faders never jump on a click; drags are relative; double-click = 0 dB.
+- Faders never jump on a click; drags are relative; Option-click (or
+  double-click) resets any control to its zero: 0 dB, pan centre, a
+  mix-minus send back to automatic. Option-drag = fine.
 - Colour only for meaning: accent = signal/OK, amber = hot, red =
   clip/mute/fault. Theme tokens live in `src/ui/theme.h` (from RTA).
 - Look at a `--screenshot` of every UI change before calling it done.

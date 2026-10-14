@@ -4,7 +4,9 @@
 //   - dragging moves the fader relative to where you grabbed it; clicking
 //     the track never jumps it (no accidental level changes on air)
 //   - Option/Alt while dragging or scrolling = fine (x0.1)
-//   - double-click the fader = 0 dB; scroll = 0.5 dB per notch
+//   - Option-click resets any control to its zero (fader/gain/send 0 dB,
+//     pan centre); an Option-press that moves is a fine drag instead.
+//     Double-click does the same. Scroll = 0.5 dB per notch
 //   - the clip light latches until clicked
 #pragma once
 
@@ -55,6 +57,29 @@ struct FaderLaw {
                 return db[i] + (p - pos[i]) / (pos[i - 1] - pos[i]) *
                                    (db[i - 1] - db[i]);
         return kFaderMinDb;
+    }
+};
+
+// Option-click = reset. Armed on an Option-press, disarmed once the
+// pointer moves (then it is a fine drag), fired on release.
+struct AltClick {
+    bool armed = false;
+    QPointF at;
+    void press(QMouseEvent* e) {
+        armed = e->modifiers() & Qt::AltModifier;
+        at = e->position();
+    }
+    // True while a would-be click has not moved yet (ignore the move).
+    bool holding(QMouseEvent* e) {
+        if (!armed) return false;
+        if ((e->position() - at).manhattanLength() < 3) return true;
+        armed = false;
+        return false;
+    }
+    bool release() {
+        const bool fire = armed;
+        armed = false;
+        return fire;
     }
 };
 
@@ -212,6 +237,7 @@ protected:
             update();
             return;
         }
+        alt_.press(e);  // Option-click anywhere on the fader = 0 dB
         if (capRect().adjusted(-6, -4, 6, 4).contains(e->pos())) {
             dragging_ = true;
             grabY_ = e->position().y();
@@ -220,7 +246,7 @@ protected:
         }
     }
     void mouseMoveEvent(QMouseEvent* e) override {
-        if (!dragging_) return;
+        if (alt_.holding(e) || !dragging_) return;
         const float scale = e->modifiers() & Qt::AltModifier ? 0.1f : 1.0f;
         const float dp = float(grabY_ - e->position().y()) /
                          float(travel().height()) * scale;
@@ -235,6 +261,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent*) override {
         dragging_ = false;
         lastScale_ = 1;
+        if (alt_.release()) commit(0);
         update();
     }
     void mouseDoubleClickEvent(QMouseEvent* e) override {
@@ -275,6 +302,7 @@ private:
     qint64 holdAt_[2] = {0, 0}, lastMeter_ = 0;
     bool clip_ = false;
     bool dragging_ = false;
+    AltClick alt_;
     double grabY_ = 0;
     float grabPos_ = 0, lastScale_ = 1;
     QElapsedTimer clock_ = [] {
@@ -470,7 +498,7 @@ public:
         setFixedHeight(20);
         setCursor(Qt::SizeVerCursor);
         setToolTip("Input gain — before EQ, dynamics and inserts.\n"
-                   "Drag up/down (hold Option for fine), double-click for 0 dB.");
+                   "Drag up/down (hold Option for fine); Option-click for 0 dB.");
     }
     void setGain(float dB) {
         if (dragging_) return;
@@ -504,13 +532,14 @@ protected:
                    (gain_ > 0.05f ? "+" : "") + QString::number(double(gain_), 'f', 1));
     }
     void mousePressEvent(QMouseEvent* e) override {
+        alt_.press(e);
         dragging_ = true;
         grabY_ = e->position().y();
         grabGain_ = gain_;
         update();
     }
     void mouseMoveEvent(QMouseEvent* e) override {
-        if (!dragging_) return;
+        if (alt_.holding(e) || !dragging_) return;
         const float perPx = e->modifiers() & Qt::AltModifier ? 0.02f : 0.2f;
         if (perPx != lastPerPx_) {  // re-anchor when switching fine/coarse
             grabY_ = e->position().y();
@@ -523,6 +552,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent*) override {
         dragging_ = false;
         lastPerPx_ = 0.2f;
+        if (alt_.release()) commit(0);
         update();
     }
     void mouseDoubleClickEvent(QMouseEvent*) override { commit(0); }
@@ -532,6 +562,7 @@ protected:
     }
 
 private:
+    AltClick alt_;
     void commit(float dB) {
         dB = std::clamp(std::round(dB * 10.0f) / 10.0f, kMin, kMax);
         if (dB == gain_) return;
@@ -594,7 +625,8 @@ private:
 //   dot    click = on/off ("−" = left out of this mix-minus, click to put
 //          it back)
 //   rest   click = menu (pre/post, reset, remove), drag up/down = level
-//          (Option = fine)
+//          (Option = fine), Option-click = 0 dB (or back to automatic on a
+//          mix-minus)
 // The last row adds a send.
 class SendList : public QWidget {
 public:
@@ -733,6 +765,7 @@ protected:
     void mouseMoveEvent(QMouseEvent* e) override {
         if (dragRow_ >= 0 && !moved_ && std::abs(e->position().y() - grabY_) < 3)
             return;  // still a click
+        alt_.holding(e);  // moved: an Option-drag is a fine drag
         if (dragRow_ >= 0) {
             if (!moved_) {
                 moved_ = true;
@@ -787,6 +820,7 @@ protected:
         }
         pressRow_ = i;
         moved_ = false;
+        alt_.press(e);
         grabY_ = e->position().y();
         grabDb_ = r.db;
         lastPerPx_ = 0.25f;
@@ -795,16 +829,22 @@ protected:
     void mouseReleaseEvent(QMouseEvent* e) override {
         const int i = pressRow_;
         const bool click = !moved_;
+        const bool reset = alt_.release() && click;
         dragRow_ = pressRow_ = -1;
         update();
-        if (click && i >= 0 && i < int(rows_.size()) && onMenu)
+        if (i < 0 || i >= int(rows_.size()) || !click) return;
+        if (reset) {
+            if (onReset) onReset(rows_[i].dest);
+        } else if (onMenu) {
             onMenu(rows_[i].dest, e->globalPosition().toPoint());
+        }
     }
 
 private:
     QList<Row> rows_;
     int hover_ = -1, dragRow_ = -1, pressRow_ = -1;
     bool moved_ = false;
+    AltClick alt_;
     double grabY_ = 0;
     float grabDb_ = 0, lastPerPx_ = 0.25f;
 };
@@ -819,7 +859,7 @@ public:
         setFixedHeight(18);
         setCursor(Qt::SizeHorCursor);
         setToolTip("Pan (balance on a stereo channel).\nDrag left/right (hold "
-                   "Option for fine), double-click to centre.");
+                   "Option for fine); Option-click to centre.");
     }
     void setPan(float p) {
         if (dragging_ || p == pan_) return;
@@ -863,13 +903,14 @@ protected:
         return (p < 0 ? "L" : "R") + QString::number(pct);
     }
     void mousePressEvent(QMouseEvent* e) override {
+        alt_.press(e);
         dragging_ = true;
         grabX_ = e->position().x();
         grabPan_ = pan_;
         update();
     }
     void mouseMoveEvent(QMouseEvent* e) override {
-        if (!dragging_) return;
+        if (alt_.holding(e) || !dragging_) return;
         const float perPx = e->modifiers() & Qt::AltModifier ? 0.002f : 0.02f;
         if (perPx != lastPerPx_) {
             grabX_ = e->position().x();
@@ -882,6 +923,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent*) override {
         dragging_ = false;
         lastPerPx_ = 0.02f;
+        if (alt_.release()) commit(0);
         update();
     }
     void mouseDoubleClickEvent(QMouseEvent*) override { commit(0); }
@@ -901,6 +943,7 @@ private:
     float pan_ = 0, grabPan_ = 0, lastPerPx_ = 0.02f;
     double grabX_ = 0;
     bool dragging_ = false;
+    AltClick alt_;
 };
 
 // A routing button: "→ Program" (where the strip goes) or "In 3" (what

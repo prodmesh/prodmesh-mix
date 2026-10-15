@@ -98,7 +98,7 @@ bool GraphDesc::reaches(NodeId from, NodeId to) const {
     return false;
 }
 
-void resolveMixMinus(GraphDesc& g) {
+void resolveDerived(GraphDesc& g) {
     std::erase_if(g.edges, [](const EdgeDesc& e) { return e.derived; });
     std::vector<EdgeDesc> add;
     for (const auto& m : g.nodes) {
@@ -126,6 +126,33 @@ void resolveMixMinus(GraphDesc& g) {
                     break;
                 }
             add.push_back({s.id, m.id, 0, pan, true, true});
+        }
+    }
+    // Monitor buses: the followed bus, or whatever is soloed.
+    for (const auto& m : g.nodes) {
+        if (m.kind != NodeKind::Bus || !m.monitor.on) continue;
+        std::vector<NodeId> soloed;
+        for (const auto& n : g.nodes)
+            if (n.solo && n.id != m.id && !n.monitor.on &&
+                (n.kind == NodeKind::Strip || n.kind == NodeKind::Bus) &&
+                !g.reaches(m.id, n.id))  // never feed what listens to it
+                soloed.push_back(n.id);
+        if (soloed.empty()) {
+            if (m.monitor.follows && g.find(m.monitor.follows) &&
+                !g.reaches(m.id, m.monitor.follows))
+                add.push_back({m.monitor.follows, m.id, 0, 0, true, true});
+            continue;
+        }
+        for (NodeId s : soloed) {
+            float pan = 0;  // the same image as in the mix
+            for (const auto& e : g.edges)
+                if (e.from == s && !e.derived && !e.send) {
+                    pan = e.pan;
+                    break;
+                }
+            EdgeDesc e{s, m.id, 0, pan, true, true};
+            e.preFader = m.monitor.pfl;
+            add.push_back(e);
         }
     }
     g.edges.insert(g.edges.end(), add.begin(), add.end());

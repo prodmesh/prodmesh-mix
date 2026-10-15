@@ -29,6 +29,7 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QSet>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
@@ -49,6 +50,7 @@ namespace pm::ui {
 class TrackPeaks {
 public:
     QString name, role;
+    quint32 node = 0;  // the source node it recorded
     bool open(const QString& path) {
         if (!reader_.open(path.toStdString())) return false;
         levels_.clear();
@@ -171,6 +173,7 @@ struct Take {
                 auto t = std::make_unique<TrackPeaks>();
                 t->name = o["name"].toString();
                 t->role = o["role"].toString();
+                t->node = quint32(o["node"].toDouble());
                 const QString wav = takeDir + "/" + o["file"].toString();
                 if (t->open(QString::fromStdString(rec::peaksPathFor(wav.toStdString()))))
                     tracks.push_back(std::move(t));
@@ -219,6 +222,11 @@ class Timeline : public QWidget {
 public:
     static constexpr int kHeader = 150, kRuler = 30, kLane = 64, kGap = 4;
     std::function<void()> onViewChanged;  // zoom / scroll / follow changed
+    std::function<void(quint32 node, bool on)> onSolo;
+    void setSoloed(const QSet<quint32>& s) {
+        soloed_ = s;
+        update();
+    }
 
     Timeline() {
         setFocusPolicy(Qt::StrongFocus);
@@ -352,6 +360,18 @@ protected:
             p.drawText(head_r.adjusted(12, 28, -8, 0), Qt::AlignLeft | Qt::AlignTop,
                        QString(program ? "program" : "source") +
                            (tr.channels() > 1 ? " · stereo" : " · mono"));
+            if (!program && tr.node) {  // solo: to the monitor, never Program
+                const QRect sb = soloRect(y);
+                const bool on = soloed_.contains(tr.node);
+                p.setRenderHint(QPainter::Antialiasing, true);
+                p.setPen(on ? QColor("#e0c05c") : theme::border);
+                p.setBrush(on ? QColor("#b8962f") : QColor("#232733"));
+                p.drawRoundedRect(QRectF(sb).adjusted(0.5, 0.5, -0.5, -0.5), 3, 3);
+                p.setRenderHint(QPainter::Antialiasing, false);
+                p.setFont(uiFont(this, 9, QFont::Bold));
+                p.setPen(on ? QColor("#1a1406") : theme::text);
+                p.drawText(sb, Qt::AlignCenter, "S");
+            }
 
             // Waveform, mirrored around the lane's centre line, in dB.
             const double mid = y + kLane / 2.0, half = kLane / 2.0 - 3;
@@ -448,7 +468,17 @@ protected:
                                             : QString());
     }
 
+    QRect soloRect(int laneY) const { return QRect(kHeader - 30, laneY + kLane - 24, 20, 18); }
     void mousePressEvent(QMouseEvent* e) override {
+        if (take_ && e->position().x() < kHeader) {
+            for (std::size_t i = 0; i < take_->tracks.size(); ++i) {
+                const int y = kRuler + kGap + int(i) * (kLane + kGap) - top_;
+                const auto& tr = *take_->tracks[i];
+                if (tr.role != "program" && tr.node && soloRect(y).contains(e->pos()) && onSolo)
+                    onSolo(tr.node, !soloed_.contains(tr.node));
+            }
+            return;
+        }
         if (e->position().x() < kHeader || !take_) return;
         cursor_ = std::clamp(timeAt(e->position().x()), 0.0, take_->seconds());
         update();
@@ -505,6 +535,7 @@ private:
     bool live_ = false, followLive_ = true;
     double spp_ = 0.05, t0_ = 0, cursor_ = -1;
     int top_ = 0;
+    QSet<quint32> soloed_;
 };
 
 class EditorView : public QWidget {
@@ -582,6 +613,7 @@ public:
             syncControls();
         });
         timeline_->onViewChanged = [this] { syncControls(); };
+        timeline_->onSolo = [this](quint32 n, bool on) { if (onSolo) onSolo(n, on); };
 
         poll_.setInterval(300);  // a live take grows; markers arrive
         connect(&poll_, &QTimer::timeout, this, [this] {
@@ -599,6 +631,9 @@ public:
         project_ = path;
         rescan(true);
     }
+    std::function<void(quint32 node, bool on)> onSolo;
+    void setSoloed(const QSet<quint32>& s) { timeline_->setSoloed(s); }
+
     // The take being recorded now (from the engine's health), or empty.
     void setLiveTake(const QString& name) {
         if (name == liveTake_) return;

@@ -51,7 +51,7 @@ GraphDesc applyScene(const GraphDesc& now, const GraphDesc& scene) {
             e.preFader = s->preFader;
         }
     }
-    resolveMixMinus(g);
+    resolveDerived(g);
     return g;
 }
 

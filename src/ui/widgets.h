@@ -1006,6 +1006,7 @@ class StripWidget : public QWidget {
 public:
     std::function<void(float faderDb, bool mute)> onChange;
     std::function<void(QPoint globalPos)> onContext;  // right-click
+    std::function<void(bool)> onSolo;
 
     StripWidget(const QString& name, int channels, bool master,
                 QWidget* parent = nullptr)
@@ -1061,18 +1062,31 @@ public:
         readout_->setStyleSheet("color: #c8cede;");
         v->addWidget(readout_);
 
+        // Solo (amber: you are not hearing the mix — the monitor is) and
+        // mute (red) side by side, as on a console.
+        auto* sm = new QHBoxLayout;
+        sm->setSpacing(4);
+        solo_ = new QPushButton("SOLO", this);
         mute_ = new QPushButton("MUTE", this);
-        mute_->setCheckable(true);
-        mute_->setCursor(Qt::PointingHandCursor);
-        mute_->setFixedHeight(26);
-        mute_->setStyleSheet(
+        const char* base =
             "QPushButton { background: #232733; border: 1px solid #323848;"
-            " border-radius: 4px; color: #8a92a6; font-size: 11px;"
-            " font-weight: 600; letter-spacing: 1px; }"
-            "QPushButton:hover { border-color: #46506a; color: #c8cede; }"
+            " border-radius: 4px; color: #8a92a6; font-size: 10px;"
+            " font-weight: 600; letter-spacing: 0.6px; }"
+            "QPushButton:hover { border-color: #46506a; color: #c8cede; }";
+        solo_->setStyleSheet(QString(base) +
+            "QPushButton:checked { background: #b8962f; border-color: #e0c05c;"
+            " color: #1a1406; }");
+        mute_->setStyleSheet(QString(base) +
             "QPushButton:checked { background: #c2393e; border-color: #e5484d;"
             " color: #ffffff; }");
-        v->addWidget(mute_);
+        for (auto* b : {solo_, mute_}) {
+            b->setCheckable(true);
+            b->setCursor(Qt::PointingHandCursor);
+            b->setFixedHeight(26);
+            sm->addWidget(b);
+        }
+        solo_->setToolTip("Solo: hear this on the Monitor bus. Program is not affected.");
+        v->addLayout(sm);
 
         // Pro Tools-style delay view: what this chain adds, and how far this
         // channel is held back to stay in phase with others.
@@ -1093,6 +1107,9 @@ public:
         connect(mute_, &QPushButton::toggled, this, [this](bool on) {
             if (syncing_) return;
             if (onChange) onChange(fader_->db(), on);
+        });
+        connect(solo_, &QPushButton::toggled, this, [this](bool on) {
+            if (!syncing_ && onSolo) onSolo(on);
         });
         showDb(0);
     }
@@ -1120,6 +1137,13 @@ public:
     AssignButton* assign() { return assign_; }
     AssignButton* input() { return input_; }
     PanField* pan() { return pan_; }
+    void setSolo(bool on) {
+        syncing_ = true;
+        solo_->setChecked(on);
+        syncing_ = false;
+    }
+    // Program and the monitor itself have no solo.
+    void setHasSolo(bool on) { solo_->setVisible(on); }
     void setHasPan(bool on) {
         auto sp = pan_->sizePolicy();
         sp.setRetainSizeWhenHidden(true);
@@ -1202,6 +1226,7 @@ private:
     InsertList* inserts_;
     FaderMeter* fader_;
     QPushButton* mute_;
+    QPushButton* solo_;
 };
 
 }  // namespace pm::ui

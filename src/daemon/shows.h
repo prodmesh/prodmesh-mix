@@ -23,9 +23,10 @@ GraphDesc inputs(int count);
 // one mono Input node per device input channel ("In 1", ...; they always
 // exist, so every input is always recorded, used or not), and input trim
 // on the source -> channel edges (sessions before 0.0.2 kept it on the
-// source node's fader).
+// source node's fader). Every show also gets a Monitor bus (solo / cue;
+// no output until one is chosen) if it has none.
 void normalize(GraphDesc& g, int deviceInputs);
 
-inline constexpr NodeId kProgram = 3000, kMixMinus = 3001;
+inline constexpr NodeId kProgram = 3000, kMixMinus = 3001, kMonitor = 3900;
 
 }  // namespace pm::shows

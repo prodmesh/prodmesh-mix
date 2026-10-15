@@ -182,6 +182,14 @@ public:
         stack_ = new QStackedWidget;
         stack_->addWidget(body);
         editor_ = new EditorView;
+        // A track is a recorded source: soloing it solos the channels it feeds.
+        editor_->onSolo = [this](quint32 source, bool on) {
+            GraphDesc g = graph_;
+            for (const auto& e : graph_.edges)
+                if (e.from == source && !e.derived)
+                    if (auto* n = g.find(e.to); n && n->kind == NodeKind::Strip) n->solo = on;
+            commit(std::move(g));
+        };
         stack_->addWidget(editor_);
         outer->addWidget(stack_, 1);
         auto* views = new QWidget;
@@ -212,6 +220,21 @@ public:
         connect(mixerBtn_, &QPushButton::clicked, this, [this] { showView(0); });
         connect(editorBtn_, &QPushButton::clicked, this, [this] { showView(1); });
         static_cast<QHBoxLayout*>(scenes_->layout())->insertWidget(0, views);
+        soloPill_ = new QPushButton;
+        soloPill_->setCursor(Qt::PointingHandCursor);
+        soloPill_->setFixedHeight(26);
+        soloPill_->setToolTip("Something is soloed: the Monitor bus carries only that. "
+                              "Program is unaffected. Click to clear all solos.");
+        soloPill_->setStyleSheet(
+            "QPushButton { background: #3a3218; border: 1px solid #e0c05c; border-radius: 13px;"
+            " color: #f3e3b0; font-size: 11px; font-weight: 700; padding: 0 12px; }"
+            "QPushButton:hover { background: #4a3f1c; }");
+        soloPill_->hide();
+        connect(soloPill_, &QPushButton::clicked, this, [this] { clearSolos(); });
+        {
+            auto* sl = static_cast<QHBoxLayout*>(scenes_->layout());
+            sl->insertWidget(sl->count() - 2, soloPill_);  // before Undo / GO
+        }
 
         scroll_ = new QScrollArea;
         scroll_->setWidgetResizable(true);
@@ -223,10 +246,21 @@ public:
 
         masterHost_ = new QWidget;
         masterHost_->setObjectName("root");
-        auto* mh = new QVBoxLayout(masterHost_);
+        auto* mh = new QHBoxLayout(masterHost_);
         mh->setContentsMargins(0, 0, 0, 0);
-        mh->setSpacing(8);
-        mh->addWidget(new SectionLabel("Program"));
+        mh->setSpacing(16);
+        auto column = [&](const QString& title) {
+            auto* c = new QWidget;
+            c->setObjectName("root");
+            auto* v = new QVBoxLayout(c);
+            v->setContentsMargins(0, 0, 0, 0);
+            v->setSpacing(8);
+            v->addWidget(new SectionLabel(title));
+            mh->addWidget(c);
+            return c;
+        };
+        programCol_ = column("Program");
+        monitorCol_ = column("Monitor");
         bodyLayout_->addWidget(masterHost_);
 
         // Honest about what it means: no engine, no program audio.
@@ -576,7 +610,7 @@ private:
             strips->setSpacing(6);
             int count = 0;
             for (const auto& n : g.nodes) {
-                if (n.kind != kind || n.id == skip) continue;
+                if (n.kind != kind || n.id == skip || n.monitor.on) continue;
                 strips->addWidget(makeStrip(n, false));
                 ++count;
             }
@@ -612,7 +646,13 @@ private:
         scroll_->setWidget(row);
 
         if (const auto* p = g.find(program))
-            masterHost_->layout()->addWidget(makeStrip(*p, true));
+            programCol_->layout()->addWidget(makeStrip(*p, true));
+        monitorCol_->setVisible(false);
+        for (const auto& n : g.nodes)
+            if (n.monitor.on) {
+                monitorCol_->layout()->addWidget(makeStrip(n, true));
+                monitorCol_->setVisible(true);
+            }
     }
 
     // --- Projects: File menu and the Start window -----------------------------
@@ -790,7 +830,7 @@ private:
     // is edges; EdgeDesc::send tells sends from the main output. Device
     // Input nodes always exist (the daemon makes one per channel) and are
     // always recorded; Output nodes exist while something feeds them.
-    // Mix-minus buses are filled by the engine (resolveMixMinus).
+    // Mix-minus buses are filled by the engine (resolveDerived).
 
     static QMenu* styledMenu(QWidget* parent) {
         auto* m = new QMenu(parent);
@@ -875,7 +915,7 @@ private:
     // Apply an edit: locally at once (so the next edit builds on it), and
     // to the engine — coalesced while dragging.
     void commit(GraphDesc g, bool soon = false) {
-        resolveMixMinus(g);
+        resolveDerived(g);
         graph_ = std::move(g);
         refreshRouting();
         for (const auto& n : graph_.nodes)  // a reorder shows at once
@@ -895,6 +935,8 @@ private:
         const QString name = QString::fromStdString(n.name);
         for (const auto& e : graph_.edges) {
             if (e.from != n.id || !isSend(e)) continue;
+            // Monitor feeds (follow / solo) are not sends.
+            if (const auto* to = graph_.find(e.to); to && to->monitor.on) continue;
             SendList::Row r;
             r.dest = e.to;
             r.label = destName(e.to);
@@ -959,10 +1001,43 @@ private:
         return in.size() > 1 ? QString("%1 +%2").arg(t).arg(in.size() - 1) : t;
     }
 
+    int soloCount() const {
+        int n = 0;
+        for (const auto& x : graph_.nodes) n += x.solo && !x.monitor.on;
+        return n;
+    }
+    void setSolo(NodeId id, bool on) {
+        GraphDesc g = graph_;
+        if (auto* n = g.find(id)) n->solo = on;
+        commit(std::move(g));
+    }
+    void clearSolos() {
+        GraphDesc g = graph_;
+        for (auto& n : g.nodes) n.solo = false;
+        commit(std::move(g));
+    }
+    void refreshSoloPill() {
+        if (!soloPill_) return;
+        const int n = soloCount();
+        soloPill_->setVisible(n > 0);
+        soloPill_->setText(n == 1 ? "SOLO · monitor only  ✕" :
+                           QString("SOLO %1 · monitor only  ✕").arg(n));
+        if (editor_) {
+            // The editor's lanes are sources: lit if a channel they feed is soloed.
+            QSet<quint32> lit;
+            for (const auto& e : graph_.edges)
+                if (const auto* to = graph_.find(e.to); to && to->solo && !e.derived)
+                    lit.insert(e.from);
+            editor_->setSoloed(lit);
+        }
+    }
+
     void refreshRouting() {
+        refreshSoloPill();
         for (const auto& n : graph_.nodes) {
             auto* st = strips_.value(n.id);
             if (!st) continue;
+            st->setSolo(n.solo);
             st->sends()->setRows(sendRows(n));
             for (const auto& e : graph_.edges)
                 if (e.from == n.id && !isSend(e)) {
@@ -988,6 +1063,19 @@ private:
                 continue;
             }
             st->setInputControls(false, false);
+            if (n.monitor.on) {
+                const int soloed = soloCount();
+                const auto* f = graph_.find(n.monitor.follows);
+                st->setCaption(soloed ? QString("SOLO · %1 · %2").arg(n.monitor.pfl ? "PFL" : "AFL")
+                                                                   .arg(soloed)
+                                      : "follows " + (f ? QString::fromStdString(f->name)
+                                                        : QString("Program")),
+                               "Monitor: your headphones / cue feed. Follows Program "
+                               "until something is soloed, then carries only that "
+                               "(PFL: before its fader; AFL: after it).\n"
+                               "Program is never affected. Click the name for options.");
+                continue;
+            }
             if (n.mixMinus.follows) {
                 QStringList out;
                 for (NodeId x : n.mixMinus.exclude)
@@ -1053,7 +1141,7 @@ private:
         menu->addSeparator();
         heading(menu, "Buses");
         for (const auto& b : graph_.nodes) {
-            if (b.kind != NodeKind::Bus) continue;
+            if (b.kind != NodeKind::Bus || b.monitor.on) continue;
             auto* a = option(menu, QString::fromStdString(b.name), {b.id}, b.channels);
             if (graph_.reaches(id, b.id)) {
                 a->setEnabled(false);  // it listens to this channel
@@ -1237,7 +1325,7 @@ private:
             return false;
         };
         for (const auto& b : graph_.nodes) {
-            if (b.kind != NodeKind::Bus || b.id == id || taken(b.id)) continue;
+            if (b.kind != NodeKind::Bus || b.id == id || taken(b.id) || b.monitor.on) continue;
             if (b.mixMinus.follows && excluded(b, id)) continue;  // its dash row
             auto* a = menu->addAction(QString::fromStdString(b.name));
             if (graph_.reaches(b.id, id)) {
@@ -1319,8 +1407,11 @@ private:
             return false;
         };
         for (const auto& b : graph_.nodes) {
-            // Mix-minus buses fill themselves; they are not a destination.
-            if (b.kind != NodeKind::Bus || b.id == id || b.mixMinus.follows) continue;
+            // Mix-minus and monitor buses fill themselves; not destinations.
+            // The monitor itself goes to outputs only.
+            if (b.kind != NodeKind::Bus || b.id == id || b.mixMinus.follows ||
+                b.monitor.on || n->monitor.on)
+                continue;
             auto* act = menu->addAction(QString::fromStdString(b.name));
             act->setCheckable(true);
             const bool was = mainEdge(b.id);
@@ -1369,6 +1460,26 @@ private:
         if (!n) return;
         const QString name = QString::fromStdString(n->name);
         auto* menu = styledMenu(this);
+        if (n->monitor.on) {
+            heading(menu, "Solo mode");
+            for (const bool pfl : {true, false}) {
+                auto* a = menu->addAction(pfl ? "PFL  (before the fader: check a source)"
+                                              : "AFL  (after the fader: as it is in the mix)");
+                a->setCheckable(true);
+                a->setChecked(n->monitor.pfl == pfl);
+                connect(a, &QAction::triggered, this, [this, id, pfl] {
+                    GraphDesc g = graph_;
+                    g.find(id)->monitor.pfl = pfl;
+                    commit(std::move(g));
+                });
+            }
+            menu->addSeparator();
+            auto* clr = menu->addAction("Clear all solos");
+            clr->setEnabled(soloCount() > 0);
+            connect(clr, &QAction::triggered, this, [this] { clearSolos(); });
+            menu->popup(at);
+            return;
+        }
         if (n->kind == NodeKind::Strip) {
             connect(menu->addAction("New mix-minus for " + name),
                     &QAction::triggered, this, [this, id] { addBus(BusKind::MixMinus, id); });
@@ -1637,6 +1748,8 @@ private:
         s->inserts()->onMove = [this, id](int from, int to) { moveInsert(id, from, to); };
         s->pan()->onPan = [this, id](float p) { setPan(id, p); };
         s->setHasPan(!master);
+        s->setHasSolo(!master);
+        s->onSolo = [this, id](bool on) { setSolo(id, on); };
         s->sends()->onToggle = [this, id](quint32 d) { toggleSend(id, d); };
         s->sends()->onLevel = [this, id](quint32 d, float db) {
             setSendLevel(id, d, db);
@@ -1698,6 +1811,7 @@ private:
     QStackedWidget* stack_;
     EditorView* editor_;
     QPushButton *mixerBtn_, *editorBtn_;
+    QPushButton* soloPill_ = nullptr;
     QString projectPath_, projectName_;
     QJsonObject projects_;
     QMenu* recentMenu_ = nullptr;
@@ -1709,6 +1823,7 @@ private:
     QHBoxLayout* bodyLayout_;
     QScrollArea* scroll_;
     QWidget* masterHost_;
+    QWidget *programCol_, *monitorCol_;
     QLabel* offline_;
     QLabel* banner_;
     QLabel* warnings_;

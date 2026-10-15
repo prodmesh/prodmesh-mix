@@ -155,6 +155,28 @@ void normalize(GraphDesc& g, int deviceInputs) {
             if (e.from == n.id) e.gainDb += n.faderDb;
         n.faderDb = 0;
     }
+    bool haveMonitor = false;
+    for (const auto& n : g.nodes) haveMonitor |= n.monitor.on;
+    if (!haveMonitor) {
+        NodeId program = 0;  // the bus feeding outputs 1-2
+        for (const auto& e : g.edges) {
+            const auto* to = g.find(e.to);
+            const auto* from = g.find(e.from);
+            if (to && from && to->kind == NodeKind::Output && to->ioChannel == 0 &&
+                from->kind == NodeKind::Bus)
+                program = from->id;
+        }
+        NodeId id = kMonitor;
+        while (g.find(id)) ++id;
+        NodeDesc mon;
+        mon.id = id;
+        mon.kind = NodeKind::Bus;
+        mon.channels = 2;
+        mon.name = "Monitor";
+        mon.monitor = {true, program, true};
+        mon.recallSafe = true;  // the operator's ears are not part of a scene
+        g.nodes.push_back(mon);
+    }
     NodeId next = 1000;
     for (const auto& n : g.nodes) next = std::max(next, n.id + 1);
     for (int ch = 0; ch < deviceInputs; ++ch) {

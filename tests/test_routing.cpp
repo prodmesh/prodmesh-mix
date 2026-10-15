@@ -56,37 +56,38 @@ struct Offline {
           EngineConfig c;
           c.sampleRate = 48000;
           c.maxBlock = kBlock;
-          c.numOutputs = 2;
+          c.numOutputs = 3;
           return c;
       }()) {}
     void run(int blocks) {
-        std::vector<float> a(kBlock), b(kBlock);
-        float* ptr[2] = {a.data(), b.data()};
+        std::vector<float> a(kBlock), b(kBlock), m(kBlock);
+        float* ptr[3] = {a.data(), b.data(), m.data()};
         for (int i = 0; i < blocks; ++i) {
             engine.pump();
             {
                 rt::ScopedRealtime scope;
-                engine.process(nullptr, 0, ptr, 2, kBlock);
+                engine.process(nullptr, 0, ptr, 3, kBlock);
             }
             out[0].insert(out[0].end(), a.begin(), a.end());
             out[1].insert(out[1].end(), b.begin(), b.end());
+            out[2].insert(out[2].end(), m.begin(), m.end());
         }
     }
     Engine engine;
-    std::vector<float> out[2];
+    std::vector<float> out[3];
 };
 
 }  // namespace
 
 TEST(mix_minus_derives_sends) {
     GraphDesc g = show();
-    resolveMixMinus(g);
+    resolveDerived(g);
     CHECK(derivedCount(g, 20, 31) == 1);
     CHECK(derivedCount(g, 21, 31) == 0);  // excluded
     for (const auto& e : g.edges)
         if (e.derived) CHECK(e.pan == -0.5f);  // follows the program image
     const auto n = g.edges.size();
-    resolveMixMinus(g);  // idempotent
+    resolveDerived(g);  // idempotent
     CHECK(g.edges.size() == n);
 
     // A strip added later joins by itself; one routed elsewhere does not.
@@ -97,19 +98,19 @@ TEST(mix_minus_derives_sends) {
     NodeDesc t;
     t.id = 23;
     g.nodes.push_back(t);
-    resolveMixMinus(g);
+    resolveDerived(g);
     CHECK(derivedCount(g, 22, 31) == 1);
     CHECK(derivedCount(g, 23, 31) == 0);
 
     // An explicit send overrides the automatic one.
     g.edges.push_back({22, 31, -6, 0});
-    resolveMixMinus(g);
+    resolveDerived(g);
     CHECK(derivedCount(g, 22, 31) == 0);
 
     // A strip that listens to the mix-minus is never fed by it.
     g.edges.push_back({31, 23, 0, 0});
     g.edges.push_back({23, 30, 0, 0});
-    resolveMixMinus(g);
+    resolveDerived(g);
     CHECK(derivedCount(g, 23, 31) == 0);
 }
 
@@ -204,7 +205,7 @@ TEST(scene_recalls_the_mix_not_the_structure) {
     extra.id = 22;
     now.nodes.push_back(extra);
     now.edges.push_back({22, 30, 0, 0});
-    resolveMixMinus(now);
+    resolveDerived(now);
     CHECK(!sceneMatches(now, stored));
 
     const GraphDesc r = applyScene(now, stored);
@@ -258,4 +259,84 @@ TEST(scene_recall_glides_faders) {
     r.run(int(0.02 * 48000 / kBlock) + 2);
     CHECK(peak(r.out[0], r.out[0].size() - kBlock) == 0.0f);
     CHECK(rt::violations() == 0);
+}
+
+
+// --- solo / monitor ------------------------------------------------------------
+
+namespace {
+// show() plus a monitor bus (33) following Program, on output 2.
+GraphDesc withMonitor(bool pfl = true) {
+    GraphDesc g = show();
+    NodeDesc mon;
+    mon.id = 33;
+    mon.kind = NodeKind::Bus;
+    mon.monitor = {true, 30, pfl};
+    g.nodes.push_back(mon);
+    NodeDesc o;
+    o.id = 43;
+    o.kind = NodeKind::Output;
+    o.ioChannel = 2;
+    g.nodes.push_back(o);
+    g.edges.push_back({33, 43, 0, 0});
+    return g;
+}
+float peakDb(const std::vector<float>& x, std::size_t from) {
+    return dsp::gainToDb(peak(x, from));
+}
+}  // namespace
+
+TEST(monitor_follows_program_until_something_is_soloed) {
+    GraphDesc g = withMonitor();
+    resolveDerived(g);
+    CHECK(derivedCount(g, 30, 33) == 1);
+    g.find(20)->solo = true;
+    resolveDerived(g);
+    CHECK(derivedCount(g, 30, 33) == 0);
+    CHECK(derivedCount(g, 20, 33) == 1);
+    CHECK(derivedCount(g, 21, 33) == 0);
+}
+
+// Tier 0: solo is for the operator's ears. Program must not change by a
+// single bit, whatever is soloed.
+TEST(solo_leaves_program_bit_identical) {
+    Offline a, b;
+    GraphDesc g = withMonitor();
+    CHECK(a.engine.setGraph(g));
+    CHECK(b.engine.setGraph(g));
+    a.run(20);
+    b.run(20);
+    g.find(21)->solo = true;
+    CHECK(b.engine.setGraph(g));  // b solos the remote mid-stream
+    a.run(60);
+    b.run(60);
+    CHECK(a.out[0] == b.out[0]);
+    CHECK(a.out[1] == b.out[1]);
+    CHECK(a.out[2] != b.out[2]);  // the monitor did change
+    CHECK(rt::violations() == 0);
+}
+
+// PFL ignores the channel's fader; AFL follows it. Mute applies to both.
+TEST(pfl_and_afl) {
+    for (bool pfl : {true, false}) {
+        Offline r;
+        GraphDesc g = withMonitor(pfl);
+        g.find(21)->mute = true;     // only strip 20 is live
+        g.find(20)->faderDb = -20;
+        g.find(20)->solo = true;
+        CHECK(r.engine.setGraph(g));
+        r.run(40);
+        const float mon = peakDb(r.out[2], 20 * kBlock);
+        const float want = pfl ? -12.0f : -32.0f;
+        CHECK_MSG(std::fabs(mon - want) < 0.5f,
+                  std::string(pfl ? "PFL " : "AFL ") + std::to_string(mon));
+    }
+}
+
+TEST(solo_is_not_part_of_a_scene) {
+    GraphDesc stored = withMonitor();
+    stored.find(20)->solo = true;
+    GraphDesc now = withMonitor();
+    CHECK(!applyScene(now, stored).find(20)->solo);
+    CHECK(sceneMatches(now, stored));
 }

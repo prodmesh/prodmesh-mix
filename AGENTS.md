@@ -176,6 +176,19 @@ created a fresh Untitled; a reconnecting UI never sees it, and it opens
 only after the first snapshot is on screen. `--session FILE` keeps the
 old single-file mode (tests).
 
+## Solo and the Monitor bus
+
+Solo never touches Program (test: `solo_leaves_program_bit_identical`).
+Every show has a Monitor bus (`NodeDesc::monitor`, added by
+`shows::normalize`, recall-safe, no output until one is chosen) that
+follows Program until something is soloed, then carries only the soloed
+strips/buses — PFL (pre-fader, default) or AFL. Like mix-minus, it is a
+rule resolved into derived edges (`resolveDerived`), so solo switches
+crossfade through the normal edge ramps. `NodeDesc::solo` is monitoring
+state: scenes never recall it. UI: SOLO | MUTE on strips, S on Editor
+lanes (soloes the channels that source feeds), amber "SOLO · monitor
+only" pill to clear, Monitor strip menu for PFL/AFL.
+
 ## Scenes
 
 A scene is a stored copy of the graph; recalling it applies the *mix*

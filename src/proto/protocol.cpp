@@ -180,6 +180,10 @@ QJsonObject graphToJson(const GraphDesc& g) {
                                          {"noiseDb", n.generator.noiseDb},
                                          {"bursts", n.generator.bursts}};
         if (n.recallSafe) o["recallSafe"] = true;
+        if (n.solo) o["solo"] = true;
+        if (n.monitor.on)
+            o["monitor"] = QJsonObject{{"follows", double(n.monitor.follows)},
+                                       {"pfl", n.monitor.pfl}};
         if (n.mixMinus.follows) {
             QJsonArray ex;
             for (auto id : n.mixMinus.exclude) ex.append(double(id));
@@ -228,6 +232,13 @@ bool graphFromJson(const QJsonObject& o, GraphDesc& g, QString* error) {
         d.generator.noiseDb = num(gen, "noiseDb", d.generator.noiseDb);
         d.generator.bursts = gen["bursts"].toBool(d.generator.bursts);
         d.recallSafe = n["recallSafe"].toBool(false);
+        d.solo = n["solo"].toBool(false);
+        if (n["monitor"].isObject()) {
+            const auto mo = n["monitor"].toObject();
+            d.monitor.on = true;
+            d.monitor.follows = NodeId(mo["follows"].toDouble(0));
+            d.monitor.pfl = mo["pfl"].toBool(true);
+        }
         const auto mm = n["mixMinus"].toObject();
         d.mixMinus.follows = NodeId(mm["follows"].toDouble(0));
         for (const auto& x : mm["exclude"].toArray())

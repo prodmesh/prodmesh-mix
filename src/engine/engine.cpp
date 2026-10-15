@@ -65,7 +65,7 @@ Engine::~Engine() {
 bool Engine::setGraph(const GraphDesc& in, std::string* error,
                       double glideMs) {
     GraphDesc g = in;
-    resolveMixMinus(g);
+    resolveDerived(g);
     carryPluginStates(g);
     // Validate by compiling against nothing; the result is discarded.
     // A dry run (no Live): structure only, no instances, no plugin loads.
@@ -81,7 +81,7 @@ bool Engine::setGraph(const GraphDesc& in, std::string* error,
 
 bool Engine::validate(const GraphDesc& in, std::string* error) const {
     GraphDesc g = in;
-    resolveMixMinus(g);
+    resolveDerived(g);
     return const_cast<Engine*>(this)->compile(g, nullptr, nullptr, error, nullptr) != nullptr;
 }
 

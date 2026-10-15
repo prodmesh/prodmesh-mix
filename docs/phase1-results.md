@@ -8,7 +8,7 @@ Measured 2026-10-14 on an Apple M3 Max (14 cores, 36 GB), macOS 26 (Darwin 25.6)
 
 | Target | Requirement | Result |
 |---|---|---|
-| T0-1 | 0 xruns in an 8 h soak at 64 paths / 48 kHz / 128 samples, reference load | **1 h passed**: 1,350,000 callbacks, 3,595 live edits, 0 xruns, worst callback 22.3% of the period. The 8 h run is in progress (`soak/soak-8h-coreaudio-64p.txt`). |
+| T0-1 | 0 xruns in an 8 h soak at 64 paths / 48 kHz / 128 samples, reference load | **Pass** (2026-10-15, 23:36–07:36, CoreAudio, lid open on AC): 10,799,988 callbacks, 28,758 live edits, **0 xruns, 0 RT violations**, worst callback 34.0% of the period (mean 14.9%). Earlier runs that do not count, and why: run 1 had 1 xrun ~4 h in, near the first microphone access (not reproduced); run 2 was clean for 4 h 13 min until the lid was closed on battery; run 3 had 1 xrun while a local test suite ran real-time threads beside it (render 17%). |
 | T0-2 | Worst callback under 70% of the period | **Pass**: the worst case is 58.6% (128 paths at 96 kHz, single thread), and 20.8% with 3 workers. |
 | T0-3 | Live edits leave unaffected paths sample-identical; edited paths fade within 10 ms | **Pass**: bit-identical null tests, continuity tests, and mutation-checked regressions (see below). |
 

@@ -9,6 +9,9 @@ first snapshot. Exits non-zero on any xrun or a reconnect over 2 s.
     tools/t05_ui_isolation.py [--build build] [--cycles 10]
 """
 import argparse, json, os, re, signal, socket, subprocess, sys, tempfile, time
+import tempfile as _tf
+# Never touch the user's projects or recent list.
+os.environ.setdefault("PM_MIX_HOME", _tf.mkdtemp(prefix="pm-gate-"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--build", default="build")
@@ -18,7 +21,11 @@ args = ap.parse_args()
 name = f"pm-t05-{os.getpid()}"
 mixd = subprocess.Popen([f"{args.build}/mixd", "--driver", "sim", "--socket", name],
                         stderr=subprocess.PIPE, text=True)
-line = mixd.stderr.readline()
+line = ""
+while "running on" not in line:  # other lines (e.g. "recording take") first
+    line = mixd.stderr.readline()
+    if not line:
+        raise SystemExit("mixd exited before it was running")
 path = re.search(r"socket (\S+)", line).group(1)
 
 def health():

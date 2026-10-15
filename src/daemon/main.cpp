@@ -110,12 +110,21 @@ public:
 
     void setRecording(const QString& dir, double ringSeconds) {
         recordDir_ = dir;
+        recordFixed_ = !dir.isEmpty();  // --record wins over project settings
         ringSeconds_ = ringSeconds;
+    }
+    void setRingSeconds(double s) { ringSeconds_ = s; }
+    static QPair<QString, bool> defaultProject() { return startupProject(); }
+    // Project mode: the session and the takes live in this folder.
+    void setProject(const QString& dir, bool fresh) {
+        projectDir_ = QDir(dir).absolutePath();
+        projectFresh_ = fresh;
     }
 
     bool start(const QString& socketName, const QString& session, bool fresh,
                const QString& showName, QString* error) {
-        sessionPath_ = session;
+        sessionPath_ = projectDir_.isEmpty() ? session : projectDir_ + "/session.json";
+        if (!projectDir_.isEmpty()) QDir().mkpath(projectDir_);
         std::string err;
         // Real inputs when the device has them (or when asked), the demo
         // show of generators otherwise.
@@ -132,6 +141,11 @@ public:
         }
         startCatalog();
         setUpLoudness();
+        if (!projectDir_.isEmpty()) {
+            if (!recordFixed_) recordDir_ = projectRecord_ ? projectDir_ + "/Takes" : QString();
+            pushRecent(projectDir_);
+            saveTimer_.start();  // a new project gets its file at once
+        }
         if (!recordDir_.isEmpty() && !startTake(error)) return false;
         if (!driver_->start(&render, &ctx_, &err)) {
             *error = QString::fromStdString(err);
@@ -202,6 +216,8 @@ private:
     void handle(QLocalSocket* s, const QJsonObject& m) {
         const auto op = m["op"].toString();
         if (op == "hello") {
+            send(s, projectMessage(projectFresh_ && m["client"].toString() == "mix-ui"));
+            if (m["client"].toString() == "mix-ui") projectFresh_ = false;  // offered once
             send(s, snapshot());
             send(s, catalogMessage());
             send(s, scenesMessage());
@@ -242,6 +258,12 @@ private:
                 snapshotPending_ = true;
                 saveTimer_.start();
             }
+        } else if (op == "projects") {
+            send(s, projectsMessage());
+        } else if (op == "newProject" || op == "openProject") {
+            QString err;
+            if (!(op == "newProject" ? newProject(m, &err) : openProject(m["path"].toString(), &err)))
+                send(s, {{"type", "error"}, {"op", op}, {"message", err}});
         } else if (op == "resetLoudness") {
             if (loud_) loud_->reset();
         } else if (op == "setLoudnessTarget") {
@@ -255,6 +277,183 @@ private:
         } else {
             send(s, {{"type", "error"}, {"op", op}, {"message", "unknown op"}});
         }
+    }
+
+    // --- projects -------------------------------------------------------------
+    // A project is a folder: session.json (mix, scenes, loudness target,
+    // record setting) and Takes/ (one folder per take, with markers.csv).
+
+    // PM_MIX_HOME (tests): projects and the recent list live there instead
+    // of ~/Music/ProdMesh Mix and the app data folder.
+    static QString home() { return qEnvironmentVariable("PM_MIX_HOME"); }
+    static QString projectsRoot() {
+        if (!home().isEmpty()) return home() + "/Projects";
+        return QStandardPaths::writableLocation(QStandardPaths::MusicLocation) +
+               "/ProdMesh Mix";
+    }
+    static QString recentPath() {
+        if (!home().isEmpty()) return home() + "/recent.json";
+        return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
+               "/recent.json";
+    }
+    static QStringList recentProjects() {
+        QFile f(recentPath());
+        QStringList out;
+        if (f.open(QIODevice::ReadOnly))
+            for (const auto& v : QJsonDocument::fromJson(f.readAll()).array())
+                out << v.toString();
+        return out;
+    }
+    static void pushRecent(const QString& dir) {
+        QStringList list = recentProjects();
+        list.removeAll(dir);
+        list.prepend(dir);
+        while (list.size() > 12) list.removeLast();
+        QDir().mkpath(QFileInfo(recentPath()).absolutePath());
+        QSaveFile f(recentPath());
+        if (!f.open(QIODevice::WriteOnly)) return;
+        f.write(QJsonDocument(QJsonArray::fromStringList(list)).toJson());
+        f.commit();
+    }
+    // Where mixd starts when not told: the last project, else a new
+    // "Untitled" (and the first UI to connect offers the Start window).
+    static QPair<QString, bool> startupProject() {
+        for (const auto& d : recentProjects())
+            if (QFileInfo::exists(d + "/session.json")) return {d, false};
+        return {projectsRoot() + "/Untitled", true};
+    }
+
+    QJsonObject projectMessage(bool offerStart) const {
+        return {{"type", "project"},
+                {"name", projectDir_.isEmpty() ? QString() : QFileInfo(projectDir_).fileName()},
+                {"path", projectDir_},
+                {"record", !recordDir_.isEmpty()},
+                {"offerStart", offerStart}};
+    }
+    QJsonObject projectsMessage() const {
+        QJsonArray recent;
+        for (const auto& d : recentProjects()) {
+            const QFileInfo fi(d + "/session.json");
+            if (!fi.exists()) continue;
+            recent.append(QJsonObject{{"name", QFileInfo(d).fileName()},
+                                      {"path", d},
+                                      {"modified", fi.lastModified().toString(Qt::ISODate)}});
+        }
+        QJsonArray templates{
+            QJsonObject{{"id", "blank"}, {"name", "Blank"},
+                        {"description", "A Program bus on outputs 1-2. Add channels as you go."}},
+            QJsonObject{{"id", "inputs"}, {"name", "All inputs"},
+                        {"description", QString("One channel per device input (%1), into Program.")
+                                            .arg(driver_->config().numInputs)}},
+            QJsonObject{{"id", "livestream"}, {"name", "Livestream (demo)"},
+                        {"description", "Talent and remote guests with groups and a "
+                                        "mix-minus, on test tones."}}};
+        return {{"type", "projects"},
+                {"recent", recent},
+                {"templates", templates},
+                {"location", projectsRoot()},
+                {"current", projectDir_}};
+    }
+
+    bool newProject(const QJsonObject& m, QString* err) {
+        const QString name = m["name"].toString().trimmed();
+        if (name.isEmpty() || name.contains('/') || name.startsWith('.')) {
+            *err = "Pick a name without slashes.";
+            return false;
+        }
+        const QString root = m["location"].toString().isEmpty() ? projectsRoot()
+                                                                 : m["location"].toString();
+        const QString dir = QDir(root).absoluteFilePath(name);
+        if (QFileInfo::exists(dir + "/session.json")) {
+            *err = "A project called \"" + name + "\" already exists there.";
+            return false;
+        }
+        const QString t = m["template"].toString("blank");
+        GraphDesc g = t == "livestream" ? shows::livestream()
+                      : t == "inputs"   ? shows::inputs(std::min(driver_->config().numInputs, 64))
+                                        : shows::blank();
+        return switchTo(dir, &g, m["record"].toBool(true), err);
+    }
+    bool openProject(const QString& path, QString* err) {
+        const QString dir = QDir(path).absolutePath();
+        if (!QFileInfo::exists(dir + "/session.json")) {
+            *err = "That folder is not a ProdMesh Mix project (no session.json).";
+            return false;
+        }
+        return switchTo(dir, nullptr, true, err);
+    }
+
+    // Close this show (save, finish the take) and open another while audio
+    // keeps running: the engine crossfades from one mix to the next.
+    bool switchTo(const QString& dir, const GraphDesc* fromTemplate, bool record,
+                  QString* err) {
+        // Save the current show exactly as it is, before anything of the
+        // next one is loaded into memory (scenes, targets live here too).
+        if (saveTimer_.isActive()) saveTimer_.stop();
+        saveSession();
+        const QString oldSession = sessionPath_;
+        auto restore = [&] {  // the next show failed: back to this one's state
+            sessionPath_ = oldSession;
+            scenes_.clear();
+            GraphDesc ignored;
+            loadSession(ignored);
+        };
+        GraphDesc g;
+        if (fromTemplate) {
+            g = *fromTemplate;
+        } else {
+            sessionPath_ = dir + "/session.json";
+            scenes_.clear();
+            if (!loadSession(g)) {
+                restore();
+                *err = "Could not read that project's session.";
+                return false;
+            }
+        }
+        shows::normalize(g, driver_->config().numInputs);
+        std::string e;
+        if (!engine_->validate(g, &e)) {  // nothing of the running show touched
+            if (!fromTemplate) restore();
+            *err = QString::fromStdString(e);
+            return false;
+        }
+        stopTake();  // finish the old show's take
+
+        projectDir_ = dir;
+        projectFresh_ = false;
+        sessionPath_ = dir + "/session.json";
+        QDir().mkpath(dir);
+        if (fromTemplate) {
+            scenes_.clear();
+            currentScene_ = 0;
+            nextSceneId_ = 1;
+            projectRecord_ = record;
+        }
+        beforeRecall_.reset();
+        markers_.clear();
+        engine_->setGraph(g, &e);
+        loudNode_ = 0;  // a new show is a new measurement
+        setUpLoudness();
+        if (!recordFixed_) recordDir_ = projectRecord_ ? dir + "/Takes" : QString();
+        QString takeErr;
+        if (!recordDir_.isEmpty() && !startTake(&takeErr))
+            qWarning("mixd: recording did not start: %s", qPrintable(takeErr));
+        pushRecent(dir);
+        saveSession();
+        snapshotPending_ = true;
+        broadcast(projectMessage(false), nullptr);
+        broadcast(scenesMessage(), nullptr);
+        broadcast(markersMessage(), nullptr);
+        qInfo("mixd: project %s", qPrintable(dir));
+        return true;
+    }
+
+    void stopTake() {
+        if (!recorder_) return;
+        recordTaps_.clear();
+        applyTaps();          // the audio thread stops feeding the old take
+        recorder_->stop();    // then drain and close its files
+        recorder_.reset();
     }
 
     // --- program loudness (BS.1770) and markers ----------------------------
@@ -575,6 +774,7 @@ private:
         }
         out = std::move(g);
         loadScenes(doc);
+        projectRecord_ = doc["record"].toBool(true);
         return true;
     }
 
@@ -619,6 +819,7 @@ private:
                                   {"version", 1},
                                   {"graph", proto::graphToJson(engine_->graph())},
                                   {"scenes", scenesJson()},
+                                  {"record", projectRecord_},
                                   {"loudness", QJsonObject{{"target", loudTarget_},
                                                            {"truePeak", loudTpLimit_}}},
                                   {"currentScene", currentScene_}})
@@ -796,6 +997,10 @@ private:
     QTimer pumpTimer_, meterTimer_, healthTimer_, saveTimer_;
     QString sessionPath_;
     QString recordDir_, takeName_;
+    bool recordFixed_ = false;
+    QString projectDir_;           // empty: legacy --session mode
+    bool projectRecord_ = true;    // record every source (project setting)
+    bool projectFresh_ = false;    // auto-created on a first run: offer Start
     double ringSeconds_ = 30;
     QElapsedTimer takeClock_;
     std::unique_ptr<rec::Recorder> recorder_;
@@ -844,7 +1049,8 @@ int main(int argc, char** argv) {
         {"block", "Block size", "frames", "128"},
         {"workers", "Extra render threads", "n", "0"},
         {"socket", "Local socket name", "name", proto::kDefaultSocket},
-        {"session", "Session file", "path"},
+        {"project", "Project folder (session + takes); created if missing", "dir"},
+        {"session", "Session file (single-file mode, no project)", "path"},
         {"fresh", "Start from the template, ignoring the saved session"},
         {"audible", "Send program to the device (default: silence)"},
         {"record", "Record every source and the program bus here", "dir"},
@@ -903,9 +1109,18 @@ int main(int argc, char** argv) {
                                            p.value("workers").toInt(),
                                            p.isSet("audible"));
     QString why;
+    daemon->setRingSeconds(p.value("ring-seconds").toDouble());
     if (p.isSet("record"))
         daemon->setRecording(p.value("record"),
                              p.value("ring-seconds").toDouble());
+    // --project DIR, or (without --session) the last project / a new
+    // Untitled. --session keeps the old single-file mode (tests, gates).
+    if (p.isSet("project")) {
+        daemon->setProject(p.value("project"), false);
+    } else if (!p.isSet("session")) {
+        const auto [dir, fresh] = Daemon::defaultProject();
+        daemon->setProject(dir, fresh);
+    }
     const QString session =
         p.isSet("session")
             ? p.value("session")

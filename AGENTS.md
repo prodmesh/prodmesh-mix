@@ -25,6 +25,7 @@ an allocation/lock on the audio thread.
 | `src/ui/` | `ProdMeshMix.app`, the mixer client: theme tokens (mirrors RTA), strip/fader/meter widgets |
 | `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread) |
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
+| `tools/projects_e2e.py` | Projects against a sim mixd: first-run Start offered once, new/open/recent, takes per project |
 | `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
 | `tools/t05_ui_isolation.py` | T0-5 gate: SIGKILL the UI repeatedly under load, check 0 xruns and < 2 s reconnect |
 | `tools/mix_bench.cpp` | Tier 0 bench: reference graph on a driver, timing histogram, live edits |
@@ -37,7 +38,10 @@ rebuilds itself from the daemon's snapshot on every (re)connect. Protocol
 messages are documented at the top of `src/proto/protocol.h`.
 
 Run it: `./build/mixd --driver sim` (or `coreaudio`; add `--audible` to
-hear it), then `open build/ProdMeshMix.app`. `ProdMeshMix --screenshot
+hear it), then `open build/ProdMeshMix.app`. Without `--session`, mixd
+opens the last project (or creates `~/Music/ProdMesh Mix/Untitled`).
+Tools and tests must not touch the user's projects: pass `--session`, or
+set `PM_MIX_HOME` to a temp dir (projects and the recent list go there). `ProdMeshMix --screenshot
 out.png --after 2000` renders the window to a PNG and quits — use it to
 check UI changes visually.
 
@@ -157,6 +161,20 @@ plugin, in order, isolated or not). Without it, adding, removing or
 reordering an insert reverted the channel's other plugins to their last
 saved settings. `mixd --driver sim
 --sim-inputs 8` gives silent device inputs to try it without hardware.
+
+## Projects
+
+A project is a folder: `session.json` (graph, scenes, loudness target,
+`record` setting) and `Takes/<take>/` (WAVs + markers.csv). mixd owns it:
+`newProject` (template blank / inputs / livestream), `openProject`,
+`projects` (recent list, templates, default location). Switching saves
+the current show *before* loading the next (its scenes must not leak),
+validates the new graph with `Engine::validate` (dry compile, no plugin
+loads), finishes the take, then crossfades to the new mix — audio never
+stops. The Start window is offered once, to the first UI of a run that
+created a fresh Untitled; a reconnecting UI never sees it, and it opens
+only after the first snapshot is on screen. `--session FILE` keeps the
+old single-file mode (tests).
 
 ## Scenes
 

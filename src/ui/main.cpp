@@ -18,6 +18,10 @@
 #include "ui/plugin_browser.h"
 #include "ui/scene_bar.h"
 #include "ui/toolbar.h"
+#include "ui/start_dialog.h"
+#include <QDesktopServices>
+#include <QMenuBar>
+#include <QUrl>
 #include <QShortcut>
 #include "ui/widgets.h"
 #include <QFileInfo>
@@ -137,6 +141,7 @@ public:
         scenes_->onStore = [this] { client_.op({{"op", "storeScene"}}); };
         scenes_->onUndo = [this] { client_.op({{"op", "undoRecall"}}); };
         scenes_->onMenu = [this](int id, QPoint at) { sceneMenu(id, at); };
+        buildMenus();
 
         banner_ = new QLabel(
             "Audio engine not reachable. Program audio is down until the "
@@ -200,6 +205,7 @@ public:
 
         client_.onConnected = [this](bool c) {
             health_->setConnected(c);
+            if (c) client_.op({{"op", "projects"}});
             if (!c) setOffline(true);
         };
         client_.onMessage = [this](const QJsonObject& m) { handle(m); };
@@ -276,6 +282,10 @@ private:
             }
             refreshRouting();
             if (glide_.active()) showGlideFrame();  // not the end values yet
+            if (startPending_) {
+                startPending_ = false;
+                QTimer::singleShot(0, this, [this] { openStart(true, /*firstRun=*/true); });
+            }
             QStringList w;
             for (const auto& v : m["warnings"].toArray()) w << v.toString();
             warnings_->setText(
@@ -297,6 +307,18 @@ private:
                              " — audio passed straight through meanwhile.");
             events_->show();
             eventsTimer_.start(15000);
+        } else if (type == "project") {
+            projectPath_ = m["path"].toString();
+            projectName_ = m["name"].toString();
+            setWindowTitle(projectName_.isEmpty() ? QString("ProdMesh Mix")
+                                                  : projectName_ + " — ProdMesh Mix");
+            client_.op({{"op", "projects"}});
+            // Opened once the next snapshot is on screen: the mixer first.
+            if (m["offerStart"].toBool()) startPending_ = true;
+        } else if (type == "projects") {
+            projects_ = m;
+            rebuildRecentMenu();
+            if (start_) start_->setProjects(m);
         } else if (type == "loudness") {
             loudTarget_ = m["target"].toDouble();
             loudTpLimit_ = m["tpLimit"].toDouble();
@@ -551,6 +573,86 @@ private:
 
         if (const auto* p = g.find(program))
             masterHost_->layout()->addWidget(makeStrip(*p, true));
+    }
+
+    // --- Projects: File menu and the Start window -----------------------------
+
+    void buildMenus() {
+        auto* bar = new QMenuBar(this);
+        auto* file = bar->addMenu("File");
+        auto* nw = file->addAction("New Project…");
+        nw->setShortcut(QKeySequence::New);
+        connect(nw, &QAction::triggered, this, [this] { openStart(true); });
+        auto* op = file->addAction("Open Project…");
+        op->setShortcut(QKeySequence::Open);
+        connect(op, &QAction::triggered, this, [this] { openStart(false); });
+        recentMenu_ = file->addMenu("Open Recent");
+        file->addSeparator();
+        auto* show = file->addAction("Show Project in Finder");
+        connect(show, &QAction::triggered, this, [this] {
+            if (!projectPath_.isEmpty())
+                QDesktopServices::openUrl(QUrl::fromLocalFile(projectPath_));
+        });
+        rebuildRecentMenu();
+    }
+
+    void rebuildRecentMenu() {
+        if (!recentMenu_) return;
+        recentMenu_->clear();
+        const auto list = projects_["recent"].toArray();
+        for (const auto& v : list) {
+            const auto o = v.toObject();
+            const QString path = o["path"].toString();
+            auto* a = recentMenu_->addAction(o["name"].toString());
+            a->setToolTip(path);
+            a->setEnabled(path != projectPath_);
+            connect(a, &QAction::triggered, this, [this, path, o] {
+                requestOpen(path, o["name"].toString());
+            });
+        }
+        recentMenu_->setEnabled(!list.isEmpty());
+    }
+
+    // Switching shows mid-show is legitimate (rehearsal -> service) but
+    // never by accident: say what happens, and that audio keeps running.
+    bool confirmSwitch(const QString& next) {
+        if (projectPath_.isEmpty()) return true;
+        QMessageBox box(QMessageBox::Question, "Open " + next,
+                        "Close " + projectName_ + " and open " + next + "?",
+                        QMessageBox::Cancel, this);
+        box.setInformativeText("Program audio keeps running and crossfades to the "
+                               "new show's mix. " + projectName_ +
+                               " is saved and its current take is finished.");
+        auto* go = box.addButton("Open " + next, QMessageBox::AcceptRole);
+        box.exec();
+        return box.clickedButton() == go;
+    }
+    void requestOpen(const QString& path, const QString& name) {
+        if (!confirmSwitch(name.isEmpty() ? QFileInfo(path).fileName() : name)) return;
+        client_.op({{"op", "openProject"}, {"path", path}});
+    }
+
+    void openStart(bool newPage, bool firstRun = false) {
+        if (!client_.connected()) return;
+        if (!start_) {
+            start_ = new StartDialog(this);
+            start_->onCreate = [this](const QString& name, const QString& templ,
+                                      const QString& location, bool record) {
+                if (!startFirstRun_ && !confirmSwitch(name)) return;
+                client_.op({{"op", "newProject"}, {"name", name}, {"template", templ},
+                            {"location", location}, {"record", record}});
+            };
+            start_->onOpen = [this](const QString& path) {
+                if (!startFirstRun_ && !confirmSwitch(QFileInfo(path).fileName())) return;
+                client_.op({{"op", "openProject"}, {"path", path}});
+            };
+        }
+        startFirstRun_ = firstRun;
+        start_->setProjects(projects_);
+        client_.op({{"op", "projects"}});
+        if (newPage) start_->showNew();
+        else start_->showRecent();
+        start_->open();
     }
 
     // --- Scene glide on screen ---------------------------------------------
@@ -1535,6 +1637,11 @@ private:
     }();
     bool loggedSnapshot_ = false;
     TopBar* health_;
+    QString projectPath_, projectName_;
+    QJsonObject projects_;
+    QMenu* recentMenu_ = nullptr;
+    StartDialog* start_ = nullptr;
+    bool startFirstRun_ = false, startPending_ = false;
     double loudTarget_ = -24, loudTpLimit_ = -2;
     SceneBar* scenes_;
     QJsonArray sceneList_;

@@ -79,6 +79,12 @@ bool Engine::setGraph(const GraphDesc& in, std::string* error,
     return true;
 }
 
+bool Engine::validate(const GraphDesc& in, std::string* error) const {
+    GraphDesc g = in;
+    resolveMixMinus(g);
+    return const_cast<Engine*>(this)->compile(g, nullptr, nullptr, error, nullptr) != nullptr;
+}
+
 void Engine::setLevel(NodeId id, float faderDb, bool mute) {
     for (auto* g : {&desired_, &published_})
         if (auto* n = g->find(id)) {

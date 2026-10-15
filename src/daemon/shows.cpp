@@ -109,6 +109,8 @@ GraphDesc livestream() {
     return g;
 }
 
+GraphDesc blank() { return inputs(0); }
+
 GraphDesc inputs(int count) {
     GraphDesc g;
     NodeDesc program;

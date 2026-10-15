@@ -11,6 +11,10 @@ namespace pm::shows {
 // bus for remote guests. Program -> outputs 1-2, mix-minus -> outputs 3-4.
 GraphDesc livestream();
 
+// Nothing but a Program bus (with a limiter) on outputs 1-2: add channels
+// as needed.
+GraphDesc blank();
+
 // One strip per device input ("In 1", ...), spread across a Program bus
 // (with a limiter) on outputs 1-2.
 GraphDesc inputs(int count);

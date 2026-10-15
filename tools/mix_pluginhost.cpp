@@ -196,8 +196,12 @@ int main(int argc, char** argv) {
     // busy machine (a VM, say) delayed some wake-ups by ~2 ms. Created
     // before Ready: the first one in a process costs ~100 ms, which must
     // not be spent passing audio through dry (e.g. after a restart).
-    os_workgroup_interval_t interval = AudioWorkIntervalCreate(
-        "ProdMesh Mix plugin host", OS_CLOCK_MACH_ABSOLUTE_TIME, nullptr);
+    // PM_HOST_NO_INTERVAL=1: without it, for A/B measurements only.
+    os_workgroup_interval_t interval =
+        std::getenv("PM_HOST_NO_INTERVAL")
+            ? nullptr
+            : AudioWorkIntervalCreate("ProdMesh Mix plugin host",
+                                      OS_CLOCK_MACH_ABSOLUTE_TIME, nullptr);
 #endif
     h.state.store(std::uint32_t(sandbox::HostState::Ready), std::memory_order_release);
 

@@ -80,6 +80,9 @@ public:
     // connections keep their short fades.
     bool setGraph(const GraphDesc& g, std::string* error = nullptr,
                   double glideMs = 0);
+    // Would setGraph() accept this? A dry compile: no instances, no
+    // plugin loads, nothing changes.
+    bool validate(const GraphDesc& g, std::string* error = nullptr) const;
 
     // Fader / mute move: ramps on the live instance without a recompile.
     void setLevel(NodeId id, float faderDb, bool mute);

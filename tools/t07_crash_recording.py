@@ -9,6 +9,9 @@ all the data. Exits non-zero on failure.
     tools/t07_crash_recording.py [--build build] [--seconds 4]
 """
 import argparse, glob, os, re, shutil, signal, struct, subprocess, sys, tempfile, time
+import tempfile as _tf
+# Never touch the user's projects or recent list.
+os.environ.setdefault("PM_MIX_HOME", _tf.mkdtemp(prefix="pm-gate-"))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--build", default="build")

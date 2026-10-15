@@ -23,7 +23,7 @@ an allocation/lock on the audio thread.
 | `src/proto/` | Control protocol (JSON lines over a local socket), graph <-> JSON; Qt Core |
 | `src/daemon/` | `mixd`, the engine daemon (Tier 0 process), and built-in show templates |
 | `src/ui/` | `ProdMeshMix.app`, the mixer client: theme tokens (mirrors RTA), strip/fader/meter widgets |
-| `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread) |
+| `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread), `peaks.h` (waveform overviews) |
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
 | `tools/projects_e2e.py` | Projects against a sim mixd: first-run Start offered once, new/open/recent, takes per project |
 | `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
@@ -208,6 +208,19 @@ meters it at 10 Hz and sends `loudness`. Targets (A/85 −24/−2, R128
 −23/−1, −16, −14) are per session. Markers (`addMarker`, button or M)
 are written to `<take>/markers.csv` (take time, sample, wall clock).
 The edit-oriented toolbar (tools, grid, nudge) waits for the timeline.
+
+## Editor view
+
+`src/ui/editor.h`: a project's takes on a timeline (review and navigation
+for now: no playback or editing yet). It never reads audio: the recorder
+writes `<track>.peaks` beside each WAV (min/max per 512 frames, int16,
+append-only, flushed with the WAV headers every second) and `take.json`
+(track files, names, roles, start wall clock) per take; the editor reads
+those, keeps x8 reduction levels for drawing any zoom, and polls a live
+take every 300 ms so it grows on screen. Waveforms are drawn in dB (−48
+floor) so speech is visible; Program is the first lane; sources are raw
+(pre-fader), so a muted source still shows audio. Cmd-= toggles Mixer /
+Editor.
 
 ## Recording
 

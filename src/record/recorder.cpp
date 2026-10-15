@@ -79,6 +79,11 @@ bool Recorder::drain(Track& t, std::vector<float>& buf) {
             setError(err);
             return false;
         }
+        // An overview that cannot be written costs the editor its picture,
+        // never the recording.
+        if (!t.peaks.open(peaksPathFor(t.path), tap.channels(), opt_.sampleRate,
+                          tap.startSample()))
+            setError(t.path + ": could not write its waveform overview");
     }
     const std::size_t chunk = buf.size() / std::size_t(tap.channels());
     while (true) {
@@ -90,7 +95,7 @@ bool Recorder::drain(Track& t, std::vector<float>& buf) {
             std::fill(buf.begin(), buf.end(), 0.0f);
             for (std::uint32_t left = t.gap.frames; left;) {
                 const auto n = std::min<std::size_t>(left, chunk);
-                if (!t.wav.write(buf.data(), n)) return false;
+                if (!write(t, buf.data(), n)) return false;
                 t.written += n;
                 left -= std::uint32_t(n);
             }
@@ -102,13 +107,19 @@ bool Recorder::drain(Track& t, std::vector<float>& buf) {
         if (!want) return true;
         std::uint64_t at = 0;
         const std::size_t n = tap.pop(buf.data(), want, &at);
-        if (!t.wav.write(buf.data(), n)) {
+        if (!write(t, buf.data(), n)) {
             setError(t.path + ": write failed");
             return false;
         }
         t.pos += n;
         t.written += n;
     }
+}
+
+bool Recorder::write(Track& t, const float* x, std::size_t frames) {
+    if (!t.wav.write(x, frames)) return false;
+    t.peaks.add(x, frames);
+    return true;
 }
 
 void Recorder::run() {
@@ -134,8 +145,11 @@ void Recorder::run() {
         for (auto& t : tracks_) drain(*t, buf);
         if (last || clock::now() - lastHeader >= headerEvery) {
             for (auto& t : tracks_)
+            {
                 if (t->wav.isOpen() && !t->wav.flushHeader(true))
                     setError(t->path + ": header update failed");
+                t->peaks.flush();
+            }
             lastHeader = clock::now();
         }
         publishStats();
@@ -143,7 +157,10 @@ void Recorder::run() {
         std::this_thread::sleep_for(
             std::chrono::duration<double, std::milli>(opt_.pollMs));
     }
-    for (auto& t : tracks_) t->wav.close();
+    for (auto& t : tracks_) {
+        t->wav.close();
+        t->peaks.close();
+    }
 }
 
 }  // namespace pm::rec

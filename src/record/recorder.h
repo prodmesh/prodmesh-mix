@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "engine/graph.h"
+#include "record/peaks.h"
 #include "record/record_tap.h"
 #include "record/wav_writer.h"
 
@@ -65,6 +66,7 @@ private:
     struct Track {
         TrackSpec spec;
         WavWriter wav;
+        PeakWriter peaks;  // waveform overview beside the WAV (editor)
         std::string path;
         std::uint64_t pos = 0;  // next pushed-frame index to write
         RecordTap::Gap gap{};
@@ -74,6 +76,7 @@ private:
 
     void run();
     bool drain(Track& t, std::vector<float>& buf);
+    bool write(Track& t, const float* x, std::size_t frames);
     void setError(std::string e);
 
     RecorderOptions opt_;

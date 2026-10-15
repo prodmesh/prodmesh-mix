@@ -237,3 +237,50 @@ TEST(overflow_becomes_silence_and_keeps_alignment) {
     for (float v : recorded) zeros += v == 0.0f;
     CHECK(zeros >= tap->droppedFrames());
 }
+
+// Each WAV gets a waveform overview: min/max per bucket that match the
+// audio exactly (to int16), readable while the take is still growing.
+TEST(recording_writes_a_matching_waveform_overview) {
+    const auto dir = tempDir("peaks");
+    Engine e(cfg());
+    CHECK(e.setGraph(recordGraph()));
+    auto tap = std::make_shared<RecordTap>(1, 48000 * 4);
+    e.setRecordTaps({{2, tap}});
+    RecorderOptions ro;
+    ro.headerIntervalS = 0.05;  // overviews flush with the headers
+    Recorder r(ro);
+    CHECK(r.start(dir, {{2, "Host", tap}}, nullptr));
+    render(e, 200);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // Mid-take: a reader sees what has been written so far...
+    const auto peaks = dir + "/01 Host.peaks";
+    PeakReader live;
+    CHECK(live.open(peaks));
+    const std::size_t early = live.buckets();
+    CHECK(early > 0);
+    render(e, 400);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // ... and picks up what arrives later.
+    CHECK(live.refresh() > 0);
+    CHECK(live.buckets() > early);
+    r.stop();
+    live.refresh();
+
+    const auto audio = readSamples(r.stats()[0].file);
+    CHECK(live.channels() == 1);
+    CHECK(live.header().bucket == kPeakBucket);
+    CHECK(live.buckets() == (audio.size() + kPeakBucket - 1) / kPeakBucket);
+    for (std::size_t b = 0; b < live.buckets(); ++b) {
+        float lo = 1, hi = -1;
+        for (std::size_t i = b * kPeakBucket;
+             i < std::min(audio.size(), (b + 1) * kPeakBucket); ++i) {
+            lo = std::min(lo, audio[i]);
+            hi = std::max(hi, audio[i]);
+        }
+        CHECK_MSG(std::fabs(live.lo(b, 0) - lo) <= 1.0f / 32767 &&
+                      std::fabs(live.hi(b, 0) - hi) <= 1.0f / 32767,
+                  "bucket " + std::to_string(b));
+        if (std::fabs(live.hi(b, 0) - hi) > 1.0f / 32767) break;
+    }
+}

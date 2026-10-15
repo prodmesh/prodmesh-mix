@@ -673,8 +673,16 @@ private:
         std::vector<rec::TrackSpec> tracks;
         std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps;
         const auto ring = std::size_t(ringSeconds_ * driver_->config().sampleRate);
+        QJsonArray manifest;  // take.json: what each file is (the editor)
         auto add = [&](const NodeDesc& n, std::string name) {
             auto tap = std::make_shared<RecordTap>(n.channels, ring);
+            const int index = int(tracks.size());
+            manifest.append(QJsonObject{
+                {"file", QString::fromStdString(rec::Recorder::fileNameFor(index, name))},
+                {"name", QString::fromStdString(name)},
+                {"channels", n.channels},
+                {"node", double(n.id)},
+                {"role", n.kind == NodeKind::Bus ? "program" : "source"}});
             tracks.push_back({n.id, std::move(name), tap});
             taps.push_back({n.id, tap});
         };
@@ -712,6 +720,19 @@ private:
         applyTaps();
         takeClock_.start();
         markers_.clear();
+        {
+            QSaveFile f(recordDir_ + "/" + takeName_ + "/take.json");
+            if (f.open(QIODevice::WriteOnly)) {
+                f.write(QJsonDocument(QJsonObject{
+                            {"format", "prodmesh-mix-take"},
+                            {"take", takeName_},
+                            {"started", QDateTime::currentDateTime().toString(Qt::ISODateWithMs)},
+                            {"sampleRate", driver_->config().sampleRate},
+                            {"tracks", manifest}})
+                            .toJson(QJsonDocument::Indented));
+                f.commit();
+            }
+        }
         qInfo("mixd: recording take \"%s\" to %s", qPrintable(takeName_),
               qPrintable(recordDir_));
         return true;

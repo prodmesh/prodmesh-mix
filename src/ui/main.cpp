@@ -19,6 +19,9 @@
 #include "ui/scene_bar.h"
 #include "ui/toolbar.h"
 #include "ui/start_dialog.h"
+#include "ui/editor.h"
+#include <QStackedWidget>
+#include <QButtonGroup>
 #include <QDesktopServices>
 #include <QMenuBar>
 #include <QUrl>
@@ -174,7 +177,41 @@ public:
         bodyLayout_ = new QHBoxLayout(body);
         bodyLayout_->setContentsMargins(16, 14, 16, 16);
         bodyLayout_->setSpacing(16);
-        outer->addWidget(body, 1);
+        // Two views of one show: the console (Mixer) and the takes on a
+        // timeline (Editor). Cmd-= flips between them, as in Pro Tools.
+        stack_ = new QStackedWidget;
+        stack_->addWidget(body);
+        editor_ = new EditorView;
+        stack_->addWidget(editor_);
+        outer->addWidget(stack_, 1);
+        auto* views = new QWidget;
+        views->setStyleSheet(
+            "QPushButton { background: #1d2129; border: 1px solid #323848; color: #8a92a6;"
+            " font-size: 11px; font-weight: 600; padding: 0 12px; height: 26px; }"
+            "QPushButton:checked { background: #232733; color: #e8ecf4; border-color: #46506a; }"
+            "QPushButton#l { border-top-left-radius: 5px; border-bottom-left-radius: 5px; }"
+            "QPushButton#r { border-top-right-radius: 5px; border-bottom-right-radius: 5px;"
+            " border-left: none; }");
+        auto* vh = new QHBoxLayout(views);
+        vh->setContentsMargins(0, 0, 14, 0);
+        vh->setSpacing(0);
+        mixerBtn_ = new QPushButton("Mixer");
+        mixerBtn_->setObjectName("l");
+        editorBtn_ = new QPushButton("Editor");
+        editorBtn_->setObjectName("r");
+        auto* vg = new QButtonGroup(views);
+        for (auto* b : {mixerBtn_, editorBtn_}) {
+            b->setCheckable(true);
+            b->setCursor(Qt::PointingHandCursor);
+            vg->addButton(b);
+            vh->addWidget(b);
+        }
+        mixerBtn_->setChecked(true);
+        mixerBtn_->setToolTip("The console (Cmd-1; Cmd-= toggles)");
+        editorBtn_->setToolTip("Takes on a timeline (Cmd-2; Cmd-= toggles)");
+        connect(mixerBtn_, &QPushButton::clicked, this, [this] { showView(0); });
+        connect(editorBtn_, &QPushButton::clicked, this, [this] { showView(1); });
+        static_cast<QHBoxLayout*>(scenes_->layout())->insertWidget(0, views);
 
         scroll_ = new QScrollArea;
         scroll_->setWidgetResizable(true);
@@ -310,6 +347,7 @@ private:
         } else if (type == "project") {
             projectPath_ = m["path"].toString();
             projectName_ = m["name"].toString();
+            editor_->setProject(projectPath_);
             setWindowTitle(projectName_.isEmpty() ? QString("ProdMesh Mix")
                                                   : projectName_ + " — ProdMesh Mix");
             client_.op({{"op", "projects"}});
@@ -362,6 +400,8 @@ private:
                 s->setLevel(float(m["faderDb"].toDouble()), m["mute"].toBool());
         } else if (type == "health") {
             health_->setHealth(m);
+            const auto rec = m["recording"].toObject();
+            editor_->setLiveTake(rec["on"].toBool() ? rec["take"].toString() : QString());
             rtIssues_.clear();
             for (const auto& v : m["pluginRt"].toArray()) {
                 const auto o = v.toObject();
@@ -594,6 +634,24 @@ private:
                 QDesktopServices::openUrl(QUrl::fromLocalFile(projectPath_));
         });
         rebuildRecentMenu();
+
+        auto* view = bar->addMenu("View");
+        auto* mx = view->addAction("Mixer");
+        mx->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_1));
+        connect(mx, &QAction::triggered, this, [this] { showView(0); });
+        auto* ed = view->addAction("Editor");
+        ed->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_2));
+        connect(ed, &QAction::triggered, this, [this] { showView(1); });
+        auto* tg = view->addAction("Toggle Mixer / Editor");
+        tg->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Equal));
+        connect(tg, &QAction::triggered, this,
+                [this] { showView(stack_->currentIndex() ? 0 : 1); });
+    }
+
+    void showView(int i) {
+        stack_->setCurrentIndex(i);
+        (i ? editorBtn_ : mixerBtn_)->setChecked(true);
+        if (i) editor_->setFocus();
     }
 
     void rebuildRecentMenu() {
@@ -1637,6 +1695,9 @@ private:
     }();
     bool loggedSnapshot_ = false;
     TopBar* health_;
+    QStackedWidget* stack_;
+    EditorView* editor_;
+    QPushButton *mixerBtn_, *editorBtn_;
     QString projectPath_, projectName_;
     QJsonObject projects_;
     QMenu* recentMenu_ = nullptr;

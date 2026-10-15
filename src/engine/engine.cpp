@@ -617,11 +617,14 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
 // --- audio thread --------------------------------------------------------
 
 void Engine::activate(RenderPlan* plan) {
+    // Stop what the new plan drops *before* retiring the old plan: those
+    // instances are owned by it, and the control thread may free a
+    // retired plan at any moment (found by TSan with free-running edits).
+    for (NodeInstance* n : plan->stopping) n->stopProcessing();
     if (active_ && !retired_.push(active_)) {
         // Unreachable while publication is gated; leaking beats freeing
         // on the audio thread.
     }
-    for (NodeInstance* n : plan->stopping) n->stopProcessing();
     active_ = plan;
     for (const auto& t : plan->edgeTargets)
         t.edge->setTargets(t.m, t.samples > 0 ? t.samples : plan->xfadeLen);

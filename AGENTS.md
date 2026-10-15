@@ -91,7 +91,12 @@ cmake -S . -B build -G Ninja && cmake --build build
   ```
   with `-DPM_SANITIZE=ON` (ASan+UBSan), `-DPM_TSAN=ON`, `-DPM_RTSAN=ON`;
   `-DPM_UBSAN=ON` also works with Apple clang. All must pass `mix-tests`,
-  and RTSan/TSan should also run `mix-bench --workers 3 --edits 20`.
+  and RTSan/TSan should also run `mix-bench --workers 3 --edits 20` with
+  **`--driver free`** as well as `sim`: back-to-back blocks make the
+  control thread race the audio thread far more often (that is how the
+  activate/retire use-after-free was found). CI (`.github/workflows`)
+  runs all of it on every push; it cannot judge dropouts (shared VMs),
+  only the soak on real hardware can.
 - RTSan checks everything reachable from functions marked `PM_NONBLOCKING`
   (`Engine::process`, `WorkerPool::work`): mark new audio-thread entry
   points the same way.

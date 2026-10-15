@@ -311,9 +311,13 @@ TEST(sandboxed_plugin_crash_keeps_audio_running) {
     CHECK_MSG(bad == 0, std::to_string(bad) + " samples differ across the crash");
     const auto events = e.drainEvents();
     CHECK(!events.empty());
-    bool crashed = false;
-    for (const auto& ev : events) crashed = crashed || ev.find("crashed") != std::string::npos;
-    CHECK_MSG(crashed, events.empty() ? "no events" : events[0]);
+    // Either way the host is replaced: it crashes, or (under a sanitizer
+    // that takes its time writing a report) the watchdog kills it first.
+    bool recovered = false;
+    for (const auto& ev : events)
+        recovered = recovered || ev.find("crashed") != std::string::npos ||
+                    ev.find("stopped responding") != std::string::npos;
+    CHECK_MSG(recovered, events.empty() ? "no events" : events[0]);
     if (std::getenv("PM_TEST_VERBOSE"))
         for (const auto& ev : events) std::printf("        event: %s\n", ev.c_str());
     CHECK(rt::violations() == 0);

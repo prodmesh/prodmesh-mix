@@ -38,6 +38,7 @@
 
 #include "daemon/shows.h"
 #include "dsp/loudness.h"
+#include "record/player.h"
 #include "driver/driver.h"
 #include "engine/engine.h"
 #include "proto/protocol.h"
@@ -180,6 +181,14 @@ public:
         sceneTimer_.start(250);
         connect(&loudTimer_, &QTimer::timeout, this, &Daemon::meterLoudness);
         loudTimer_.start(100);
+        connect(&transportTimer_, &QTimer::timeout, this, [this] {
+            // The end of the take stops the transport, as in any DAW.
+            if (player_ && player_->set()->wantRoll.load() && playLength_ > 0 &&
+                double(player_->set()->position.load()) / driver_->config().sampleRate >=
+                    playLength_)
+                player_->set()->wantRoll = false;
+            broadcast(transportMessage(), nullptr);
+        });
 
         qInfo("mixd: running on %s: %d in / %d out, %.0f Hz, block %d, socket %s",
               driver_->deviceName().c_str(), driver_->config().numInputs,
@@ -222,6 +231,7 @@ private:
             send(s, catalogMessage());
             send(s, scenesMessage());
             send(s, markersMessage());
+            send(s, transportMessage());
         } else if (op == "ping") {
             send(s, {{"type", "pong"}, {"t", m["t"]}});
         } else if (op == "setLevel") {
@@ -264,6 +274,12 @@ private:
             QString err;
             if (!(op == "newProject" ? newProject(m, &err) : openProject(m["path"].toString(), &err)))
                 send(s, {{"type", "error"}, {"op", op}, {"message", err}});
+        } else if (op == "enterPlayback" || op == "exitPlayback" || op == "transport") {
+            QString err;
+            const bool ok = op == "enterPlayback" ? enterPlayback(m["take"].toString(), &err)
+                            : op == "exitPlayback" ? exitPlayback(&err)
+                                                   : transport(m, &err);
+            if (!ok) send(s, {{"type", "error"}, {"op", op}, {"message", err}});
         } else if (op == "resetLoudness") {
             if (loud_) loud_->reset();
         } else if (op == "setLoudnessTarget") {
@@ -454,6 +470,175 @@ private:
         applyTaps();          // the audio thread stops feeding the old take
         recorder_->stop();    // then drain and close its files
         recorder_.reset();
+    }
+
+    // --- playback (virtual soundcheck) ----------------------------------------
+    // The recorded raw sources go back into their source nodes in place of
+    // the live inputs, through the whole mix and out of the outputs. A
+    // deliberate mode: recording stops (the take is finished) and returns
+    // with a new take when going back to live.
+
+    QJsonObject transportMessage() const {
+        const auto* set = player_ ? player_->set().get() : nullptr;
+        const double fs = driver_->config().sampleRate;
+        return {{"type", "transport"},
+                {"mode", playTake_.isEmpty() ? "live" : "playback"},
+                {"take", playTake_},
+                {"playing", set && set->wantRoll.load()},
+                {"position", set ? double(set->position.load()) / fs : 0.0},
+                {"length", playLength_},
+                {"underruns", set ? double(set->underruns.load()) : 0.0},
+                {"tracks", int(playTracks_.size())}};
+    }
+
+    // Source nodes dip (5 ms ramps) around a mode change so live and
+    // replayed audio never cut in or out abruptly; their own mute states
+    // are restored exactly.
+    void sourcesQuiet(bool quiet) {
+        for (const auto& n : engine_->graph().nodes) {
+            if (n.kind != NodeKind::Input && n.kind != NodeKind::Generator) continue;
+            if (quiet) savedMutes_[n.id] = n.mute;
+            const bool restore = savedMutes_.value(n.id, n.mute);
+            engine_->setLevel(n.id, n.faderDb, quiet ? true : restore);
+        }
+        if (!quiet) savedMutes_.clear();
+    }
+
+    // Opens the take at `frame` and hands the engine the new set once its
+    // rings are primed (or after 1 s regardless: underruns are counted).
+    void openAt(std::uint64_t frame, bool roll, std::function<void()> done) {
+        auto player = std::make_unique<rec::Player>();
+        std::string err;
+        std::vector<rec::PlayerTrack> tracks(playTracks_.begin(), playTracks_.end());
+        if (!player->open(tracks, frame, 4.0, &err)) {
+            qWarning("mixd: playback: %s", err.c_str());
+            switching_ = false;
+            return;
+        }
+        auto* raw = player.release();
+        auto start = std::make_shared<QElapsedTimer>();
+        start->start();
+        auto poll = std::make_shared<std::function<void()>>();
+        *poll = [this, raw, start, roll, done, poll] {
+            const auto fs = std::size_t(driver_->config().sampleRate);
+            if (!raw->primed(fs / 2) && start->elapsed() < 1000) {
+                QTimer::singleShot(10, this, *poll);
+                return;
+            }
+            std::unique_ptr<rec::Player> old = std::move(player_);
+            player_.reset(raw);
+            player_->set()->wantRoll = pendingRoll_ >= 0 ? pendingRoll_ == 1 : roll;
+            pendingRoll_ = -1;
+            engine_->setPlayback(player_->set());
+            // The old set lives on in plans until they retire; its reader
+            // can stop now (its rings simply stop filling).
+            if (old) old->close();
+            switching_ = false;
+            broadcast(transportMessage(), nullptr);
+            if (done) done();
+        };
+        QTimer::singleShot(0, this, *poll);
+    }
+
+    bool enterPlayback(const QString& take, QString* err) {
+        if (switching_) { *err = "Busy switching; try again."; return false; }
+        if (projectDir_.isEmpty()) { *err = "Playback needs a project."; return false; }
+        const QString dir = projectDir_ + "/Takes/" + take;
+        QFile f(dir + "/take.json");
+        if (!f.open(QIODevice::ReadOnly)) { *err = "That take has no take.json."; return false; }
+        const auto doc = QJsonDocument::fromJson(f.readAll()).object();
+        QList<rec::PlayerTrack> tracks;
+        const auto& g = engine_->graph();
+        for (const auto& v : doc["tracks"].toArray()) {
+            const auto o = v.toObject();
+            if (o["role"].toString() != "source") continue;
+            const auto* n = g.find(NodeId(o["node"].toDouble()));
+            if (!n || (n->kind != NodeKind::Input && n->kind != NodeKind::Generator)) continue;
+            tracks.append({n->id, (dir + "/" + o["file"].toString()).toStdString()});
+        }
+        if (tracks.isEmpty()) {
+            *err = "None of that take's sources exist in this show any more.";
+            return false;
+        }
+        // Playing back the take being recorded is fine: it is finished
+        // (stopTake) before the player opens its files.
+        switching_ = true;
+        sourcesQuiet(true);
+        QTimer::singleShot(30, this, [this, take, tracks] {
+            stopTake();
+            playTake_ = take;
+            playTracks_ = tracks;
+            rec::WavInfo info;
+            playLength_ = 0;
+            for (const auto& t : tracks)
+                if (rec::WavWriter::readInfo(t.wav, info))
+                    playLength_ = std::max(playLength_, double(info.frames) / info.sampleRate);
+            openAt(0, false, [this] {
+                QTimer::singleShot(30, this, [this] { sourcesQuiet(false); });
+                transportTimer_.start(66);
+                qInfo("mixd: playback of take %s (%lld sources)", qPrintable(playTake_),
+                      qint64(playTracks_.size()));
+            });
+        });
+        return true;
+    }
+
+    bool exitPlayback(QString* err) {
+        if (playTake_.isEmpty()) { *err = "Not in playback."; return false; }
+        if (switching_) { *err = "Busy switching; try again."; return false; }
+        switching_ = true;
+        if (player_) player_->set()->wantRoll = false;  // fades out
+        QTimer::singleShot(30, this, [this] {
+            sourcesQuiet(true);
+            QTimer::singleShot(30, this, [this] {
+                engine_->setPlayback(nullptr);
+                if (player_) player_->close();
+                playTake_.clear();
+                playTracks_.clear();
+                playLength_ = 0;
+                transportTimer_.stop();
+                QTimer::singleShot(30, this, [this] {
+                    sourcesQuiet(false);  // live inputs ramp back in
+                    player_.reset();
+                    switching_ = false;
+                    QString e;
+                    if (!recordDir_.isEmpty() && !startTake(&e))
+                        qWarning("mixd: recording did not restart: %s", qPrintable(e));
+                    broadcast(transportMessage(), nullptr);
+                    qInfo("mixd: back to live inputs");
+                });
+            });
+        });
+        return true;
+    }
+
+    bool transport(const QJsonObject& m, QString* err) {
+        if (playTake_.isEmpty() || !player_) { *err = "Not in playback."; return false; }
+        const QString action = m["action"].toString();
+        auto& set = *player_->set();
+        if ((action == "play" || action == "stop") && switching_) {
+            // A locate is opening the new position: apply it there.
+            pendingRoll_ = action == "play" ? 1 : 0;
+        } else if (action == "play") {
+            set.wantRoll = true;
+        } else if (action == "stop") {
+            set.wantRoll = false;
+        } else if (action == "locate") {
+            if (switching_) { *err = "Busy; try again."; return false; }
+            const double fs = driver_->config().sampleRate;
+            const auto frame = std::uint64_t(std::clamp(m["seconds"].toDouble(), 0.0, playLength_) * fs);
+            const bool roll = set.wantRoll.load();
+            switching_ = true;
+            set.wantRoll = false;  // fade out here, resume there
+            QTimer::singleShot(roll ? 20 : 0, this, [this, frame, roll] {
+                openAt(frame, roll, nullptr);
+            });
+        } else {
+            *err = "unknown transport action";
+            return false;
+        }
+        broadcast(transportMessage(), nullptr);
+        return true;
     }
 
     // --- program loudness (BS.1770) and markers ----------------------------
@@ -1043,6 +1228,15 @@ private:
         QString wall, label;
     };
     QList<Marker> markers_;
+    // Playback (virtual soundcheck): a take replayed into the sources.
+    std::unique_ptr<rec::Player> player_;
+    QString playTake_;            // take folder name, empty = live
+    QList<rec::PlayerTrack> playTracks_;
+    double playLength_ = 0;       // seconds
+    QTimer transportTimer_;
+    bool switching_ = false;      // a mode change / locate is in progress
+    int pendingRoll_ = -1;        // play (1) / stop (0) asked for mid-switch
+    QMap<NodeId, bool> savedMutes_;
     QProcess* scanner_ = nullptr;
     QList<Scene> scenes_;
     int currentScene_ = 0, nextSceneId_ = 1;

@@ -63,6 +63,10 @@ public:
         connect(&tick_, &QTimer::timeout, this, [this] { update(); });
         tick_.start();
     }
+    void setTransport(const QJsonObject& t) {
+        transport_ = t;
+        update();
+    }
     void setRecording(const QJsonObject& r, bool connected) {
         connected_ = connected;
         rec_ = r;
@@ -91,6 +95,16 @@ protected:
         p.drawText(QRect(0, 4, width(), 30), Qt::AlignLeft | Qt::AlignVCenter,
                    QTime::currentTime().toString("HH:mm:ss"));
         const QRect line(0, 36, width(), 18);
+        if (connected_ && transport_["mode"].toString() == "playback") {
+            // Playback replaces recording: say so where REC would be.
+            const bool playing = transport_["playing"].toBool();
+            p.setFont(uiFont(this, 11, QFont::DemiBold, 0.5));
+            p.setPen(playing ? theme::accentHi : theme::warn);
+            p.drawText(line, Qt::AlignLeft | Qt::AlignVCenter,
+                       QString(playing ? "▶ " : "■ ") + hms(transport_["position"].toDouble()) +
+                           "  /  " + hms(transport_["length"].toDouble()));
+            return;
+        }
         if (!connected_ || !rec_["on"].toBool()) {
             p.setFont(uiFont(this, 11));
             p.setPen(theme::text);
@@ -120,7 +134,7 @@ protected:
 
 private:
     QTimer tick_;
-    QJsonObject rec_;
+    QJsonObject rec_, transport_;
     bool connected_ = false;
 };
 
@@ -316,6 +330,7 @@ public:
     void setLoudness(const QJsonObject& m) {
         if (connected_) loud_->setLoudness(m);
     }
+    void setTransport(const QJsonObject& t) { clock_->setTransport(t); }
     // The newest marker flashes on the button for a moment.
     void setMarkers(int count, const QString& newest) {
         const bool added = count > markers_;

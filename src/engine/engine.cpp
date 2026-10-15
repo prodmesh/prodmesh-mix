@@ -172,6 +172,12 @@ void Engine::setRecordTaps(
     pump();
 }
 
+void Engine::setPlayback(std::shared_ptr<PlaybackSet> set) {
+    playback_ = std::move(set);
+    dirty_ = true;
+    pump();
+}
+
 std::vector<Engine::PluginRtIssue> Engine::pluginRtIssues() const {
     std::vector<PluginRtIssue> out;
     for (const auto& [id, inst] : live_.nodes)
@@ -306,6 +312,8 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
     auto plan = std::make_unique<RenderPlan>();
     const bool first = !prev || publishedSerial_ == 0;
     plan->xfadeLen = first ? 0 : transitionSamples_;
+    plan->playback = playback_.get();
+    plan->playbackHold = playback_;
     const bool dry = !live;
     Live scratch;
     if (!live) live = &scratch;
@@ -392,6 +400,8 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
         s.meter = meter.get();
         plan->meters.push_back(meter);
         live->meters[d.id] = meter;
+        if (playback_ && (d.kind == NodeKind::Input || d.kind == NodeKind::Generator))
+            s.feed = playback_->feedFor(d.id);
         std::size_t ntaps = 0;
         for (const auto& [id, tap] : taps_)
             if (id == d.id && tap->channels() == d.channels &&
@@ -632,7 +642,17 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
     if (s.dying && !p.fading()) return;
     float* const* buf = &p.chan[s.buf];
 
-    switch (s.kind) {
+    // Playback mode: sources play their recording (or nothing), never the
+    // live input or the test tone; everything downstream is unchanged.
+    const bool fromRecording =
+        p.playback && (s.kind == NodeKind::Input || s.kind == NodeKind::Generator);
+    if (fromRecording) {
+        if (s.feed && sliceBlock_.play)
+            s.feed->read(buf, s.nch, frames, sliceBlock_.g0, sliceBlock_.g1);
+        else
+            for (int c = 0; c < s.nch; ++c)
+                std::memset(buf[c], 0, sizeof(float) * std::size_t(frames));
+    } else switch (s.kind) {
     case NodeKind::Input:
         for (int c = 0; c < s.nch; ++c) {
             const int dev = s.ioChannel + c;
@@ -659,7 +679,7 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
         break;
     }
 
-    if (s.fadeOut && p.fading()) {
+    if (s.fadeOut && p.fading() && !fromRecording) {
         float* const* fade = &p.chan[s.fadeBuf];
         for (int c = 0; c < s.nch; ++c)
             std::memcpy(fade[c], buf[c], sizeof(float) * frames);
@@ -672,8 +692,8 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
             for (int c = 0; c < s.nch; ++c)
                 buf[c][i] = buf[c][i] * g + fade[c][i] * (1.0f - g);
         }
-    } else {
-        s.node->process(buf, frames);
+    } else if (!(fromRecording && s.kind == NodeKind::Generator)) {
+        s.node->process(buf, frames);  // (a generator would overwrite it)
     }
 
     // Dying steps keep their level; their edges carry the fade.
@@ -710,6 +730,8 @@ void Engine::process(const float* const* in, int numIn, float* const* out,
             slice[c] = in && in[c] ? in[c] + off : nullptr;
 
         sliceTime_ = sampleTime_;  // read by workers after the gen bump
+        sliceBlock_ = p.playback ? p.playback->begin(n, levelRampSamples_)
+                                 : PlaybackSet::Block{};
         if (pool_)
             pool_->run(p, slice, ins, n);
         else
@@ -730,6 +752,7 @@ void Engine::process(const float* const* in, int numIn, float* const* out,
             }
         }
 
+        if (sliceBlock_.play) p.playback->advance(n);
         sampleTime_ += std::uint64_t(n);
         if (p.fading()) {
             p.xfadePos += n;

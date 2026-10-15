@@ -32,6 +32,7 @@
 #include "core/rt_thread.h"
 #include "core/spsc_queue.h"
 #include "engine/graph.h"
+#include "record/playback.h"
 
 namespace pm {
 
@@ -101,6 +102,13 @@ public:
     // next plan (no change to the audio itself).
     void setRecordTaps(
         std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> taps);
+
+    // Playback ("virtual soundcheck"): with a set, every Input / Generator
+    // node plays its recording from it instead of the live input or tone
+    // (silent if it has none); null returns to live. Takes effect with the
+    // next plan; transport (play / stop / position) lives in the set.
+    void setPlayback(std::shared_ptr<PlaybackSet> set);
+    bool playbackMode() const { return playback_ != nullptr; }
 
     // Post-fader meters since the last read; false for an unknown node.
     // Reads reset the accumulators, so one reader (the daemon) owns them.
@@ -206,6 +214,8 @@ private:
     bool resyncLevels_ = false;
     std::uint64_t levelSeq_ = 0;
     int glideSamples_ = 0;  // for the next published plan
+    std::shared_ptr<PlaybackSet> playback_;
+    PlaybackSet::Block sliceBlock_{};  // audio thread: this block's playback
     std::string lastError_;
     Live live_;
     std::vector<NodeInstance*> publishedNodes_;

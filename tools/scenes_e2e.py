@@ -6,6 +6,8 @@ import argparse, socket, json, os, sys, tempfile, time, subprocess
 ap = argparse.ArgumentParser(); ap.add_argument("--build", default="build")
 args = ap.parse_args(); build = args.build
 tmp = tempfile.mkdtemp(prefix="pm-scenes-")
+import atexit, shutil
+atexit.register(shutil.rmtree, tmp, True)  # recordings add up
 sock = "pm-scenes-%d" % os.getpid(); sess = tmp + "/session.json"
 sockdir = os.environ.get("TMPDIR", "/tmp/")
 daemons=[]

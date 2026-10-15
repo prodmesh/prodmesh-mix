@@ -10,6 +10,7 @@
 
 #include "core/rt_guard.h"
 #include "engine/engine.h"
+#include "record/player.h"
 #include "record/recorder.h"
 #include "record/wav_writer.h"
 #include "test.h"
@@ -283,4 +284,75 @@ TEST(recording_writes_a_matching_waveform_overview) {
                   "bucket " + std::to_string(b));
         if (std::fabs(live.hi(b, 0) - hi) > 1.0f / 32767) break;
     }
+}
+
+// --- playback (virtual soundcheck) -------------------------------------------
+
+// A take played back into the source node, through the same mix, gives
+// the same output, bit for bit (after the 5 ms fade-in).
+TEST(playback_reproduces_the_recording) {
+    const auto dir = tempDir("playback");
+    Engine a(cfg());
+    CHECK(a.setGraph(recordGraph()));
+    auto tap = std::make_shared<RecordTap>(1, 48000 * 4);
+    a.setRecordTaps({{1, tap}});  // the raw source (generator), as mixd records it
+    Recorder r({});
+    CHECK(r.start(dir, {{1, "Host", tap}}, nullptr));
+    const auto live = render(a, 300);
+    r.stop();
+    const std::string wav = r.stats()[0].file;
+    WavInfo info;
+    CHECK(WavWriter::readInfo(wav, info));
+    const std::size_t offset = live.size() - info.frames;  // tap armed at a block edge
+
+    Engine b(cfg());
+    CHECK(b.setGraph(recordGraph()));
+    Player player;
+    CHECK(player.open({{1, wav}}, 0, 2.0, nullptr));
+    for (int i = 0; i < 200 && !player.primed(48000); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    b.setPlayback(player.set());
+    render(b, 2);  // the playback plan is live; the transport is stopped
+    player.set()->wantRoll = true;
+    const auto replay = render(b, 200);
+    const std::size_t fade = 512;
+    CHECK(replay.size() > fade);
+    CHECK(std::memcmp(replay.data() + fade, live.data() + offset + fade,
+                      (replay.size() - fade) * sizeof(float)) == 0);
+    CHECK(player.set()->position.load() == replay.size());
+    CHECK(player.set()->underruns.load() == 0);
+
+    // Stop fades out, and the position holds.
+    player.set()->wantRoll = false;
+    const auto tail = render(b, 20);
+    CHECK(tail.back() == 0.0f);
+    CHECK(!player.set()->rolling.load());
+    const auto held = player.set()->position.load();
+    render(b, 10);
+    CHECK(player.set()->position.load() == held);
+
+    // Back to live: the generator plays again.
+    b.setPlayback(nullptr);
+    const auto back = render(b, 1000);  // > the tone's longest quiet segment (1.5 s)
+    float pk = 0;
+    for (float v : back) pk = std::max(pk, std::fabs(v));
+    CHECK_MSG(pk > 0.1f, "live peak " + std::to_string(pk));
+    CHECK(rt::violations() == 0);
+}
+
+// Tracks never drift: if any ring is short, nobody plays or advances.
+TEST(playback_underrun_keeps_tracks_aligned) {
+    PlaybackSet set;
+    set.feeds.push_back(std::make_unique<PlaybackFeed>(1, 1, 4096));
+    set.feeds.push_back(std::make_unique<PlaybackFeed>(2, 1, 4096));
+    std::vector<float> ones(1024, 1.0f);
+    set.feeds[0]->write(ones.data(), 1024);
+    set.wantRoll = true;
+    auto b = set.begin(128, 240);
+    CHECK(!b.play);
+    CHECK(set.underruns.load() == 1);
+    set.feeds[1]->write(ones.data(), 1024);
+    b = set.begin(128, 240);
+    CHECK(b.play);
+    CHECK(b.g0 == 0.0f && b.g1 > 0.0f);  // fades in
 }

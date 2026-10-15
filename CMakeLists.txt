@@ -48,6 +48,7 @@ add_library(mix_engine STATIC
     src/driver/sim_driver.cpp
     src/record/wav_writer.cpp
     src/record/recorder.cpp
+    src/record/player.cpp
     src/plugin/plugin.cpp
     src/plugin/clap_host.cpp
     src/plugin/vst3_host.cpp

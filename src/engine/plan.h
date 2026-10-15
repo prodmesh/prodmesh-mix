@@ -13,6 +13,7 @@
 
 #include "engine/graph.h"
 #include "engine/node.h"
+#include "record/playback.h"
 #include "record/record_tap.h"
 
 namespace pm {
@@ -31,6 +32,7 @@ struct PlanStep {
     MeterState* meter = nullptr;
     // Recorder, loudness meter, ...: every tap on this node's output.
     std::array<RecordTap*, 4> taps{};
+    PlaybackFeed* feed = nullptr;  // playback mode: this source's recording
     int nch = 1;
     int buf = 0;      // first channel in RenderPlan::chan
     int fadeBuf = 0;  // first scratch channel for fadeOut
@@ -63,6 +65,10 @@ struct RenderPlan {
     std::vector<std::shared_ptr<LevelState>> levelStates;
     std::vector<std::shared_ptr<MeterState>> meters;
     std::vector<std::shared_ptr<RecordTap>> taps;
+    // Playback mode: sources play this set instead of live inputs / tones
+    // (and are silent when they have no recording).
+    PlaybackSet* playback = nullptr;
+    std::shared_ptr<PlaybackSet> playbackHold;
     // Instances of the previous plan this one drops (owned by that plan).
     std::vector<NodeInstance*> stopping;
 

@@ -169,6 +169,26 @@ public:
             " padding: 7px 16px; border-bottom: 1px solid #e5484d;");
         events_->hide();
         outer->addWidget(events_);
+        // Playback is a mode the operator must never forget they are in.
+        playbackBar_ = new QWidget;
+        playbackBar_->setAttribute(Qt::WA_StyledBackground);
+        playbackBar_->setStyleSheet(
+            "QWidget { background: #362f1a; border-bottom: 1px solid #e0c05c; }"
+            "QLabel { color: #f3e3b0; font-size: 13px; font-weight: 600; border: none; }"
+            "QPushButton { background: #e0c05c; color: #1a1406; border: none; border-radius: 5px;"
+            " font-size: 12px; font-weight: 700; padding: 5px 14px; }"
+            "QPushButton:hover { background: #f3d77a; }");
+        auto* pb = new QHBoxLayout(playbackBar_);
+        pb->setContentsMargins(16, 6, 16, 6);
+        playbackLabel_ = new QLabel;
+        pb->addWidget(playbackLabel_, 1);
+        auto* back = new QPushButton("Back to live");
+        back->setCursor(Qt::PointingHandCursor);
+        pb->addWidget(back);
+        connect(back, &QPushButton::clicked, this,
+                [this] { client_.op({{"op", "exitPlayback"}}); });
+        playbackBar_->hide();
+        outer->addWidget(playbackBar_);
         eventsTimer_.setSingleShot(true);
         connect(&eventsTimer_, &QTimer::timeout, events_, &QLabel::hide);
 
@@ -183,6 +203,26 @@ public:
         stack_->addWidget(body);
         editor_ = new EditorView;
         // A track is a recorded source: soloing it solos the channels it feeds.
+        editor_->onPlayTake = [this](const QString& take) {
+            QMessageBox box(QMessageBox::Question, "Play back " + take,
+                            "Play back " + take + " through the mix?", QMessageBox::Cancel, this);
+            box.setInformativeText(
+                "Its recorded sources replace the live inputs: inserts, sends, buses "
+                "and every output carry the replay (virtual soundcheck). Recording "
+                "stops until you go back to live.");
+            auto* go = box.addButton("Play back", QMessageBox::AcceptRole);
+            box.exec();
+            if (box.clickedButton() == go) client_.op({{"op", "enterPlayback"}, {"take", take}});
+        };
+        editor_->onTransport = [this](const QString& action, double t) {
+            client_.op({{"op", "transport"}, {"action", action}, {"seconds", t}});
+        };
+        // Space: play / stop, in playback mode.
+        auto* space = new QShortcut(QKeySequence(Qt::Key_Space), this);
+        connect(space, &QShortcut::activated, this, [this] {
+            if (editor_->inPlayback())
+                client_.op({{"op", "transport"}, {"action", editor_->playing() ? "stop" : "play"}});
+        });
         editor_->onSolo = [this](quint32 source, bool on) {
             GraphDesc g = graph_;
             for (const auto& e : graph_.edges)
@@ -391,6 +431,18 @@ private:
             projects_ = m;
             rebuildRecentMenu();
             if (start_) start_->setProjects(m);
+        } else if (type == "transport") {
+            const bool playback = m["mode"].toString() == "playback";
+            playbackLabel_->setText(
+                "PLAYBACK · " + m["take"].toString() +
+                "  —  the inputs are this recording, not live. Program and every output "
+                "carry the replay." +
+                (m["underruns"].toDouble() > 0
+                     ? QString("  (%1 disk underruns)").arg(m["underruns"].toDouble())
+                     : QString()));
+            playbackBar_->setVisible(playback);
+            health_->setTransport(m);
+            editor_->setTransport(m);
         } else if (type == "loudness") {
             loudTarget_ = m["target"].toDouble();
             loudTpLimit_ = m["tpLimit"].toDouble();
@@ -1812,6 +1864,8 @@ private:
     EditorView* editor_;
     QPushButton *mixerBtn_, *editorBtn_;
     QPushButton* soloPill_ = nullptr;
+    QWidget* playbackBar_;
+    QLabel* playbackLabel_;
     QString projectPath_, projectName_;
     QJsonObject projects_;
     QMenu* recentMenu_ = nullptr;

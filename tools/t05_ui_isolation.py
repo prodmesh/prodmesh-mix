@@ -12,6 +12,8 @@ import argparse, json, os, re, signal, socket, subprocess, sys, tempfile, time
 import tempfile as _tf
 # Never touch the user's projects or recent list.
 os.environ.setdefault("PM_MIX_HOME", _tf.mkdtemp(prefix="pm-gate-"))
+import atexit as _ax, shutil as _sh
+_ax.register(_sh.rmtree, os.environ["PM_MIX_HOME"], True)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--build", default="build")

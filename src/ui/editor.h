@@ -223,8 +223,18 @@ public:
     static constexpr int kHeader = 150, kRuler = 30, kLane = 64, kGap = 4;
     std::function<void()> onViewChanged;  // zoom / scroll / follow changed
     std::function<void(quint32 node, bool on)> onSolo;
+    std::function<void(double seconds)> onLocate;  // playback: click = go there
     void setSoloed(const QSet<quint32>& s) {
         soloed_ = s;
+        update();
+    }
+    // Playback of this take: the playhead (green), or -1.
+    void setPlayhead(double t, bool playing) {
+        playhead_ = t;
+        playing_ = playing;
+        if (t >= 0 && playing && followPlay_) {
+            if (t > t0_ + width_s() * 0.92 || t < t0_) t0_ = std::max(0.0, t - width_s() * 0.1);
+        }
         update();
     }
 
@@ -232,6 +242,11 @@ public:
         setFocusPolicy(Qt::StrongFocus);
         setMouseTracking(true);
         setAttribute(Qt::WA_OpaquePaintEvent);
+    }
+    // No take loaded, but one is being recorded (its files are on the way).
+    void setWaiting(bool w) {
+        waiting_ = w;
+        update();
     }
     void setTake(Take* t, bool live) {
         take_ = t;
@@ -271,7 +286,9 @@ public:
     }
     void fit() {
         if (!take_) return;
-        const double len = std::max(1.0, take_->seconds());
+        // At least a minute: a take that just started must not open at
+        // sample level (and a live one grows into the view).
+        const double len = std::max(60.0, take_->seconds());
         spp_ = len * 1.02 / std::max(100, laneWidth());
         t0_ = 0;
         followLive_ = false;
@@ -331,8 +348,9 @@ protected:
             p.setPen(theme::text);
             p.setFont(uiFont(this, 13));
             p.drawText(rect(), Qt::AlignCenter,
-                       "No recordings in this project yet.\nTakes appear here as soon as "
-                       "recording starts.");
+                       waiting_ ? "Recording… the first audio of this take appears in a moment."
+                                : "No recordings in this project yet.\nTakes appear here as "
+                                  "soon as recording starts.");
             return;
         }
         const int w = width();
@@ -419,6 +437,13 @@ protected:
                 p.drawLine(QPointF(x, kRuler), QPointF(x, height()));
             }
         }
+        if (playhead_ >= 0) {
+            const double x = xAt(playhead_);
+            if (x >= kHeader && x <= w) {
+                p.setPen(QPen(playing_ ? theme::accentHi : theme::accent, 2));
+                p.drawLine(QPointF(x, 0), QPointF(x, height()));
+            }
+        }
         if (cursor_ >= 0) {
             const double x = xAt(cursor_);
             if (x >= kHeader && x <= w) {
@@ -481,6 +506,7 @@ protected:
         }
         if (e->position().x() < kHeader || !take_) return;
         cursor_ = std::clamp(timeAt(e->position().x()), 0.0, take_->seconds());
+        if (playhead_ >= 0 && onLocate) onLocate(cursor_);
         update();
         if (onViewChanged) onViewChanged();
     }
@@ -536,6 +562,8 @@ private:
     double spp_ = 0.05, t0_ = 0, cursor_ = -1;
     int top_ = 0;
     QSet<quint32> soloed_;
+    double playhead_ = -1;
+    bool playing_ = false, followPlay_ = true, waiting_ = false;
 };
 
 class EditorView : public QWidget {
@@ -581,10 +609,21 @@ public:
         auto* fit = new QPushButton("Fit");
         follow_ = new QPushButton("Follow live");
         follow_->setCheckable(true);
+        playTake_ = new QPushButton("▶  Play this take");
+        playTake_->setToolTip("Virtual soundcheck: feed this take's recorded sources into "
+                              "the mix in place of the live inputs");
+        transportBtn_ = new QPushButton("▶");
+        transportBtn_->setToolTip("Play / stop (Space)");
+        transportBtn_->setFixedWidth(40);
         out->setToolTip("Zoom out (R, or Cmd-scroll)");
         in->setToolTip("Zoom in (T, or Cmd-scroll)");
         fit->setToolTip("The whole take (F)");
         follow_->setToolTip("Keep the record head in view");
+        for (auto* b : {playTake_, transportBtn_}) {
+            b->setCursor(Qt::PointingHandCursor);
+            h->addWidget(b);
+        }
+        h->addSpacing(8);
         for (auto* b : {out, in, fit, follow_}) {
             b->setCursor(Qt::PointingHandCursor);
             h->addWidget(b);
@@ -614,9 +653,23 @@ public:
         });
         timeline_->onViewChanged = [this] { syncControls(); };
         timeline_->onSolo = [this](quint32 n, bool on) { if (onSolo) onSolo(n, on); };
+        timeline_->onLocate = [this](double t) {
+            if (onTransport) onTransport("locate", t);
+        };
+        connect(playTake_, &QPushButton::clicked, this, [this] {
+            if (take_ && onPlayTake) onPlayTake(take_->name);
+        });
+        connect(transportBtn_, &QPushButton::clicked, this, [this] {
+            if (onTransport) onTransport(playing_ ? "stop" : "play", 0);
+        });
 
         poll_.setInterval(300);  // a live take grows; markers arrive
         connect(&poll_, &QTimer::timeout, this, [this] {
+            // A take that just started has no audio on disk for a moment.
+            if (!take_ && !liveTake_.isEmpty() && takes_->count()) {
+                openTake(takes_->itemData(takes_->currentIndex()).toString());
+                return;
+            }
             if (take_ && take_->name == liveTake_ && take_->refresh()) {
                 timeline_->tick();
                 syncControls();
@@ -633,6 +686,26 @@ public:
     }
     std::function<void(quint32 node, bool on)> onSolo;
     void setSoloed(const QSet<quint32>& s) { timeline_->setSoloed(s); }
+    std::function<void(const QString& take)> onPlayTake;
+    std::function<void(const QString& action, double seconds)> onTransport;
+
+    // From the engine's transport messages.
+    void setTransport(const QJsonObject& t) {
+        const bool playback = t["mode"].toString() == "playback";
+        playbackTake_ = playback ? t["take"].toString() : QString();
+        playing_ = t["playing"].toBool();
+        if (playback && take_ && take_->name != playbackTake_) {
+            // Show the take being played.
+            for (int i = 0; i < takes_->count(); ++i)
+                if (QFileInfo(takes_->itemData(i).toString()).fileName() == playbackTake_)
+                    takes_->setCurrentIndex(i);
+        }
+        const bool here = playback && take_ && take_->name == playbackTake_;
+        timeline_->setPlayhead(here ? t["position"].toDouble() : -1, playing_);
+        syncControls();
+    }
+    bool inPlayback() const { return !playbackTake_.isEmpty(); }
+    bool playing() const { return playing_; }
 
     // The take being recorded now (from the engine's health), or empty.
     void setLiveTake(const QString& name) {
@@ -680,6 +753,7 @@ private:
         take_ = std::move(t);
         const bool live = take_ && take_->name == liveTake_;
         timeline_->setTake(take_.get(), live);
+        timeline_->setWaiting(!take_ && QFileInfo(dir).fileName() == liveTake_);
         syncControls();
     }
     void syncControls() {
@@ -703,11 +777,17 @@ private:
             scroll_->setPageStep(int(timeline_->width_s() * 10));
             scroll_->setValue(int(timeline_->startTime() * 10));
         } else {
-            info_->setText(project_.isEmpty() ? QString() : "No takes yet");
+            info_->setText(project_.isEmpty() ? QString()
+                           : liveTake_.isEmpty() ? "No takes yet" : "Starting…");
             cursorLbl_->clear();
             scroll_->setRange(0, 0);
         }
         const bool live = take_ && take_->name == liveTake_;
+        const bool playingThis = take_ && take_->name == playbackTake_;
+        playTake_->setVisible(take_ && playbackTake_.isEmpty());
+        playTake_->setEnabled(take_ != nullptr);
+        transportBtn_->setVisible(playingThis);
+        transportBtn_->setText(playing_ ? "■" : "▶");
         follow_->setVisible(live);
         follow_->setChecked(timeline_->following());
         syncing_ = false;
@@ -716,6 +796,9 @@ private:
     QComboBox* takes_;
     QLabel *info_, *cursorLbl_;
     QPushButton* follow_;
+    QPushButton *playTake_, *transportBtn_;
+    QString playbackTake_;
+    bool playing_ = false;
     Timeline* timeline_;
     QScrollBar* scroll_;
     QTimer poll_;

@@ -25,6 +25,7 @@ an allocation/lock on the audio thread.
 | `src/ui/` | `ProdMeshMix.app`, the mixer client: theme tokens (mirrors RTA), strip/fader/meter widgets |
 | `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread), `peaks.h` (waveform overviews) |
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
+| `tools/playback_e2e.py` | Playback (virtual soundcheck) against a sim mixd: play, locate, stop at end, back to live, 0 dropouts |
 | `tools/projects_e2e.py` | Projects against a sim mixd: first-run Start offered once, new/open/recent, takes per project |
 | `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
 | `tools/t05_ui_isolation.py` | T0-5 gate: SIGKILL the UI repeatedly under load, check 0 xruns and < 2 s reconnect |
@@ -188,6 +189,29 @@ crossfade through the normal edge ramps. `NodeDesc::solo` is monitoring
 state: scenes never recall it. UI: SOLO | MUTE on strips, S on Editor
 lanes (soloes the channels that source feeds), amber "SOLO · monitor
 only" pill to clear, Monitor strip menu for PFL/AFL.
+
+## Playback (virtual soundcheck)
+
+A finished take replayed into its source nodes in place of the live
+inputs, through the whole mix and out of every output — the Dante
+virtual-soundcheck workflow. `record/playback.h`: one read-ahead ring per
+source (`PlaybackFeed`) in a `PlaybackSet`, filled by `rec::Player`'s
+reader thread; the audio thread decides once per block (`begin`) whether
+it plays — only if every ring has the block, so tracks never drift; an
+underrun is silence for all and counted — and fades 5 ms at play/stop.
+`Engine::setPlayback(set)`: in a plan with a set, Input/Generator steps
+read their feed (or are silent), never the device or the tone. A locate
+builds a new set (rings are never reset under the audio thread); play /
+stop asked for mid-locate are applied at the new position. mixd:
+`enterPlayback` finishes the take (recording stops), `transport`
+(play/stop/locate; stops at the end of the take), `exitPlayback` starts a
+new take; source levels dip 5 ms around mode changes. Test:
+`playback_reproduces_the_recording` (bit-exact after the fade-in). UI: an
+amber banner for as long as playback lasts, "Play this take" in the
+Editor, Space = play/stop, click = locate.
+
+Recordings are big (17 tracks ≈ 11 GB/hour): e2e tools delete their temp
+projects; don't leave demo daemons recording.
 
 ## Scenes
 

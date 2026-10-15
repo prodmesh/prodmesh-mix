@@ -10,6 +10,8 @@ import argparse, atexit, json, os, socket, subprocess, sys, tempfile, time
 ap = argparse.ArgumentParser(); ap.add_argument("--build", default="build")
 build = ap.parse_args().build
 home = tempfile.mkdtemp(prefix="pm-projects-")
+import atexit, shutil
+atexit.register(shutil.rmtree, home, True)  # recordings add up
 sock = "pm-projects-%d" % os.getpid()
 sockdir = os.environ.get("TMPDIR", "/tmp/")
 env = dict(os.environ, PM_MIX_HOME=home)

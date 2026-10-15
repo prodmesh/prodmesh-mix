@@ -4,6 +4,8 @@
 // DSP state inside the instances it points to.
 #pragma once
 
+#include <array>
+
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -27,7 +29,8 @@ struct PlanStep {
     NodeInstance* fadeOut = nullptr;  // old instance during a crossfade
     LevelState* level = nullptr;
     MeterState* meter = nullptr;
-    RecordTap* tap = nullptr;
+    // Recorder, loudness meter, ...: every tap on this node's output.
+    std::array<RecordTap*, 4> taps{};
     int nch = 1;
     int buf = 0;      // first channel in RenderPlan::chan
     int fadeBuf = 0;  // first scratch channel for fadeOut

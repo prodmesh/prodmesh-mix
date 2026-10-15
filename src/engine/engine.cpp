@@ -386,9 +386,11 @@ std::unique_ptr<RenderPlan> Engine::compile(const GraphDesc& next,
         s.meter = meter.get();
         plan->meters.push_back(meter);
         live->meters[d.id] = meter;
+        std::size_t ntaps = 0;
         for (const auto& [id, tap] : taps_)
-            if (id == d.id && tap->channels() == d.channels) {
-                s.tap = tap.get();
+            if (id == d.id && tap->channels() == d.channels &&
+                ntaps < s.taps.size()) {
+                s.taps[ntaps++] = tap.get();
                 plan->taps.push_back(tap);
             }
         // The instance that renders is always the last one pushed.
@@ -672,7 +674,9 @@ void Engine::renderStep(RenderPlan& p, int index, const float* const* in,
     s.level->apply(buf, s.nch, frames,
                    s.preBuf >= 0 ? &p.chan[s.preBuf] : nullptr);
     if (s.meter && !s.dying) s.meter->accumulate(buf, frames);
-    if (s.tap && !s.dying) s.tap->push(buf, frames, sliceTime_);
+    if (!s.dying)
+        for (RecordTap* t : s.taps)
+            if (t) t->push(buf, frames, sliceTime_);
 }
 
 void Engine::process(const float* const* in, int numIn, float* const* out,

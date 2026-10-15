@@ -13,7 +13,7 @@ an allocation/lock on the audio thread.
 | Path | Contents |
 |---|---|
 | `src/core/` | Wait-free SPSC queue, real-time guard, RT thread/workgroup helpers, parameter ramp |
-| `src/dsp/` | Biquads (RBJ), gate / compressor / limiter, deterministic test generator |
+| `src/dsp/` | Biquads (RBJ), gate / compressor / limiter, deterministic test generator, BS.1770 loudness (`loudness.h`) |
 | `src/engine/graph.h` | `GraphDesc`: control-side description (plain values) |
 | `src/engine/node.*` | `NodeInstance` / `EdgeInstance`: audio-thread DSP state, live across plans |
 | `src/engine/plan.h` | `RenderPlan`: compiled, immutable per-edit render order + buffers |
@@ -178,6 +178,18 @@ a glide short; an operator's fader move (newer sequence) takes over.
 `undoRecall` restores the mix and the live scene from just before the
 last recall. UI: select a scene, then GO (double-click = recall now);
 clicking the selected scene opens its menu.
+
+## Top bar: clock, loudness, markers
+
+`src/ui/toolbar.h`. Program loudness per ITU-R BS.1770-4 / EBU R128
+(`dsp::LoudnessMeter`: K-weighting, momentary, short-term, gated
+integrated, 4x true peak), tested against the spec's coefficients and EBU
+Tech 3341 cases. The audio thread only copies the program bus into a
+`RecordTap` (a plan step carries up to 4 taps: recorder + meter); mixd
+meters it at 10 Hz and sends `loudness`. Targets (A/85 −24/−2, R128
+−23/−1, −16, −14) are per session. Markers (`addMarker`, button or M)
+are written to `<take>/markers.csv` (take time, sample, wall clock).
+The edit-oriented toolbar (tools, grid, nudge) waits for the timeline.
 
 ## Recording
 

@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "daemon/shows.h"
+#include "dsp/loudness.h"
 #include "driver/driver.h"
 #include "engine/engine.h"
 #include "proto/protocol.h"
@@ -130,6 +131,7 @@ public:
             return false;
         }
         startCatalog();
+        setUpLoudness();
         if (!recordDir_.isEmpty() && !startTake(error)) return false;
         if (!driver_->start(&render, &ctx_, &err)) {
             *error = QString::fromStdString(err);
@@ -162,6 +164,8 @@ public:
             }
         });
         sceneTimer_.start(250);
+        connect(&loudTimer_, &QTimer::timeout, this, &Daemon::meterLoudness);
+        loudTimer_.start(100);
 
         qInfo("mixd: running on %s: %d in / %d out, %.0f Hz, block %d, socket %s",
               driver_->deviceName().c_str(), driver_->config().numInputs,
@@ -201,6 +205,7 @@ private:
             send(s, snapshot());
             send(s, catalogMessage());
             send(s, scenesMessage());
+            send(s, markersMessage());
         } else if (op == "ping") {
             send(s, {{"type", "pong"}, {"t", m["t"]}});
         } else if (op == "setLevel") {
@@ -237,11 +242,115 @@ private:
                 snapshotPending_ = true;
                 saveTimer_.start();
             }
+        } else if (op == "resetLoudness") {
+            if (loud_) loud_->reset();
+        } else if (op == "setLoudnessTarget") {
+            loudTarget_ = std::clamp(m["lufs"].toDouble(loudTarget_), -40.0, -5.0);
+            loudTpLimit_ = std::clamp(m["truePeak"].toDouble(loudTpLimit_), -10.0, 0.0);
+            saveTimer_.start();
+        } else if (op == "addMarker") {
+            addMarker(m["label"].toString());
         } else if (op.endsWith("Scene") || op == "undoRecall") {
             handleScene(s, op, m);
         } else {
             send(s, {{"type", "error"}, {"op", op}, {"message", "unknown op"}});
         }
+    }
+
+    // --- program loudness (BS.1770) and markers ----------------------------
+
+    // The program bus: the bus feeding device outputs 1-2.
+    NodeId programNode() const {
+        const auto& g = engine_->graph();
+        for (const auto& e : g.edges) {
+            const auto* to = g.find(e.to);
+            const auto* from = g.find(e.from);
+            if (to && from && to->kind == NodeKind::Output && to->ioChannel == 0 &&
+                from->kind == NodeKind::Bus)
+                return from->id;
+        }
+        return 0;
+    }
+    void applyTaps() {
+        auto all = recordTaps_;
+        if (loudTap_) all.push_back({loudNode_, loudTap_});
+        engine_->setRecordTaps(std::move(all));
+    }
+    // The meter follows the program bus; a different bus starts a new
+    // measurement. The audio thread only copies into the tap's ring.
+    void setUpLoudness() {
+        const NodeId id = programNode();
+        const auto* n = engine_->graph().find(id);
+        const int ch = n ? n->channels : 0;
+        if (id == loudNode_ && ch == loudChannels_) return;
+        loudNode_ = id;
+        loudChannels_ = ch;
+        loud_.reset();
+        loudTap_.reset();
+        if (id && ch) {
+            const double fs = driver_->config().sampleRate;
+            loudTap_ = std::make_shared<RecordTap>(ch, std::size_t(5 * fs));
+            loud_ = std::make_unique<dsp::LoudnessMeter>(fs, ch);
+        }
+        applyTaps();
+    }
+    void meterLoudness() {
+        if (!loud_ || !loudTap_) return;
+        RecordTap::Gap gap;
+        while (loudTap_->nextGap(gap)) {}  // a stalled daemon: just skip
+        const std::size_t chunk = 4096;
+        loudBuf_.resize(chunk * std::size_t(loudChannels_));
+        while (const std::size_t n = loudTap_->pop(loudBuf_.data(), chunk, nullptr))
+            loud_->process(loudBuf_.data(), n);
+        broadcast({{"type", "loudness"},
+                   {"m", loud_->momentary()},
+                   {"s", loud_->shortTerm()},
+                   {"i", loud_->integrated()},
+                   {"mMax", loud_->maxMomentary()},
+                   {"tp", loud_->takeRecentPeak()},
+                   {"tpMax", loud_->truePeakMax()},
+                   {"seconds", loud_->seconds()},
+                   {"target", loudTarget_},
+                   {"tpLimit", loudTpLimit_}},
+                  nullptr);
+    }
+
+    // A marker: when it happened in the take (and on the wall clock), for
+    // post. Written next to the take's files as it is dropped.
+    void addMarker(QString label) {
+        const double t = recorder_ ? takeClock_.elapsed() / 1000.0 : -1;
+        const QString wall = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
+        if (label.trimmed().isEmpty()) label = QString("Marker %1").arg(markers_.size() + 1);
+        markers_.append({t, wall, label});
+        if (recorder_) {
+            QFile f(recordDir_ + "/" + takeName_ + "/markers.csv");
+            const bool fresh = !f.exists();
+            if (f.open(QIODevice::Append | QIODevice::Text)) {
+                if (fresh) f.write("index,take_time,take_seconds,sample,wall_clock,label\n");
+                const int s = int(t);
+                const QString tc = QString("%1:%2:%3.%4")
+                                       .arg(s / 3600, 2, 10, QChar('0'))
+                                       .arg(s / 60 % 60, 2, 10, QChar('0'))
+                                       .arg(s % 60, 2, 10, QChar('0'))
+                                       .arg(int((t - s) * 1000), 3, 10, QChar('0'));
+                QString safe = label;
+                safe.replace('"', "'");
+                f.write(QString("%1,%2,%3,%4,%5,\"%6\"\n")
+                            .arg(markers_.size())
+                            .arg(tc)
+                            .arg(t, 0, 'f', 3)
+                            .arg(qint64(t * driver_->config().sampleRate))
+                            .arg(wall, safe)
+                            .toUtf8());
+            }
+        }
+        broadcast(markersMessage(), nullptr);
+    }
+    QJsonObject markersMessage() const {
+        QJsonArray list;
+        for (const auto& mk : markers_)
+            list.append(QJsonObject{{"t", mk.takeSeconds}, {"wall", mk.wall}, {"label", mk.label}});
+        return {{"type", "markers"}, {"markers", list}};
     }
 
     // --- scenes ------------------------------------------------------------
@@ -400,8 +509,10 @@ private:
             *error = QString::fromStdString(err);
             return false;
         }
-        engine_->setRecordTaps(std::move(taps));
+        recordTaps_ = std::move(taps);
+        applyTaps();
         takeClock_.start();
+        markers_.clear();
         qInfo("mixd: recording take \"%s\" to %s", qPrintable(takeName_),
               qPrintable(recordDir_));
         return true;
@@ -489,6 +600,9 @@ private:
             scenes_.append(sc);
         }
         currentScene_ = doc["currentScene"].toInt(0);
+        const auto ld = doc["loudness"].toObject();
+        loudTarget_ = ld["target"].toDouble(loudTarget_);
+        loudTpLimit_ = ld["truePeak"].toDouble(loudTpLimit_);
     }
 
     // QSaveFile writes a temp file and renames it over the old one, so a
@@ -505,6 +619,8 @@ private:
                                   {"version", 1},
                                   {"graph", proto::graphToJson(engine_->graph())},
                                   {"scenes", scenesJson()},
+                                  {"loudness", QJsonObject{{"target", loudTarget_},
+                                                           {"truePeak", loudTpLimit_}}},
                                   {"currentScene", currentScene_}})
                     .toJson(QJsonDocument::Indented));
         if (!f.commit())
@@ -606,6 +722,7 @@ private:
         }
         if (snapshotPending_ && engine_->settled()) {
             snapshotPending_ = false;
+            setUpLoudness();  // no-op unless the program bus changed
             auto snap = snapshot();
             // Clients animate to the new values over the engine's glide.
             if (snapshotGlideMs_ > 0) snap["glideMs"] = snapshotGlideMs_;
@@ -685,6 +802,21 @@ private:
     QJsonArray catalog_;
     bool snapshotPending_ = false;
     double snapshotGlideMs_ = 0;
+    // Taps: the recorder's (per take) and the program loudness meter's.
+    std::vector<std::pair<NodeId, std::shared_ptr<RecordTap>>> recordTaps_;
+    std::shared_ptr<RecordTap> loudTap_;
+    NodeId loudNode_ = 0;
+    int loudChannels_ = 0;
+    std::unique_ptr<dsp::LoudnessMeter> loud_;
+    std::vector<float> loudBuf_;
+    QTimer loudTimer_;
+    double loudTarget_ = -24, loudTpLimit_ = -2;  // ATSC A/85 by default
+    // Markers dropped during the show: take time (s), wall clock, label.
+    struct Marker {
+        double takeSeconds;
+        QString wall, label;
+    };
+    QList<Marker> markers_;
     QProcess* scanner_ = nullptr;
     QList<Scene> scenes_;
     int currentScene_ = 0, nextSceneId_ = 1;

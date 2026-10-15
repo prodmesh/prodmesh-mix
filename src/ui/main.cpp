@@ -17,6 +17,8 @@
 #include "ui/theme.h"
 #include "ui/plugin_browser.h"
 #include "ui/scene_bar.h"
+#include "ui/toolbar.h"
+#include <QShortcut>
 #include "ui/widgets.h"
 #include <QFileInfo>
 #include <QInputDialog>
@@ -98,175 +100,6 @@ private:
     QMap<quint32, QPair<float, bool>> pending_;
 };
 
-// Top bar: identity, connection, and engine health — always visible.
-class HealthBar : public QWidget {
-public:
-    HealthBar() { setFixedHeight(44); }
-
-    void setConnected(bool c) {
-        connected_ = c;
-        update();
-    }
-    void setFormat(double rate, int block, const QString& device) {
-        format_ = QString("%1 · %2 kHz · %3 samples")
-                      .arg(device.isEmpty() ? "Engine" : device)
-                      .arg(rate / 1000.0, 0, 'g', 3)
-                      .arg(block);
-        update();
-    }
-    void setHealth(const QJsonObject& h) {
-        meanLoad_ = h["meanLoad"].toDouble();
-        worstLoad_ = std::max(worstLoad_ * 0.9, h["worstLoad"].toDouble());
-        xruns_ = qint64(h["xruns"].toDouble());
-        rtViolations_ = qint64(h["rtViolations"].toDouble());
-        const auto r = h["recording"].toObject();
-        recOn_ = r["on"].toBool();
-        recSeconds_ = r["seconds"].toDouble();
-        recTracks_ = r["tracks"].toInt();
-        recDropped_ = qint64(r["droppedFrames"].toDouble());
-        recDroppedSeconds_ = r["droppedSeconds"].toDouble();
-        recRingFill_ = r["ringFill"].toDouble();
-        recDiskSeconds_ = r["diskSecondsLeft"].toDouble();
-        recError_ = r["error"].toString();
-        update();
-    }
-
-protected:
-    void paintEvent(QPaintEvent*) override {
-        QPainter p(this);
-        p.setRenderHint(QPainter::Antialiasing);
-        p.fillRect(rect(), theme::bg);
-        p.setPen(theme::grid);
-        p.drawLine(0, height() - 1, width(), height() - 1);
-
-        QFont f = font();
-        f.setPixelSize(14);
-        f.setWeight(QFont::DemiBold);
-        p.setFont(f);
-        p.setPen(theme::textMax);
-        p.drawText(QRect(16, 0, 200, height()), Qt::AlignVCenter,
-                   "ProdMesh Mix");
-
-        // Connection pill.
-        f.setPixelSize(11);
-        f.setWeight(QFont::Medium);
-        p.setFont(f);
-        const QString state =
-            connected_ ? "Engine connected" : "Engine not reachable";
-        const QColor col = connected_ ? theme::accent : theme::clip;
-        const int pw = p.fontMetrics().horizontalAdvance(state) + 30;
-        const QRect pill(130, 12, pw, 20);
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(col.red(), col.green(), col.blue(), 36));
-        p.drawRoundedRect(pill, 10, 10);
-        p.setBrush(col);
-        p.drawEllipse(QPoint(pill.left() + 11, pill.center().y() + 1), 4, 4);
-        p.setPen(col);
-        p.drawText(pill.adjusted(20, 0, 0, 0), Qt::AlignVCenter, state);
-        int left = pill.right() + 12;
-        if (connected_) {
-            p.setPen(theme::text);
-            const int fw = p.fontMetrics().horizontalAdvance(format_);
-            p.drawText(QRect(left, 0, fw, height()), Qt::AlignVCenter, format_);
-            left += fw + 18;
-        }
-        if (connected_ && recOn_) paintRecording(p, left);
-
-        // Right side: DSP load bar, xruns — only while they are live.
-        if (!connected_) return;
-        int x = width() - 16;
-        auto rightText = [&](const QString& s, const QColor& c) {
-            const int w = p.fontMetrics().horizontalAdvance(s);
-            x -= w;
-            p.setPen(c);
-            p.drawText(QRect(x, 0, w, height()), Qt::AlignVCenter, s);
-            x -= 18;
-        };
-        if (rtViolations_ > 0)
-            rightText(QString("%1 RT violations").arg(rtViolations_),
-                      theme::clip);
-        rightText(xruns_ == 1 ? "1 dropout" : QString("%1 dropouts").arg(xruns_),
-                  xruns_ ? theme::clip : theme::text);
-
-        const QString load = QString("DSP %1%  peak %2%")
-                                 .arg(int(std::round(meanLoad_ * 100)))
-                                 .arg(int(std::round(worstLoad_ * 100)));
-        rightText(load, theme::textHi);
-        const QRect bar(x - 120, height() / 2 - 3, 120, 6);
-        p.setPen(Qt::NoPen);
-        p.setBrush(theme::control);
-        p.drawRoundedRect(bar, 3, 3);
-        const auto barColor = worstLoad_ > 0.7 ? theme::clip
-                              : worstLoad_ > 0.5 ? theme::warn
-                                                 : theme::accent;
-        p.setBrush(barColor);
-        p.drawRoundedRect(QRect(bar.left(), bar.top(),
-                                int(std::min(1.0, meanLoad_) * bar.width()),
-                                bar.height()),
-                          3, 3);
-        p.setBrush(theme::textMax);
-        p.drawRect(QRect(bar.left() + int(std::min(1.0, worstLoad_) *
-                                          bar.width()) - 1,
-                         bar.top() - 2, 2, bar.height() + 4));
-    }
-
-private:
-    // "● REC 01:23:45 · 9 tracks · 41 h disk" — red while healthy (red is
-    // the universal record colour); amber text when the disk or the
-    // writer needs attention.
-    void paintRecording(QPainter& p, int x) {
-        const int s = int(recSeconds_);
-        const QString clock = QString("%1:%2:%3")
-                                  .arg(s / 3600, 2, 10, QChar('0'))
-                                  .arg(s / 60 % 60, 2, 10, QChar('0'))
-                                  .arg(s % 60, 2, 10, QChar('0'));
-        const QRect pill(x, 12, 98, 20);
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(229, 72, 77, 40));
-        p.drawRoundedRect(pill, 10, 10);
-        p.setBrush(theme::clip);
-        p.drawEllipse(QPoint(pill.left() + 11, pill.center().y() + 1), 4, 4);
-        p.setPen(QColor("#ffd9db"));
-        p.drawText(pill.adjusted(20, 0, 0, 0), Qt::AlignVCenter,
-                   "REC " + clock);
-
-        const double hours = recDiskSeconds_ / 3600.0;
-        QString detail = QString("%1 tracks · %2 disk")
-                             .arg(recTracks_)
-                             .arg(hours >= 1 ? QString("%1 h").arg(int(hours))
-                                             : QString("%1 min").arg(
-                                                   int(recDiskSeconds_ / 60)));
-        bool attention = hours < 2;
-        if (recDropped_ > 0) {
-            detail += QString(" · %1 s of gaps").arg(recDroppedSeconds_, 0, 'f', 1);
-            attention = true;
-        }
-        if (recRingFill_ > 0.5) {
-            detail += QString(" · disk slow (%1% buffered)")
-                          .arg(int(recRingFill_ * 100));
-            attention = true;
-        }
-        if (!recError_.isEmpty()) {
-            detail += " · " + recError_;
-            attention = true;
-        }
-        p.setPen(attention ? theme::warn : theme::text);
-        p.drawText(QRect(pill.right() + 10, 0, 520, height()),
-                   Qt::AlignVCenter, detail);
-    }
-
-    bool connected_ = false;
-    bool recOn_ = false;
-    double recSeconds_ = 0, recRingFill_ = 0, recDiskSeconds_ = 0;
-    double recDroppedSeconds_ = 0;
-    int recTracks_ = 0;
-    qint64 recDropped_ = 0;
-    QString recError_;
-    QString format_;
-    double meanLoad_ = 0, worstLoad_ = 0;
-    qint64 xruns_ = 0, rtViolations_ = 0;
-};
-
 class SectionLabel : public QLabel {
 public:
     explicit SectionLabel(const QString& t) : QLabel(t.toUpper()) {
@@ -287,8 +120,15 @@ public:
         auto* outer = new QVBoxLayout(this);
         outer->setContentsMargins(0, 0, 0, 0);
         outer->setSpacing(0);
-        health_ = new HealthBar;
+        health_ = new TopBar;
         outer->addWidget(health_);
+        health_->onMarker = [this] { client_.op({{"op", "addMarker"}}); };
+        health_->onLoudnessMenu = [this](QPoint at) { loudnessMenu(at); };
+        // M drops a marker from anywhere in the window.
+        auto* mk = new QShortcut(QKeySequence(Qt::Key_M), this);
+        connect(mk, &QShortcut::activated, this, [this] {
+            if (client_.connected()) client_.op({{"op", "addMarker"}});
+        });
         scenes_ = new SceneBar;
         outer->addWidget(scenes_);
         scenes_->onRecall = [this](int id) {
@@ -457,6 +297,20 @@ private:
                              " — audio passed straight through meanwhile.");
             events_->show();
             eventsTimer_.start(15000);
+        } else if (type == "loudness") {
+            loudTarget_ = m["target"].toDouble();
+            loudTpLimit_ = m["tpLimit"].toDouble();
+            health_->setLoudness(m);
+        } else if (type == "markers") {
+            const auto list = m["markers"].toArray();
+            QString newest;
+            if (!list.isEmpty()) {
+                const auto o = list.last().toObject();
+                const double t = o["t"].toDouble();
+                newest = o["label"].toString() +
+                         (t >= 0 ? "  ·  " + hms(t) : "  ·  " + o["wall"].toString().left(8));
+            }
+            health_->setMarkers(int(list.size()), newest);
         } else if (type == "scenes") {
             sceneList_ = m["scenes"].toArray();
             scenes_->setScenes(m);
@@ -1378,6 +1232,32 @@ private:
         menu->popup(at);
     }
 
+    // Loudness targets for the common delivery specs, and reset.
+    void loudnessMenu(QPoint at) {
+        auto* menu = styledMenu(this);
+        heading(menu, "Loudness target");
+        const struct { const char* label; double lufs, tp; } presets[] = {
+            {"−24 LKFS · TP −2   US broadcast (ATSC A/85)", -24, -2},
+            {"−23 LUFS · TP −1   EU broadcast (EBU R128)", -23, -1},
+            {"−16 LUFS · TP −1   Podcast / AES streaming", -16, -1},
+            {"−14 LUFS · TP −1   YouTube, Spotify", -14, -1},
+        };
+        for (const auto& pr : presets) {
+            auto* a = menu->addAction(QString::fromUtf8(pr.label));
+            a->setCheckable(true);
+            a->setChecked(std::fabs(loudTarget_ - pr.lufs) < 0.01 &&
+                          std::fabs(loudTpLimit_ - pr.tp) < 0.01);
+            const double l = pr.lufs, t = pr.tp;
+            connect(a, &QAction::triggered, this, [this, l, t] {
+                client_.op({{"op", "setLoudnessTarget"}, {"lufs", l}, {"truePeak", t}});
+            });
+        }
+        menu->addSeparator();
+        connect(menu->addAction("Reset measurement  (integrated, true-peak max)"),
+                &QAction::triggered, this, [this] { client_.op({{"op", "resetLoudness"}}); });
+        menu->popup(at);
+    }
+
     void sceneMenu(int id, QPoint at) {
         QString name;
         double fade = 0;
@@ -1654,7 +1534,8 @@ private:
         return t;
     }();
     bool loggedSnapshot_ = false;
-    HealthBar* health_;
+    TopBar* health_;
+    double loudTarget_ = -24, loudTpLimit_ = -2;
     SceneBar* scenes_;
     QJsonArray sceneList_;
     QHBoxLayout* bodyLayout_;

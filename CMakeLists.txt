@@ -104,6 +104,11 @@ if(Qt6_FOUND)
 
     qt_add_executable(mixd src/daemon/main.cpp src/daemon/shows.cpp)
     target_link_libraries(mixd PRIVATE mix_proto Qt6::Network)
+    # The menu-bar icon (mixd --menu-bar, as the app starts the engine).
+    if(TARGET Qt6::Widgets)
+        target_link_libraries(mixd PRIVATE Qt6::Widgets)
+        target_compile_definitions(mixd PRIVATE PM_MIXD_TRAY)
+    endif()
     set_target_properties(mixd PROPERTIES MACOSX_BUNDLE FALSE)
 
     add_executable(mix-proto-tests
@@ -126,7 +131,30 @@ if(Qt6_FOUND)
     if(APPLE)
         set_target_properties(mix-ui PROPERTIES MACOSX_BUNDLE TRUE
             MACOSX_BUNDLE_GUI_IDENTIFIER "com.prodmesh.mix"
-            MACOSX_BUNDLE_BUNDLE_NAME "ProdMesh Mix")
+            MACOSX_BUNDLE_BUNDLE_NAME "ProdMesh Mix"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/cmake/Info.plist.in")
+        # One app: the engine is a helper app inside the bundle
+        # (Contents/Helpers/ProdMesh Mix Engine.app) with its own identity,
+        # so a running engine never stands in for the mixer window. Its
+        # helpers (plugin host, scanner) sit beside mixd. Refreshed on every
+        # build so the bundle never carries a stale engine.
+        configure_file(cmake/EngineInfo.plist.in
+            ${CMAKE_BINARY_DIR}/EngineInfo.plist @ONLY)
+        set(PM_ENGINE_APP "$<TARGET_BUNDLE_CONTENT_DIR:mix-ui>/Helpers/ProdMesh Mix Engine.app")
+        add_custom_target(app-bundle ALL
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${PM_ENGINE_APP}/Contents/MacOS"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_BINARY_DIR}/EngineInfo.plist "${PM_ENGINE_APP}/Contents/Info.plist"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:mixd> $<TARGET_FILE:mix-pluginhost> $<TARGET_FILE:mix-plugin>
+                "${PM_ENGINE_APP}/Contents/MacOS"
+            COMMAND ${CMAKE_COMMAND} -E rm -f
+                $<TARGET_FILE_DIR:mix-ui>/mixd $<TARGET_FILE_DIR:mix-ui>/mix-pluginhost
+                $<TARGET_FILE_DIR:mix-ui>/mix-plugin
+            DEPENDS mix-ui mixd mix-pluginhost mix-plugin
+            COMMENT "Bundling the engine into ProdMeshMix.app")
     endif()
 endif()
 

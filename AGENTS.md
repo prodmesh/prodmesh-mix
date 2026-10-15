@@ -25,6 +25,7 @@ an allocation/lock on the audio thread.
 | `src/ui/` | `ProdMeshMix.app`, the mixer client: theme tokens (mirrors RTA), strip/fader/meter widgets |
 | `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread), `peaks.h` (waveform overviews) |
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
+| `tools/engine_lifecycle_e2e.py` | One engine per socket; shutdown warns clients and finalises the take |
 | `tools/playback_e2e.py` | Playback (virtual soundcheck) against a sim mixd: play, locate, stop at end, back to live, 0 dropouts |
 | `tools/projects_e2e.py` | Projects against a sim mixd: first-run Start offered once, new/open/recent, takes per project |
 | `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
@@ -38,8 +39,11 @@ Qt Core/Network; the UI is a separate process that owns no audio and
 rebuilds itself from the daemon's snapshot on every (re)connect. Protocol
 messages are documented at the top of `src/proto/protocol.h`.
 
-Run it: `./build/mixd --driver sim` (or `coreaudio`; add `--audible` to
-hear it), then `open build/ProdMeshMix.app`. Without `--session`, mixd
+Run it: `open build/ProdMeshMix.app` — one app: it starts its engine
+from the bundle (`Contents/Helpers/ProdMesh Mix Engine.app`, see "The app
+and its engine") when none is running. For development, run an engine
+yourself (`./build/mixd --driver sim`, or `coreaudio` + `--audible` to hear
+it) and the app connects to it instead. Without `--session`, mixd
 opens the last project (or creates `~/Music/ProdMesh Mix/Untitled`).
 Tools and tests must not touch the user's projects: pass `--session`, or
 set `PM_MIX_HOME` to a temp dir (projects and the recent list go there). `ProdMeshMix --screenshot
@@ -124,6 +128,28 @@ cmake -S . -B build -G Ninja && cmake --build build
   on this machine: worst callback 40% -> 19% of the period.
 - clangd may show false errors until `build/compile_commands.json` exists
   (it is symlinked to the repo root by the first configure).
+
+## The app and its engine
+
+One app, two processes. `ProdMeshMix.app` (the window) owns no audio; the
+engine `mixd` ships inside it as a helper app,
+`Contents/Helpers/ProdMesh Mix Engine.app` (bundle id
+`com.prodmesh.mix.engine`, `LSUIElement`), with `mix-pluginhost` and
+`mix-plugin` beside it. A helper app, not a bare binary in `MacOS/`:
+otherwise macOS takes the running engine for the app and reopening the
+window does nothing. The app starts the engine detached
+(`--menu-bar --audible`) when nothing answers on the default socket and
+restarts it after an unexpected stop (at most 3 starts a minute, then it
+says so). A UI crash or "Close window only" leaves the engine running,
+shown by its menu-bar icon (status, Open, Quit) — never ghost audio. A
+deliberate stop (menu bar, or the app's "Quit and stop audio") sends
+`shutdown` to every client, which quits instead of restarting it. One
+engine per socket: a second mixd refuses to start (exit 3) rather than
+take the socket. Devices / rate / buffer come from the command line, else
+`audio.json` in the app data folder; no input until one is chosen (a
+laptop mic into its own speakers would howl); a first run from the app
+starts on the Blank template. Non-default sockets, `--no-engine` and
+`--screenshot` never start an engine (tests).
 
 ## Routing and mix-minus
 

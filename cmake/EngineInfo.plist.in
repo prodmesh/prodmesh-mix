@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- The audio engine, as a helper app inside ProdMeshMix.app: its own
+     bundle identity, so macOS treats a running engine and the mixer window
+     as two apps (reopening the window works while the engine runs), and a
+     menu-bar-only app (LSUIElement): no Dock icon, just its status item. -->
+<dict>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleName</key>
+	<string>ProdMesh Mix Engine</string>
+	<key>CFBundleDisplayName</key>
+	<string>ProdMesh Mix Engine</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.prodmesh.mix.engine</string>
+	<key>CFBundleExecutable</key>
+	<string>mixd</string>
+	<key>CFBundleVersion</key>
+	<string>@PROJECT_VERSION@</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@PROJECT_VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.4</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ProdMesh Mix records and mixes the audio inputs you choose in Audio Setup.</string>
+</dict>
+</plist>

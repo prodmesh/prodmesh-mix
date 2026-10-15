@@ -26,6 +26,9 @@
 #include <QMenuBar>
 #include <QUrl>
 #include <QShortcut>
+#include <QTime>
+#include <QCloseEvent>
+#include <QProcess>
 #include "ui/widgets.h"
 #include <QFileInfo>
 #include <QInputDialog>
@@ -121,7 +124,10 @@ public:
 
 class MainWindow : public QWidget {
 public:
-    explicit MainWindow(const QString& socket) : client_(socket) {
+    // autostartEngine: the app's own engine (default socket): start it from
+    // the bundle when nothing answers, and again if it stops unexpectedly.
+    MainWindow(const QString& socket, bool autostartEngine)
+        : client_(socket), autostart_(autostartEngine) {
         setWindowTitle("ProdMesh Mix");
         setStyleSheet("QWidget#root { background: #14161c; }");
         auto* outer = new QVBoxLayout(this);
@@ -316,8 +322,21 @@ public:
 
         client_.onConnected = [this](bool c) {
             health_->setConnected(c);
-            if (c) client_.op({{"op", "projects"}});
-            if (!c) setOffline(true);
+            if (c) {
+                client_.op({{"op", "projects"}});
+                if (restarting_) {  // it came back after an unexpected stop
+                    events_->setText("The audio engine stopped unexpectedly and was restarted "
+                                     "at " + QTime::currentTime().toString("HH:mm:ss") +
+                                     ". The show and its recordings were restored.");
+                    events_->show();
+                    eventsTimer_.start(20000);
+                }
+                restarting_ = false;
+                everConnected_ = true;
+            } else {
+                setOffline(true);
+                maybeStartEngine();
+            }
         };
         client_.onMessage = [this](const QJsonObject& m) { handle(m); };
         sendTimer_.setSingleShot(true);
@@ -333,7 +352,80 @@ protected:
         offline_->setGeometry(offline_->parentWidget()->rect());
     }
 
+    // Closing the app must never stop program audio by accident: ask.
+    void closeEvent(QCloseEvent* e) override {
+        if (quitting_ || !autostart_ || !client_.connected()) {
+            e->accept();
+            return;
+        }
+        QMessageBox box(QMessageBox::Question, "Quit ProdMesh Mix",
+                        "Stop the audio engine too?", QMessageBox::Cancel, this);
+        box.setInformativeText(
+            "Quit and stop audio: program audio stops on every output and the "
+            "recording is finished.\n\nClose window only: the engine keeps running "
+            "in the menu bar — reopen ProdMesh Mix to get back to it.");
+        auto* stop = box.addButton("Quit and stop audio", QMessageBox::DestructiveRole);
+        auto* keep = box.addButton("Close window only", QMessageBox::AcceptRole);
+        box.setDefaultButton(QMessageBox::Cancel);
+        box.exec();
+        if (box.clickedButton() == keep) {
+            quitting_ = true;
+            e->accept();
+        } else if (box.clickedButton() == stop) {
+            // The engine answers with "shutdown" (handled below: we quit);
+            // give up waiting after 3 s.
+            e->ignore();
+            stopping_ = true;
+            client_.op({{"op", "shutdown"}, {"client", "the app"}});
+            QTimer::singleShot(3000, this, [this] { quitting_ = true; qApp->quit(); });
+        } else {
+            e->ignore();
+        }
+    }
+
 private:
+    // --- The engine's lifecycle (one app) -----------------------------------
+    // The engine is its own process (a UI crash never stops audio), started
+    // detached from this bundle and shown in the menu bar while it runs.
+    static QString enginePath() {
+        return QFileInfo(QCoreApplication::applicationDirPath() +
+                         "/../Helpers/ProdMesh Mix Engine.app/Contents/MacOS/mixd")
+            .canonicalFilePath();
+    }
+
+    void maybeStartEngine() {
+        if (!autostart_ || stopping_ || quitting_ || !QFileInfo::exists(enginePath())) return;
+        // It takes a moment to open the device; don't pile up attempts.
+        if (launchClock_.isValid() && launchClock_.elapsed() < 4000) return;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        while (!launches_.isEmpty() && now - launches_.first() > 60000) launches_.removeFirst();
+        if (launches_.size() >= 3) {  // a crash loop: stop and say so
+            if (!gaveUp_) {
+                gaveUp_ = true;
+                offlineText("The audio engine keeps stopping",
+                            "It stopped three times in a minute, so it is not being "
+                            "restarted again.<br>Check Audio Setup (the device may be "
+                            "missing), then reopen ProdMesh Mix.");
+            }
+            return;
+        }
+        restarting_ = everConnected_;
+        launches_.append(now);
+        launchClock_.restart();
+        offlineText(everConnected_ ? "Restarting the audio engine…" : "Starting the audio engine…",
+                    everConnected_ ? "It stopped unexpectedly. The show and its recordings "
+                                     "are restored as it comes back."
+                                   : "Program audio starts as soon as it is running.");
+        QProcess::startDetached(enginePath(), {"--menu-bar", "--audible"});
+    }
+
+    void offlineText(const QString& title, const QString& detail) {
+        offline_->setText("<div style='font-size:16px; color:#e8ecf4; font-weight:600;'>" +
+                          title + "</div><div style='font-size:13px; color:#8a92a6; "
+                                  "margin-top:8px;'>" + detail + "</div>");
+        banner_->setText(title + " " + QString(detail).replace("<br>", " "));
+    }
+
     void setOffline(bool off) {
         offline_->setVisible(off && strips_.isEmpty());
         // With a mixer already built, keep it on screen so the operator
@@ -431,6 +523,11 @@ private:
             projects_ = m;
             rebuildRecentMenu();
             if (start_) start_->setProjects(m);
+        } else if (type == "shutdown") {
+            // Stopped on purpose (here or from the menu bar): close too,
+            // rather than start it again.
+            stopping_ = quitting_ = true;
+            qApp->quit();
         } else if (type == "transport") {
             const bool playback = m["mode"].toString() == "playback";
             playbackLabel_->setText(
@@ -1860,6 +1957,10 @@ private:
     }();
     bool loggedSnapshot_ = false;
     TopBar* health_;
+    bool autostart_ = false, stopping_ = false, quitting_ = false;
+    bool restarting_ = false, everConnected_ = false, gaveUp_ = false;
+    QElapsedTimer launchClock_;
+    QList<qint64> launches_;
     QStackedWidget* stack_;
     EditorView* editor_;
     QPushButton *mixerBtn_, *editorBtn_;
@@ -1908,6 +2009,7 @@ int main(int argc, char** argv) {
     p.addHelpOption();
     p.addOptions({
         {"socket", "Engine socket name", "name", pm::proto::kDefaultSocket},
+        {"no-engine", "Never start the bundled engine (connect to one you run)"},
         {"screenshot", "Save a PNG of the window after --after ms, then quit",
          "path"},
         {"after", "Delay before --screenshot", "ms", "1500"},
@@ -1918,7 +2020,11 @@ int main(int argc, char** argv) {
     });
     p.process(app);
 
-    pm::ui::MainWindow win(p.value("socket"));
+    // The app starts its own engine; developer runs on another socket (and
+    // the tests) never do.
+    const bool autostart = !p.isSet("no-engine") && !p.isSet("screenshot") &&
+                           p.value("socket") == pm::proto::kDefaultSocket;
+    pm::ui::MainWindow win(p.value("socket"), autostart);
     win.resize(1240, 640);
     win.show();
     if (p.isSet("open-browser"))

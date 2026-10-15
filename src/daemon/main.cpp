@@ -38,6 +38,9 @@
 
 #include "daemon/shows.h"
 #include "dsp/loudness.h"
+#if defined(PM_MIXD_TRAY)
+#include "daemon/tray.h"
+#endif
 #include "record/player.h"
 #include "driver/driver.h"
 #include "engine/engine.h"
@@ -116,6 +119,24 @@ public:
     }
     void setRingSeconds(double s) { ringSeconds_ = s; }
     static QPair<QString, bool> defaultProject() { return startupProject(); }
+
+    // For the menu-bar icon.
+    QJsonObject engineStatus() const {
+        return {{"project", projectDir_.isEmpty() ? QString() : QFileInfo(projectDir_).fileName()},
+                {"recording", recorder_ != nullptr},
+                {"seconds", recorder_ ? takeClock_.elapsed() / 1000.0 : 0.0},
+                {"xruns", double(driver_->stats().xruns.load())},
+                {"device", QString::fromStdString(driver_->deviceName())}};
+    }
+
+    // A deliberate stop (menu bar or the app): tell every UI first, so it
+    // quits too instead of restarting an engine the operator just stopped.
+    void shutdown(const QString& reason) {
+        qInfo("mixd: shutting down (%s)", qPrintable(reason));
+        broadcast({{"type", "shutdown"}, {"reason", reason}}, nullptr);
+        for (auto* c : clients_) c->flush();
+        QTimer::singleShot(150, qApp, &QCoreApplication::quit);
+    }
     // Project mode: the session and the takes live in this folder.
     void setProject(const QString& dir, bool fresh) {
         projectDir_ = QDir(dir).absolutePath();
@@ -130,7 +151,8 @@ public:
         // Real inputs when the device has them (or when asked), the demo
         // show of generators otherwise.
         const int ins = driver_->config().numInputs;
-        GraphDesc show = showName == "demo" || (showName.isEmpty() && ins == 0)
+        GraphDesc show = showName == "blank" ? shows::blank()
+                         : showName == "demo" || (showName.isEmpty() && ins == 0)
                              ? shows::livestream()
                              : shows::inputs(std::min(ins, 64));
         if (!fresh && loadSession(show))
@@ -268,6 +290,8 @@ private:
                 snapshotPending_ = true;
                 saveTimer_.start();
             }
+        } else if (op == "shutdown") {
+            shutdown("asked by " + m["client"].toString("a client"));
         } else if (op == "projects") {
             send(s, projectsMessage());
         } else if (op == "newProject" || op == "openProject") {
@@ -1252,7 +1276,18 @@ private:
 }  // namespace
 
 int main(int argc, char** argv) {
-    QCoreApplication app(argc, argv);
+    // --menu-bar (how the app starts the engine): a GUI process for the
+    // menu-bar icon; otherwise headless, as tests and servers run it.
+    bool menuBar = false;
+    for (int i = 1; i < argc; ++i) menuBar |= std::strcmp(argv[i], "--menu-bar") == 0;
+#if defined(PM_MIXD_TRAY)
+    std::unique_ptr<QCoreApplication> appHolder =
+        menuBar ? std::make_unique<QApplication>(argc, argv)
+                : std::make_unique<QCoreApplication>(argc, argv);
+#else
+    std::unique_ptr<QCoreApplication> appHolder = std::make_unique<QCoreApplication>(argc, argv);
+#endif
+    QCoreApplication& app = *appHolder;
     app.setOrganizationName("ProdMesh");
     app.setApplicationName("Mix");
 
@@ -1279,8 +1314,35 @@ int main(int argc, char** argv) {
          "name"},
         {"list-devices", "List audio devices and exit"},
         {"ring-seconds", "Per-track disk buffer (T0-8 headroom)", "s", "30"},
+        {"menu-bar", "Show the engine in the menu bar (as the app starts it)"},
     });
     p.process(app);
+
+    // One engine per socket. A second one would take the socket from the
+    // running engine and leave it playing with no way to reach it.
+    {
+        QLocalSocket probe;
+        probe.connectToServer(p.value("socket"));
+        if (probe.waitForConnected(300)) {
+            qCritical("mixd: an engine is already running on \"%s\"",
+                      qPrintable(p.value("socket")));
+            return 3;
+        }
+    }
+
+    // Devices, rate and buffer: the command line, else the app's Audio
+    // Setup (audio.json), else defaults. No input until one is chosen: a
+    // laptop mic into its own speakers would howl.
+    QJsonObject audio;
+    {
+        QFile f(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/audio.json");
+        if (f.open(QIODevice::ReadOnly)) audio = QJsonDocument::fromJson(f.readAll()).object();
+    }
+    auto setting = [&](const char* name, const QString& fallback) {
+        if (p.isSet(name)) return p.value(name);
+        const auto v = audio.value(QLatin1String(name));
+        return v.isString() ? v.toString() : v.isDouble() ? QString::number(v.toDouble()) : fallback;
+    };
 
 #if defined(__APPLE__)
     if (p.isSet("list-devices")) {
@@ -1293,11 +1355,12 @@ int main(int argc, char** argv) {
     }
 #endif
     DriverConfig dc;
-    dc.sampleRate = p.value("rate").toDouble();
-    dc.blockSize = p.value("block").toInt();
+    dc.sampleRate = setting("rate", "48000").toDouble();
+    dc.blockSize = setting("block", "128").toInt();
     dc.numOutputs = 4;
-    dc.inputDevice = p.value("input") == "default" ? "" : p.value("input").toStdString();
-    dc.outputDevice = p.value("output").toStdString();
+    const QString input = setting("input", "none");
+    dc.inputDevice = input == "default" ? "" : input.toStdString();
+    dc.outputDevice = setting("output", "").toStdString();
     std::unique_ptr<Driver> driver;
     std::string err;
     if (p.value("driver") == "sim") {
@@ -1341,12 +1404,25 @@ int main(int argc, char** argv) {
             ? p.value("session")
             : QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) +
                   "/session.json";
-    if (!daemon->start(p.value("socket"), session, p.isSet("fresh"),
-                       p.value("show"), &why)) {
+    // A first run from the app starts empty, not on the demo's test tones.
+    const QString show = p.isSet("show") ? p.value("show") : menuBar ? "blank" : QString();
+    if (!daemon->start(p.value("socket"), session, p.isSet("fresh"), show, &why)) {
         qCritical("mixd: %s", qPrintable(why));
         return 1;
     }
+#if defined(PM_MIXD_TRAY)
+    std::unique_ptr<pm::daemon::EngineTray> tray;
+    if (menuBar) {
+        tray = std::make_unique<pm::daemon::EngineTray>();
+        auto* d = daemon.get();
+        tray->status = [d] { return d->engineStatus(); };
+        tray->onQuit = [d] { d->shutdown("quit from the menu bar"); };
+    }
+#endif
     const int rc = app.exec();
+#if defined(PM_MIXD_TRAY)
+    tray.reset();
+#endif
     daemon.reset();
     return rc;
 }

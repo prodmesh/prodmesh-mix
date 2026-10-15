@@ -1,0 +1,73 @@
+# Build and test on macOS: the unit tests, the end-to-end gates on the
+# simulated clock, and the sanitizer builds (Homebrew LLVM: Apple clang's
+# ASan/TSan are broken on recent macOS and it has no RealtimeSanitizer).
+# Nothing here needs an audio device or third-party plugins.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: SDKs (only the parts the build uses)
+        run: |
+          git submodule update --init --depth 1 third_party/clap third_party/vst3sdk
+          git -C third_party/vst3sdk submodule update --init --depth 1 base pluginterfaces public.sdk
+      - name: Tools
+        run: brew install ninja qt
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="$(brew --prefix qt)"
+      - name: Build
+        run: cmake --build build
+      - name: Unit tests
+        run: |
+          ./build/mix-tests
+          ./build/mix-proto-tests
+      - name: Bench (simulated clock)
+        run: ./build/mix-bench --driver sim --seconds 10 --edits 4
+      - name: End-to-end gates
+        run: |
+          python3 tools/scenes_e2e.py
+          python3 tools/projects_e2e.py
+          python3 tools/playback_e2e.py
+          python3 tools/t07_crash_recording.py
+      - name: UI isolation (T0-5)
+        run: python3 tools/t05_ui_isolation.py --cycles 3
+
+  sanitizers:
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [PM_SANITIZE, PM_TSAN, PM_RTSAN]
+    steps:
+      - uses: actions/checkout@v4
+      - name: SDKs
+        run: |
+          git submodule update --init --depth 1 third_party/clap third_party/vst3sdk
+          git -C third_party/vst3sdk submodule update --init --depth 1 base pluginterfaces public.sdk
+      - name: Tools
+        run: brew install ninja llvm
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER="$(brew --prefix llvm)/bin/clang++"
+          -D${{ matrix.sanitizer }}=ON
+      - name: Build
+        run: cmake --build build --target mix-tests mix-bench mix-pluginhost
+      - name: Tests
+        run: ./build/mix-tests
+      - name: Bench with live edits
+        if: matrix.sanitizer != 'PM_SANITIZE'
+        run: ./build/mix-bench --driver sim --seconds 10 --workers 3 --edits 20

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <string>

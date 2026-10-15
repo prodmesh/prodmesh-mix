@@ -96,6 +96,10 @@ h = wait("health", lambda m: m["recording"].get("on"))
 check(h["recording"]["take"] != take, "back to live: a new take is recording")
 time.sleep(0.6)
 h = latest("health")
-check(h["xruns"] == 0 and h["rtViolations"] == 0,
-      "Tier 0: no dropouts through it all (%d xruns, %d RT violations)" % (h["xruns"], h["rtViolations"]))
+# Shared CI machines (CI=true) have no real-time guarantees: dropouts are
+# reported there, not judged. RT violations are code bugs and always fail.
+strict = not os.environ.get("CI")
+check(h["rtViolations"] == 0 and (h["xruns"] == 0 or not strict),
+      "Tier 0: no dropouts through it all (%d xruns%s, %d RT violations)"
+      % (h["xruns"], "" if strict else ", not judged on CI", h["rtViolations"]))
 print("PASS" if ok else "FAILED"); sys.exit(0 if ok else 1)

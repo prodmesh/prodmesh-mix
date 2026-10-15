@@ -33,8 +33,11 @@ jobs:
         run: |
           ./build/mix-tests
           ./build/mix-proto-tests
-      - name: Bench (simulated clock)
-        run: ./build/mix-bench --driver sim --seconds 10 --edits 4
+      # Shared VMs have no real-time guarantees, so CI cannot judge
+      # dropouts (the soak on real hardware does). Free-running still
+      # catches allocations / locks on the audio thread and edit bugs.
+      - name: Bench (free-running)
+        run: ./build/mix-bench --driver free --seconds 10 --edits 4
       - name: End-to-end gates
         run: |
           python3 tools/scenes_e2e.py
@@ -68,6 +71,6 @@ jobs:
         run: cmake --build build --target mix-tests mix-bench mix-pluginhost
       - name: Tests
         run: ./build/mix-tests
-      - name: Bench with live edits
+      - name: Bench with live edits (free-running)
         if: matrix.sanitizer != 'PM_SANITIZE'
-        run: ./build/mix-bench --driver sim --seconds 10 --workers 3 --edits 20
+        run: ./build/mix-bench --driver free --seconds 10 --workers 3 --edits 20

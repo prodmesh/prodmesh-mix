@@ -105,3 +105,14 @@ TEST(normalize_adds_device_inputs_and_moves_trim) {
     Engine e(c);
     CHECK(e.setGraph(g));
 }
+
+// A smaller device (Audio Setup): unused inputs it lacks go, used ones stay.
+TEST(normalize_drops_unused_inputs_the_device_lacks) {
+    GraphDesc g = shows::inputs(2);  // In 1-2 feed channels
+    shows::normalize(g, 8);
+    shows::normalize(g, 1);
+    int inputs = 0;
+    for (const auto& n : g.nodes) inputs += n.kind == NodeKind::Input;
+    CHECK(inputs == 2);  // In 2 is used by a channel: kept (silent)
+    CHECK(g.find(1000) && g.find(1001));
+}

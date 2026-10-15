@@ -26,6 +26,7 @@ an allocation/lock on the audio thread.
 | `src/record/` | Always-on recording: `RecordTap` (wait-free ring + gap log), `WavWriter` (crash-safe BWF/RF64), `Recorder` (disk-writer thread), `peaks.h` (waveform overviews) |
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
 | `tools/engine_lifecycle_e2e.py` | One engine per socket; shutdown warns clients and finalises the take |
+| `tools/audio_setup_e2e.py` | Audio Setup: apply saves `audio.json` and restarts the engine in place; command-line settings are locked |
 | `tools/playback_e2e.py` | Playback (virtual soundcheck) against a sim mixd: play, locate, stop at end, back to live, 0 dropouts |
 | `tools/projects_e2e.py` | Projects against a sim mixd: first-run Start offered once, new/open/recent, takes per project |
 | `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
@@ -150,6 +151,26 @@ take the socket. Devices / rate / buffer come from the command line, else
 laptop mic into its own speakers would howl); a first run from the app
 starts on the Blank template. Non-default sockets, `--no-engine` and
 `--screenshot` never start an engine (tests).
+
+**Audio Setup** (Setup menu, `src/ui/audio_setup.h`). The engine owns
+the device, so it lists them (`audioSetup`: devices with channel counts,
+the standard rates and buffer range each supports; what is saved, what
+is running, which settings the command line locked) and applies a choice
+(`applyAudio`): it saves `audio.json` (devices by UID, with names for
+display) and restarts **in place** — `execv` of itself with the same
+arguments after a normal shutdown (take finalised, session saved), since
+a device's rate and buffer are fixed while it runs. Clients get
+`restarting` first; the app waits for the engine to come back (~0.4 s of
+silence on this machine) instead of starting another, and confirms
+before applying. Saved devices that are missing at start (Dante Virtual
+Soundcard not running, an interface unplugged) never keep the engine
+down: it falls back to the system output with no input and reports a
+`warning` (snapshot `engine.warning`, shown in the app). Take folders
+are never reused (a restart within the same second gets `-2`).
+Inputs a smaller device lacks are dropped from the show by
+`shows::normalize` unless a channel uses them (those stay, silent). Read
+JSON with `value()`, not non-const `operator[]`: the latter inserts keys
+(it once wrote `"rate": null` to audio.json).
 
 ## Routing and mix-minus
 

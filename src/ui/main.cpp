@@ -20,6 +20,7 @@
 #include "ui/toolbar.h"
 #include "ui/start_dialog.h"
 #include "ui/editor.h"
+#include "ui/audio_setup.h"
 #include <QStackedWidget>
 #include <QButtonGroup>
 #include <QDesktopServices>
@@ -333,9 +334,24 @@ public:
                 }
                 restarting_ = false;
                 everConnected_ = true;
+                if (expectRestart_) announceAudio_ = true;  // said on the snapshot
+                expectRestart_ = false;
             } else {
                 setOffline(true);
-                maybeStartEngine();
+                if (expectRestart_ && expectClock_.elapsed() < 10000) {
+                    offlineText("Applying the audio settings…",
+                                "The engine is reopening the device. Program audio is back "
+                                "in a moment.");
+                    // Not back in 10 s (the restart failed): start one.
+                    QTimer::singleShot(10500, this, [this] {
+                        if (client_.connected() || !expectRestart_) return;
+                        expectRestart_ = false;
+                        maybeStartEngine();
+                    });
+                } else {
+                    expectRestart_ = false;
+                    maybeStartEngine();
+                }
             }
         };
         client_.onMessage = [this](const QJsonObject& m) { handle(m); };
@@ -453,6 +469,22 @@ private:
             rate_ = eng["sampleRate"].toDouble();
             deviceOutputs_ = eng["outputs"].toInt(2);
             health_->setFormat(rate_, eng["block"].toInt(), eng["device"].toString());
+            const QString audioWarning = eng["warning"].toString();
+            if (announceAudio_ || (!audioWarning.isEmpty() && audioWarning != shownAudioWarning_)) {
+                events_->setText(
+                    !audioWarning.isEmpty()
+                        ? "The saved audio devices could not be opened (" + audioWarning +
+                              ") — the engine is using the system output without inputs. "
+                              "Setup > Audio Setup to choose devices."
+                        : QString("Audio settings applied: %1 · %2 kHz · %3 samples.")
+                              .arg(eng["device"].toString())
+                              .arg(rate_ / 1000.0, 0, 'g', 4)
+                              .arg(eng["block"].toInt()));
+                events_->show();
+                eventsTimer_.start(audioWarning.isEmpty() ? 10000 : 30000);
+                shownAudioWarning_ = audioWarning;
+                announceAudio_ = false;
+            }
             GraphDesc g;
             if (proto::graphFromJson(m["graph"].toObject(), g, nullptr)) {
                 // Compare with what the strips were built from: a local edit
@@ -523,6 +555,11 @@ private:
             projects_ = m;
             rebuildRecentMenu();
             if (start_) start_->setProjects(m);
+        } else if (type == "audioSetup") {
+            if (audioDlg_) audioDlg_->setInfo(m);
+        } else if (type == "restarting") {
+            expectRestart_ = true;
+            expectClock_.restart();
         } else if (type == "shutdown") {
             // Stopped on purpose (here or from the menu bar): close too,
             // rather than start it again.
@@ -584,6 +621,7 @@ private:
         } else if (type == "health") {
             health_->setHealth(m);
             const auto rec = m["recording"].toObject();
+            recording_ = rec["on"].toBool();
             editor_->setLiveTake(rec["on"].toBool() ? rec["take"].toString() : QString());
             rtIssues_.clear();
             for (const auto& v : m["pluginRt"].toArray()) {
@@ -824,6 +862,11 @@ private:
         });
         rebuildRecentMenu();
 
+        auto* setup = bar->addMenu("Setup");
+        auto* audio = setup->addAction("Audio Setup…");
+        audio->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_A));
+        connect(audio, &QAction::triggered, this, [this] { openAudioSetup(); });
+
         auto* view = bar->addMenu("View");
         auto* mx = view->addAction("Mixer");
         mx->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_1));
@@ -836,6 +879,28 @@ private:
         connect(tg, &QAction::triggered, this,
                 [this] { showView(stack_->currentIndex() ? 0 : 1); });
     }
+
+public:
+    AudioSetupDialog* audioSetup() const { return audioDlg_; }
+    void openAudioSetup() {
+        if (!client_.connected()) return;
+        if (!audioDlg_) {
+            audioDlg_ = new AudioSetupDialog(this);
+            audioDlg_->onRefresh = [this] { client_.op({{"op", "audioSetup"}}); };
+            audioDlg_->recording = [this] { return recording_; };
+            audioDlg_->onApply = [this](const QJsonObject& c) {
+                QJsonObject m = c;
+                m["op"] = "applyAudio";
+                client_.op(m);
+            };
+        }
+        audioDlg_->setInfo({});
+        client_.op({{"op", "audioSetup"}});
+        audioDlg_->show();
+        audioDlg_->raise();
+    }
+
+private:
 
     void showView(int i) {
         stack_->setCurrentIndex(i);
@@ -1959,6 +2024,12 @@ private:
     TopBar* health_;
     bool autostart_ = false, stopping_ = false, quitting_ = false;
     bool restarting_ = false, everConnected_ = false, gaveUp_ = false;
+    // Audio Setup: the engine restarts itself to apply; wait for it rather
+    // than start another one, then say what it came back with.
+    bool expectRestart_ = false, announceAudio_ = false, recording_ = false;
+    QElapsedTimer expectClock_;
+    AudioSetupDialog* audioDlg_ = nullptr;
+    QString shownAudioWarning_;
     QElapsedTimer launchClock_;
     QList<qint64> launches_;
     QStackedWidget* stack_;
@@ -2017,6 +2088,8 @@ int main(int argc, char** argv) {
                          "after connecting, filtered by --browser-search",
          "node"},
         {"browser-search", "Dev aid: text for --open-browser", "text"},
+        {"audio-setup", "Dev aid: open Audio Setup after connecting (with "
+                        "--screenshot, the dialog is what is saved)"},
     });
     p.process(app);
 
@@ -2033,8 +2106,16 @@ int main(int argc, char** argv) {
                             p.value("browser-search"));
         });
 
+    if (p.isSet("audio-setup"))
+        QTimer::singleShot(1000, &win, [&] { win.openAudioSetup(); });
+
     if (p.isSet("screenshot")) {
         QTimer::singleShot(p.value("after").toInt(), &win, [&] {
+            if (auto* d = win.audioSetup(); d && d->isVisible()) {
+                d->grab().save(p.value("screenshot"));
+                app.exit(0);  // quit() would wait on the modal dialog
+                return;
+            }
             QPixmap shot = win.grab();
             if (auto* b = win.browser()) {  // composite the popup on top
                 QPainter painter(&shot);

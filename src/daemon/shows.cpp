@@ -177,6 +177,17 @@ void normalize(GraphDesc& g, int deviceInputs) {
         mon.recallSafe = true;  // the operator's ears are not part of a scene
         g.nodes.push_back(mon);
     }
+    // Inputs the device no longer has (a smaller one was chosen in Audio
+    // Setup) go when nothing uses them: every Input is recorded, and a
+    // 64-channel Dante show should not leave 62 silent tracks behind.
+    // Ones a channel still uses stay, silent, so the mix survives.
+    std::erase_if(g.nodes, [&](const NodeDesc& n) {
+        if (n.kind != NodeKind::Input || n.ioChannel + n.channels <= deviceInputs)
+            return false;
+        for (const auto& e : g.edges)
+            if (e.from == n.id || e.to == n.id) return false;
+        return true;
+    });
     NodeId next = 1000;
     for (const auto& n : g.nodes) next = std::max(next, n.id + 1);
     for (int ch = 0; ch < deviceInputs; ++ch) {

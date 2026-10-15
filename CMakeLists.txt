@@ -123,7 +123,7 @@ endif()
 if(Qt6_FOUND)
     qt_add_executable(mix-ui src/ui/main.cpp src/ui/widgets.h src/ui/theme.h
         src/ui/plugin_browser.h src/ui/scene_bar.h src/ui/toolbar.h
-        src/ui/start_dialog.h src/ui/editor.h)
+        src/ui/start_dialog.h src/ui/editor.h src/ui/audio_setup.h)
     target_compile_definitions(mix-ui PRIVATE PM_VERSION_STRING="${PROJECT_VERSION}")
     target_link_libraries(mix-ui PRIVATE mix_proto Qt6::Widgets Qt6::Network)
     add_dependencies(mixd mix-plugin)  # mixd runs it to scan plugins

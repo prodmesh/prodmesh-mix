@@ -44,6 +44,8 @@ struct AudioDeviceInfo {
     int inputs = 0, outputs = 0;
     double sampleRate = 0;
     bool defaultInput = false, defaultOutput = false;
+    std::vector<double> rates;      // the standard rates it can run at
+    int minBlock = 0, maxBlock = 0;  // buffer size range, frames
 };
 
 class Driver {

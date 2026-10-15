@@ -45,6 +45,7 @@ jobs:
           python3 tools/playback_e2e.py
           python3 tools/t07_crash_recording.py
           python3 tools/engine_lifecycle_e2e.py
+          python3 tools/audio_setup_e2e.py
       - name: UI isolation (T0-5)
         run: python3 tools/t05_ui_isolation.py --cycles 3
 

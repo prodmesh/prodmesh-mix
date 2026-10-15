@@ -80,6 +80,22 @@ void onSignal(int) {
     (void)!::write(gSignalPipe[1], &c, 1);
 }
 
+// Audio Setup: devices, rate and buffer live in audio.json (the app data
+// folder, or PM_MIX_HOME for tests); the command line overrides it.
+QString audioSettingsPath() {
+    const QString home = qEnvironmentVariable("PM_MIX_HOME");
+    return (home.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                           : home) +
+           "/audio.json";
+}
+
+struct AudioSetup {
+    QString driver;          // "coreaudio" / "sim"
+    QJsonObject saved;       // audio.json as read at start
+    QStringList locked;      // settings given on the command line
+    QString warning;         // why the saved devices were not used
+};
+
 class Daemon : public QObject {
     // Scenes: stored mixes, recalled with an optional fade.
     struct Scene {
@@ -127,6 +143,90 @@ public:
                 {"seconds", recorder_ ? takeClock_.elapsed() / 1000.0 : 0.0},
                 {"xruns", double(driver_->stats().xruns.load())},
                 {"device", QString::fromStdString(driver_->deviceName())}};
+    }
+
+    void setAudioSetup(AudioSetup a) { setup_ = std::move(a); }
+    bool restartRequested() const { return restart_; }
+
+    // What Audio Setup shows: the devices there are, what is saved, and
+    // what the device actually runs at (it may round a buffer size).
+    QJsonObject audioSetupMessage() const {
+        QJsonArray devices;
+#if defined(__APPLE__)
+        if (setup_.driver == "coreaudio")
+            for (const auto& d : listAudioDevices()) {
+                QJsonArray rates;
+                for (double r : d.rates) rates.append(r);
+                devices.append(QJsonObject{{"name", QString::fromStdString(d.name)},
+                                           {"uid", QString::fromStdString(d.uid)},
+                                           {"inputs", d.inputs},
+                                           {"outputs", d.outputs},
+                                           {"rate", d.sampleRate},
+                                           {"rates", rates},
+                                           {"minBlock", d.minBlock},
+                                           {"maxBlock", d.maxBlock},
+                                           {"defaultInput", d.defaultInput},
+                                           {"defaultOutput", d.defaultOutput}});
+            }
+#endif
+        const auto& dc = driver_->config();
+        return {{"type", "audioSetup"},
+                {"driver", setup_.driver},
+                {"devices", devices},
+                {"saved", setup_.saved},
+                {"locked", QJsonArray::fromStringList(setup_.locked)},
+                {"warning", setup_.warning},
+                {"running", QJsonObject{{"device", QString::fromStdString(driver_->deviceName())},
+                                        {"inputs", dc.numInputs},
+                                        {"outputs", dc.numOutputs},
+                                        {"rate", dc.sampleRate},
+                                        {"block", dc.blockSize}}}};
+    }
+
+    // Saves the new settings and restarts the engine in place to use them
+    // (a device's rate and buffer are fixed while it runs). Program audio
+    // stops for a moment, so the app asks first; the take is finished and
+    // the next one starts with the engine.
+    bool applyAudio(const QJsonObject& m, QString* err) {
+        static const QStringList keys{"input", "output", "rate", "block"};
+        QJsonObject next = setup_.saved;
+        for (const auto& k : keys) {
+            if (!m.contains(k)) continue;
+            if (setup_.locked.contains(k)) {
+                *err = "The engine was started with --" + k + "; restart it without it to "
+                       "choose this here.";
+                return false;
+            }
+            next[k] = m[k];
+        }
+        for (const auto& k : {QStringLiteral("inputName"), QStringLiteral("outputName")})
+            if (m.contains(k)) next[k] = m[k];
+        const double rate = next.value("rate").toDouble(48000);  // value(): no null inserted
+        const int block = next.value("block").toInt(128);
+        if (!QList<double>{44100, 48000, 88200, 96000, 176400, 192000}.contains(rate)) {
+            *err = QString("%1 Hz is not a supported sample rate.").arg(rate);
+            return false;
+        }
+        if (block < 16 || block > 4096) {
+            *err = QString("A buffer of %1 samples is out of range (16-4096).").arg(block);
+            return false;
+        }
+        QSaveFile f(audioSettingsPath());
+        QDir().mkpath(QFileInfo(f.fileName()).path());
+        if (!f.open(QIODevice::WriteOnly) ||
+            f.write(QJsonDocument(next).toJson()) < 0 || !f.commit()) {
+            *err = "Could not save the audio settings: " + f.errorString();
+            return false;
+        }
+        setup_.saved = next;
+        qInfo("mixd: restarting to apply the audio settings");
+        broadcast({{"type", "restarting"},
+                   {"reason", "Applying the new audio settings"}},
+                  nullptr);
+        for (auto* c : clients_) c->flush();
+        restart_ = true;
+        QTimer::singleShot(150, qApp, &QCoreApplication::quit);
+        return true;
     }
 
     // A deliberate stop (menu bar or the app): tell every UI first, so it
@@ -290,6 +390,11 @@ private:
                 snapshotPending_ = true;
                 saveTimer_.start();
             }
+        } else if (op == "audioSetup") {
+            send(s, audioSetupMessage());
+        } else if (op == "applyAudio") {
+            QString err;
+            if (!applyAudio(m, &err)) send(s, {{"type", "error"}, {"op", op}, {"message", err}});
         } else if (op == "shutdown") {
             shutdown("asked by " + m["client"].toString("a client"));
         } else if (op == "projects") {
@@ -915,7 +1020,13 @@ private:
                 to->ioChannel == 0 && from->kind == NodeKind::Bus)
                 add(*from, from->name.empty() ? "Program" : from->name);
         }
+        // Never reuse a folder: a take that started within the same second
+        // (an Audio Setup restart, a quick project switch) would be
+        // overwritten.
         takeName_ = QDateTime::currentDateTime().toString("yyyy-MM-dd HHmmss");
+        for (int n = 2; QFileInfo::exists(recordDir_ + "/" + takeName_); ++n)
+            takeName_ = QDateTime::currentDateTime().toString("yyyy-MM-dd HHmmss") +
+                        QString("-%1").arg(n);
         rec::RecorderOptions ro;
         ro.sampleRate = std::uint32_t(driver_->config().sampleRate);
         recorder_ = std::make_unique<rec::Recorder>(ro);
@@ -1139,7 +1250,8 @@ private:
                                        {"sampleRate", dc.sampleRate},
                                        {"block", dc.blockSize},
                                        {"outputs", dc.numOutputs},
-                                       {"periodUs", periodUs_}}}};
+                                       {"periodUs", periodUs_},
+                                       {"warning", setup_.warning}}}};
     }
 
     void pump() {
@@ -1271,11 +1383,15 @@ private:
     double periodUs_ = 0;
     double windowSum_ = 0, windowMax_ = 0;
     std::uint64_t windowCount_ = 0;
+    AudioSetup setup_;
+    bool restart_ = false;
 };
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    // For a restart in place (Audio Setup): same arguments, same process.
+    const std::vector<std::string> args(argv, argv + argc);
     // --menu-bar (how the app starts the engine): a GUI process for the
     // menu-bar icon; otherwise headless, as tests and servers run it.
     bool menuBar = false;
@@ -1335,7 +1451,7 @@ int main(int argc, char** argv) {
     // laptop mic into its own speakers would howl.
     QJsonObject audio;
     {
-        QFile f(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/audio.json");
+        QFile f(audioSettingsPath());
         if (f.open(QIODevice::ReadOnly)) audio = QJsonDocument::fromJson(f.readAll()).object();
     }
     auto setting = [&](const char* name, const QString& fallback) {
@@ -1343,6 +1459,11 @@ int main(int argc, char** argv) {
         const auto v = audio.value(QLatin1String(name));
         return v.isString() ? v.toString() : v.isDouble() ? QString::number(v.toDouble()) : fallback;
     };
+    AudioSetup setup;
+    setup.driver = p.value("driver");
+    setup.saved = audio;
+    for (const char* k : {"input", "output", "rate", "block"})
+        if (p.isSet(k)) setup.locked << k;
 
 #if defined(__APPLE__)
     if (p.isSet("list-devices")) {
@@ -1369,6 +1490,24 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__)
     } else if (p.value("driver") == "coreaudio") {
         driver = makeCoreAudioDriver(dc, &err);
+        // Saved devices that are gone (Dante Virtual Soundcard not
+        // started, an interface unplugged) must not keep the engine down:
+        // fall back to the system output, no input, and say so.
+        const bool fromSaved = !p.isSet("input") && !p.isSet("output") &&
+                               (audio.contains("input") || audio.contains("output"));
+        if (!driver && fromSaved) {
+            // Name the device the operator chose, not its UID.
+            setup.warning = QString::fromStdString(err);
+            for (const char* k : {"input", "output"}) {
+                const QString uid = audio.value(k).toString(),
+                              name = audio.value(QString(k) + "Name").toString();
+                if (!uid.isEmpty() && !name.isEmpty()) setup.warning.replace(uid, name);
+            }
+            qWarning("mixd: %s; using the system output without inputs", err.c_str());
+            dc.inputDevice = "none";
+            dc.outputDevice.clear();
+            driver = makeCoreAudioDriver(dc, &err);
+        }
 #endif
     }
     if (!driver) {
@@ -1386,6 +1525,7 @@ int main(int argc, char** argv) {
     auto daemon = std::make_unique<Daemon>(std::move(driver),
                                            p.value("workers").toInt(),
                                            p.isSet("audible"));
+    daemon->setAudioSetup(setup);
     QString why;
     daemon->setRingSeconds(p.value("ring-seconds").toDouble());
     if (p.isSet("record"))
@@ -1423,6 +1563,18 @@ int main(int argc, char** argv) {
 #if defined(PM_MIXD_TRAY)
     tray.reset();
 #endif
-    daemon.reset();
+    const bool restart = daemon->restartRequested();
+    daemon.reset();  // device stopped, take finished, session saved
+    if (restart) {
+        const QByteArray self = QCoreApplication::applicationFilePath().toLocal8Bit();
+        ::close(gSignalPipe[0]);
+        ::close(gSignalPipe[1]);
+        std::vector<char*> av;
+        for (const auto& a : args) av.push_back(const_cast<char*>(a.c_str()));
+        av.push_back(nullptr);
+        ::execv(self.constData(), av.data());
+        std::perror("mixd: restart failed");
+        return 1;
+    }
     return rc;
 }

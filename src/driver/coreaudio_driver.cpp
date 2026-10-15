@@ -339,15 +339,38 @@ std::vector<AudioDeviceInfo> listAudioDevices() {
     std::vector<AudioDeviceInfo> out;
     const auto defIn = defaultDevice(true), defOut = defaultDevice(false);
     for (auto id : allDevices()) {
+        const auto uid = stringProp(id, kAudioDevicePropertyDeviceUID);
+        if (uid.rfind("com.prodmesh.mix.aggregate.", 0) == 0) continue;  // ours
         Float64 rate = 0;
         UInt32 size = sizeof rate;
         auto a = addr(kAudioDevicePropertyNominalSampleRate);
         AudioObjectGetPropertyData(id, &a, 0, nullptr, &size, &rate);
-        out.push_back({stringProp(id, kAudioObjectPropertyName),
-                       stringProp(id, kAudioDevicePropertyDeviceUID),
-                       channelCount(id, kAudioObjectPropertyScopeInput),
-                       channelCount(id, kAudioObjectPropertyScopeOutput), rate,
-                       id == defIn, id == defOut});
+        AudioDeviceInfo d{stringProp(id, kAudioObjectPropertyName), uid,
+                          channelCount(id, kAudioObjectPropertyScopeInput),
+                          channelCount(id, kAudioObjectPropertyScopeOutput), rate,
+                          id == defIn, id == defOut, {}, 0, 0};
+        // Rates come as ranges (often single points); offer the standard
+        // rates that fall inside one.
+        a = addr(kAudioDevicePropertyAvailableNominalSampleRates);
+        size = 0;
+        if (!AudioObjectGetPropertyDataSize(id, &a, 0, nullptr, &size) && size) {
+            std::vector<AudioValueRange> ranges(size / sizeof(AudioValueRange));
+            if (!AudioObjectGetPropertyData(id, &a, 0, nullptr, &size, ranges.data()))
+                for (double r : {44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0})
+                    for (const auto& rg : ranges)
+                        if (r >= rg.mMinimum - 0.5 && r <= rg.mMaximum + 0.5) {
+                            d.rates.push_back(r);
+                            break;
+                        }
+        }
+        AudioValueRange frames{};
+        size = sizeof frames;
+        a = addr(kAudioDevicePropertyBufferFrameSizeRange);
+        if (!AudioObjectGetPropertyData(id, &a, 0, nullptr, &size, &frames)) {
+            d.minBlock = int(frames.mMinimum);
+            d.maxBlock = int(frames.mMaximum);
+        }
+        out.push_back(std::move(d));
     }
     return out;
 }

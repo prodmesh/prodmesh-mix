@@ -689,6 +689,19 @@ private:
             *err = "None of that take's sources exist in this show any more.";
             return false;
         }
+        // No resampling: a take at another rate would play at the wrong
+        // speed and pitch, through every output.
+        const double engineRate = driver_->config().sampleRate;
+        for (const auto& t : tracks) {
+            rec::WavInfo info;
+            if (rec::WavWriter::readInfo(t.wav, info) && info.sampleRate != engineRate) {
+                *err = QString("That take is %1 kHz and the engine runs at %2 kHz. Change "
+                               "the sample rate in Setup > Audio Setup to play it back.")
+                           .arg(info.sampleRate / 1000.0, 0, 'g', 4)
+                           .arg(engineRate / 1000.0, 0, 'g', 4);
+                return false;
+            }
+        }
         // Playing back the take being recorded is fine: it is finished
         // (stopTake) before the player opens its files.
         switching_ = true;

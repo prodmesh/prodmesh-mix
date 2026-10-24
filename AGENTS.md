@@ -27,6 +27,7 @@ an allocation/lock on the audio thread.
 | `tools/t07_crash_recording.py` | T0-7 gate: kill -9 mid-take, header lag <= 1 s, restart repairs every file |
 | `tools/engine_lifecycle_e2e.py` | One engine per socket; shutdown warns clients and finalises the take |
 | `tools/audio_setup_e2e.py` | Audio Setup: apply saves `audio.json` and restarts the engine in place; command-line settings are locked |
+| `tools/import_multitracks.py` | Folder of multitrack WAVs -> a project whose take is those files (stereo = two mono inputs, a bus per stem section); `mix-import` converts one WAV to take files + peaks |
 | `tools/playback_e2e.py` | Playback (virtual soundcheck) against a sim mixd: play, locate, stop at end, back to live, 0 dropouts |
 | `tools/projects_e2e.py` | Projects against a sim mixd: first-run Start offered once, new/open/recent, takes per project |
 | `tools/scenes_e2e.py` | Scenes against a sim mixd: store, modified, recall with fade, undo, persistence |
@@ -258,7 +259,8 @@ stop asked for mid-locate are applied at the new position. mixd:
 `enterPlayback` finishes the take (recording stops), `transport`
 (play/stop/locate; stops at the end of the take), `exitPlayback` starts a
 new take; source levels dip 5 ms around mode changes. Test:
-`playback_reproduces_the_recording` (bit-exact after the fade-in). UI: an
+`playback_reproduces_the_recording` (bit-exact after the fade-in). A take
+at another rate than the engine is refused (no resampling). UI: an
 amber banner for as long as playback lasts, "Play this take" in the
 Editor, Space = play/stop, click = locate.
 

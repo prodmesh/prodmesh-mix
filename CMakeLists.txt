@@ -175,6 +175,10 @@ target_compile_definitions(mix-bench PRIVATE
 target_compile_definitions(mix-tests PRIVATE
     PM_TEST_CLAP="$<TARGET_BUNDLE_DIR:pm-test-clap>")
 
+# Outside WAVs -> take files (multitracks to play back).
+add_executable(mix-import tools/mix_import.cpp)
+target_link_libraries(mix-import PRIVATE mix_engine)
+
 add_executable(mix-plugin tools/mix_plugin.cpp)
 target_link_libraries(mix-plugin PRIVATE mix_engine)
 
